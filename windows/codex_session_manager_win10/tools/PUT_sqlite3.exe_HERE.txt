@@ -1,0 +1,7 @@
+Optional full-index support:
+
+Put Windows sqlite3.exe in this tools folder, or add sqlite3.exe to PATH.
+
+Without sqlite3.exe, the app still scans rollout JSONL files and can copy
+session files, but SQLite thread index merge/delete steps are skipped.
+

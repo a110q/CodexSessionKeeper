@@ -1,0 +1,18 @@
+{
+  "name": "codex-session-manager-win10-electron",
+  "version": "1.0.8",
+  "description": "Codex session manager for Windows 10",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "package:win": "electron-packager . codex_session_manager --platform=win32 --arch=x64 --out=../../dist/win10-exe --overwrite --prune=true"
+  },
+  "dependencies": {
+    "sql.js": "^1.10.3"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.3.6",
+    "electron": "^30.5.1"
+  }
+}

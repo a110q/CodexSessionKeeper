@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>codex_会话管理</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand-block">
+        <div class="brand-mark">C</div>
+        <div>
+          <h1>codex_会话管理</h1>
+          <p>管理、备份和恢复 Codex 对话</p>
+        </div>
+      </div>
+
+      <div class="state-card">
+        <div class="state-title">当前 Codex 状态</div>
+        <div class="state-line"><span>Provider</span><strong id="stateProvider">unknown</strong></div>
+        <div class="state-line"><span>Model</span><strong id="stateModel">unknown</strong></div>
+        <div class="state-line"><span>Account</span><strong id="stateAccount">none</strong></div>
+        <div class="state-line"><span>Sessions</span><strong id="stateSessions">0 / 0</strong></div>
+      </div>
+
+      <nav class="side-nav">
+        <button class="nav-button active" data-section="sessions">会话管理</button>
+        <button class="nav-button" data-section="snapshots">快照恢复</button>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="toolbar-left">
+          <span class="function-label">功能</span>
+          <div class="segmented">
+            <button class="segment active" data-section="sessions">会话管理</button>
+            <button class="segment" data-section="snapshots">快照恢复</button>
+          </div>
+        </div>
+        <div class="top-actions">
+          <label class="switch-line" title="打开应用时检测会话丢失，确认后只恢复对话">
+            <span>打开时自动找回</span>
+            <input id="autoRestoreSwitch" type="checkbox" />
+          </label>
+          <button id="refreshBtn" class="ghost-button">刷新</button>
+          <div class="open-dir-wrap">
+            <button id="openDirsBtn" class="ghost-button">打开目录</button>
+            <div id="openDirsMenu" class="menu-popover hidden">
+              <button data-dir-action="codex">打开 Codex 数据目录</button>
+              <button data-dir-action="vault">打开快照库目录</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <section id="sessionsSection" class="section active">
+        <div class="split-view">
+          <section class="list-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>会话列表</h2>
+                <p>单击选中会话；双击查看对话记录；右键可从快照恢复指定会话。</p>
+              </div>
+              <span id="sessionCount" class="count-pill">0 / 0</span>
+            </div>
+            <div class="filter-card">
+              <input id="sessionSearch" class="search-input" placeholder="搜索标题、目录、模型、ID" />
+              <label class="mini-switch"><span>归档</span><input id="showArchived" type="checkbox" checked /></label>
+              <button id="checkVisibleSessionsBtn" class="ghost-button">全选可见</button>
+              <button id="clearCheckedSessionsBtn" class="ghost-button hidden">清空选择</button>
+              <button id="deleteCheckedSessionsBtn" class="danger-button hidden">删除选中</button>
+            </div>
+            <div id="sessionList" class="session-list"></div>
+          </section>
+
+          <section class="detail-panel">
+            <div id="sessionDetail" class="detail-empty">
+              <div class="empty-icon">⌁</div>
+              <h3>没有选中会话</h3>
+              <p>从左侧选择一个会话，或调整搜索条件。</p>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="snapshotsSection" class="section">
+        <div class="split-view">
+          <section class="list-panel compact">
+            <div class="panel-heading">
+              <div>
+                <h2>快照恢复</h2>
+                <p>用于切换账号后找回或回滚对话。</p>
+              </div>
+              <span id="snapshotCount" class="count-pill">0</span>
+            </div>
+            <div class="filter-card">
+              <input id="snapshotName" class="search-input" placeholder="快照备注，可留空" />
+              <button id="createSnapshotBtn" class="primary-button">创建快照</button>
+              <select id="snapshotFilter" class="search-input compact-select">
+                <option value="all">全部</option>
+                <option value="manual">手动</option>
+                <option value="system">系统自动</option>
+              </select>
+              <button id="checkAllSnapshotsBtn" class="ghost-button">全选</button>
+              <button id="clearCheckedSnapshotsBtn" class="ghost-button hidden">清空选择</button>
+              <button id="deleteCheckedSnapshotsBtn" class="danger-button hidden">删除选中</button>
+            </div>
+            <div id="snapshotList" class="snapshot-list"></div>
+          </section>
+          <section class="detail-panel">
+            <div id="snapshotDetail" class="detail-empty">
+              <div class="empty-icon">▧</div>
+              <h3>没有选中快照</h3>
+              <p>先创建一个快照，或从左侧选择已有快照。</p>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="contextMenu" class="context-menu hidden">
+    <button data-action="view">查看对话记录</button>
+    <button data-action="restore">从最近快照恢复此会话</button>
+    <button data-action="open">打开会话文件</button>
+    <button data-action="reveal">在文件夹中显示</button>
+    <hr />
+    <button data-action="delete" class="danger">删除会话</button>
+  </div>
+
+  <div id="conversationModal" class="modal hidden">
+    <div class="modal-panel">
+      <header class="modal-header">
+        <div>
+          <h2 id="conversationTitle">对话记录</h2>
+          <p id="conversationMeta">正在加载...</p>
+        </div>
+        <button id="closeConversation" class="ghost-button">关闭</button>
+      </header>
+      <div id="conversationBody" class="conversation-body"></div>
+      <footer class="modal-footer">
+        <button id="conversationOpenFile" class="ghost-button">打开原始文件</button>
+        <button id="conversationRevealFile" class="ghost-button">在文件夹中显示</button>
+        <span>双击会话行可再次打开此窗口</span>
+      </footer>
+    </div>
+  </div>
+
+  <div id="busyOverlay" class="busy-overlay hidden">
+    <div class="busy-card">
+      <div class="busy-title-row">
+        <div class="busy-spinner"></div>
+        <div>
+          <h3 id="busyTitle">正在处理...</h3>
+          <p>正在执行本地文件操作</p>
+        </div>
+      </div>
+      <div class="busy-progress"><span></span></div>
+      <p id="busyDetail" class="busy-detail">文件较多或磁盘较忙时会需要一些时间，请耐心等待。</p>
+      <p class="busy-footnote">请等待完成后再切换或关闭应用，避免快照和索引写入中断。</p>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="./renderer.js"></script>
+</body>
+</html>
