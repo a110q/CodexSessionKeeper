@@ -10,8 +10,8 @@
 
 请到 GitHub Releases 下载对应系统的安装包：
 
-- macOS：下载 `codex_session_keeper_macos_v1.0.10.zip`，解压后运行 `codex_会话管理.app`。
-- Windows：下载 `codex_session_keeper_windows_v1.0.10.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
+- macOS：下载 `codex_session_keeper_macos_v1.0.11.zip`，解压后运行 `codex_会话管理.app`。
+- Windows：下载 `codex_session_keeper_windows_v1.0.11.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
 
 [下载地址](https://github.com/a110q/CodexSessionKeeper/releases)
 
@@ -78,6 +78,10 @@ Windows 使用当前用户目录下的等效路径：
 这通常说明 Codex 的 `state_5.sqlite` 在当时不可读，可能是 Codex 正在写入、WAL 文件还没合并，或者数据库文件已经损坏。
 
 `v1.0.10` 起不会因此中断创建快照，会自动降级为文件型快照。建议先退出 Codex 后再创建一次快照，如果仍反复出现，可以先使用文件型快照恢复重要会话。
+
+### Windows 提示 `EPERM: operation not permitted, lstat`
+
+这通常是某个会话 jsonl 文件被 Codex、杀毒软件、同步盘或权限策略临时锁住。`v1.0.11` 起创建快照会跳过单个不可访问文件，继续备份其他可读会话，并在成功提示里列出被跳过的文件。
 
 ### 快照里没有 `state_5.sqlite` 还能恢复吗
 

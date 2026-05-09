@@ -7,7 +7,7 @@ const crypto = require('crypto');
 let mainWindow;
 let sqlPromise;
 
-const appVersion = '1.0.10';
+const appVersion = '1.0.11';
 const codexRoot = path.join(os.homedir(), '.codex');
 const vaultRoot = path.join(os.homedir(), '.codex-session-vault');
 const snapshotRoot = path.join(vaultRoot, 'snapshots');
@@ -451,7 +451,13 @@ function firstUserMessageFromRollout(filePath) {
 
 function walkFiles(root, predicate, output = []) {
   if (!exists(root)) return output;
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return output;
+  }
+  for (const entry of entries) {
     const fullPath = path.join(root, entry.name);
     if (entry.isDirectory()) walkFiles(fullPath, predicate, output);
     if (entry.isFile() && predicate(fullPath, entry)) output.push(fullPath);
@@ -646,17 +652,69 @@ function timestampId() {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
-function copyPathIntoSnapshot(relativePath, dataPath) {
+function addCopyWarning(warnings, message) {
+  if (!Array.isArray(warnings) || !message) return;
+  warnings._copyWarningCount = (warnings._copyWarningCount || 0) + 1;
+  if (warnings._copyWarningCount <= 6) {
+    warnings.push(message);
+  } else if (warnings._copyWarningCount === 7) {
+    warnings.push('还有更多文件因为权限不足或正在被占用而被跳过，其他可读会话已继续备份。');
+  }
+}
+
+function displayPathForWarning(targetPath) {
+  return safeRelativePath(codexRoot, targetPath) || targetPath;
+}
+
+function copyEntryIntoSnapshot(source, destination, warnings) {
+  let stat;
+  try {
+    stat = fs.lstatSync(source);
+  } catch (error) {
+    addCopyWarning(warnings, `跳过不可访问文件：${displayPathForWarning(source)}。原因：${error.code || error.message}`);
+    return false;
+  }
+
+  if (stat.isDirectory()) {
+    ensureDir(destination);
+    let entries;
+    try {
+      entries = fs.readdirSync(source);
+    } catch (error) {
+      addCopyWarning(warnings, `跳过不可读取目录：${displayPathForWarning(source)}。原因：${error.code || error.message}`);
+      return false;
+    }
+    let copiedAny = false;
+    for (const entry of entries) {
+      copiedAny = copyEntryIntoSnapshot(path.join(source, entry), path.join(destination, entry), warnings) || copiedAny;
+    }
+    return copiedAny;
+  }
+
+  if (!stat.isFile()) {
+    return false;
+  }
+
+  try {
+    ensureDir(path.dirname(destination));
+    if (exists(destination)) fs.rmSync(destination, { force: true });
+    fs.copyFileSync(source, destination);
+    return true;
+  } catch (error) {
+    addCopyWarning(warnings, `跳过复制失败文件：${displayPathForWarning(source)}。原因：${error.code || error.message}`);
+    return false;
+  }
+}
+
+function copyPathIntoSnapshot(relativePath, dataPath, warnings = null) {
   const source = path.join(codexRoot, relativePath);
   if (!exists(source)) return false;
   const destination = path.join(dataPath, relativePath);
-  ensureDir(path.dirname(destination));
-  fs.cpSync(source, destination, { recursive: true, force: true });
-  return true;
+  return copyEntryIntoSnapshot(source, destination, warnings);
 }
 
-async function copyStateDatabaseIntoSnapshot(dataPath) {
-  if (!copyPathIntoSnapshot('state_5.sqlite', dataPath)) {
+async function copyStateDatabaseIntoSnapshot(dataPath, warnings = null) {
+  if (!copyPathIntoSnapshot('state_5.sqlite', dataPath, warnings)) {
     return { ok: false, warning: '' };
   }
 
@@ -774,13 +832,13 @@ async function createSnapshot(name, reason, candidates = backupCandidates) {
   const snapshotPath = path.join(snapshotRoot, id);
   const dataPath = path.join(snapshotPath, 'data');
   ensureDir(dataPath);
+  const warnings = [];
   const includedPaths = candidates
     .filter((candidate) => !stateDatabaseSnapshotPaths.has(candidate))
-    .filter((candidate) => copyPathIntoSnapshot(candidate, dataPath));
+    .filter((candidate) => copyPathIntoSnapshot(candidate, dataPath, warnings));
 
-  const warnings = [];
   if (candidates.includes('state_5.sqlite')) {
-    const stateCopy = await copyStateDatabaseIntoSnapshot(dataPath);
+    const stateCopy = await copyStateDatabaseIntoSnapshot(dataPath, warnings);
     if (stateCopy.ok) {
       includedPaths.push('state_5.sqlite');
     } else if (stateCopy.warning) {
@@ -875,12 +933,13 @@ async function createSessionProtectionSnapshot(name, reason, sessions) {
   const dataPath = path.join(snapshotPath, 'data');
   ensureDir(dataPath);
   const includedPaths = new Set();
+  const warnings = [];
 
   for (const relativePath of conversationLineMergePaths) {
     const source = path.join(codexRoot, relativePath);
     if (!exists(source)) continue;
     const destination = path.join(dataPath, relativePath);
-    copyReplacing(source, destination);
+    if (!copyEntryIntoSnapshot(source, destination, warnings)) continue;
     filterLineFile(destination, relativePath === 'session_index.jsonl' ? 'id' : null, sessionIds);
     includedPaths.add(relativePath);
   }
@@ -891,8 +950,7 @@ async function createSessionProtectionSnapshot(name, reason, sessions) {
   if (copyShellSnapshotsForSessions(sessionIds, dataPath)) {
     includedPaths.add('shell_snapshots');
   }
-  const warnings = [];
-  const stateCopy = await copyStateDatabaseIntoSnapshot(dataPath);
+  const stateCopy = await copyStateDatabaseIntoSnapshot(dataPath, warnings);
   if (stateCopy.ok) {
     includedPaths.add('state_5.sqlite');
   } else if (stateCopy.warning) {
@@ -944,13 +1002,13 @@ async function createRestoreProtectionSnapshot(name, reason, protectionMode, ses
 
   const snapshot = getSnapshotById(meta.id);
   if (!snapshot) return meta;
-  for (const relativePath of extraLightweightCandidates) {
-    if (conversationLineMergePaths.includes(relativePath) || stateDatabaseSnapshotPaths.has(relativePath)) continue;
-    copyPathIntoSnapshot(relativePath, snapshot.dataPath);
-  }
-
   const metaPath = path.join(snapshot.path, 'snapshot.json');
   const updatedMeta = JSON.parse(readText(metaPath));
+  updatedMeta.warnings = updatedMeta.warnings || [];
+  for (const relativePath of extraLightweightCandidates) {
+    if (conversationLineMergePaths.includes(relativePath) || stateDatabaseSnapshotPaths.has(relativePath)) continue;
+    copyPathIntoSnapshot(relativePath, snapshot.dataPath, updatedMeta.warnings);
+  }
   updatedMeta.includedPaths = [
     ...new Set([
       ...(updatedMeta.includedPaths || []),

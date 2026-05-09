@@ -316,7 +316,7 @@ final class VaultModel: ObservableObject {
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
-    private let appVersion = "1.0.10"
+    private let appVersion = "1.0.11"
     private var didRunLaunchAutoRestore = false
     private var conversationLoadID = UUID()
     private var sessionSearchTask: Task<Void, Never>?
