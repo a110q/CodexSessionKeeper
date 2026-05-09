@@ -10,8 +10,8 @@
 
 请到 GitHub Releases 下载对应系统的安装包：
 
-- macOS：下载 `codex_session_keeper_macos_v1.0.8.zip`，解压后运行 `codex_会话管理.app`。
-- Windows：下载 `codex_session_keeper_windows_v1.0.8.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
+- macOS：下载 `codex_session_keeper_macos_v1.0.9.zip`，解压后运行 `codex_会话管理.app`。
+- Windows：下载 `codex_session_keeper_windows_v1.0.9.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
 
 Windows 版本是免安装便携版。不要只拷贝单独的 exe 文件，Electron 运行时需要同目录下的 `resources`、`locales` 和 `.dll` 文件。
 

@@ -7,7 +7,7 @@ const crypto = require('crypto');
 let mainWindow;
 let sqlPromise;
 
-const appVersion = '1.0.8';
+const appVersion = '1.0.9';
 const codexRoot = path.join(os.homedir(), '.codex');
 const vaultRoot = path.join(os.homedir(), '.codex-session-vault');
 const snapshotRoot = path.join(vaultRoot, 'snapshots');
@@ -381,9 +381,10 @@ function snapshotFilePathForSession(snapshot, session) {
 async function loadSessionsInSnapshot(snapshot) {
   if (!snapshot) return [];
   const databasePath = path.join(snapshot.dataPath, 'state_5.sqlite');
-  if (!exists(databasePath)) return [];
+  if (!exists(databasePath)) return loadSessionsFromFiles(snapshot.dataPath);
 
   let db;
+  let databaseSessions = [];
   try {
     db = await openDatabase(databasePath);
     const rows = execRows(db, `
@@ -401,17 +402,22 @@ async function loadSessionsInSnapshot(snapshot) {
       FROM threads
       ORDER BY updated_at DESC, created_at DESC;
     `);
-    return rows.map((row) => {
+    databaseSessions = rows.map((row) => {
       const session = makeSession(row, false, 0);
       const probe = snapshotFilePathForSession(snapshot, session);
       const fileExists = exists(probe);
-      return makeSession(row, fileExists, fileExists ? fileSize(probe) : 0);
+      return makeSession(row, fileExists, fileExists ? fileSize(probe) : 0, probe || session.rolloutPath);
     });
   } catch {
-    return [];
+    databaseSessions = [];
   } finally {
     if (db) db.close();
   }
+  if (databaseSessions.length && databaseSessions.every((session) => session.existsOnDisk)) {
+    return databaseSessions;
+  }
+  const fileSessions = loadSessionsFromFiles(snapshot.dataPath);
+  return mergeSessionLists(databaseSessions, fileSessions);
 }
 
 function extractSessionIdFromPath(filePath) {
@@ -453,10 +459,10 @@ function walkFiles(root, predicate, output = []) {
   return output;
 }
 
-function loadTitleMaps() {
+function loadTitleMaps(root = codexRoot) {
   const titles = new Map();
   const archived = new Map();
-  for (const line of readLines(path.join(codexRoot, 'history.jsonl'))) {
+  for (const line of readLines(path.join(root, 'history.jsonl'))) {
     if (!line.includes('session_id')) continue;
     const obj = parseJsonLine(line);
     if (obj?.session_id) {
@@ -464,7 +470,7 @@ function loadTitleMaps() {
       if (obj.is_archived !== undefined) archived.set(String(obj.session_id), Boolean(obj.is_archived));
     }
   }
-  for (const line of readLines(path.join(codexRoot, 'session_index.jsonl'))) {
+  for (const line of readLines(path.join(root, 'session_index.jsonl'))) {
     if (!line.includes('"id"')) continue;
     const obj = parseJsonLine(line);
     if (obj?.id && obj.thread_name) titles.set(String(obj.id), String(obj.thread_name));
@@ -472,11 +478,39 @@ function loadTitleMaps() {
   return { titles, archived };
 }
 
-function loadSessionsFromFiles() {
-  const { titles, archived } = loadTitleMaps();
+function sortSessionsByUpdatedAt(sessions) {
+  return sessions.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+}
+
+function mergeSessionLists(primarySessions, fallbackSessions) {
+  const sessionsById = new Map();
+  for (const session of fallbackSessions) {
+    if (session.id) sessionsById.set(session.id, session);
+  }
+  for (const session of primarySessions) {
+    if (!session.id) continue;
+    const fallback = sessionsById.get(session.id);
+    if (fallback && !session.existsOnDisk && fallback.existsOnDisk) {
+      sessionsById.set(session.id, {
+        ...session,
+        title: session.title || fallback.title,
+        rolloutPath: fallback.rolloutPath,
+        archived: session.archived || fallback.archived,
+        existsOnDisk: true,
+        sizeBytes: fallback.sizeBytes
+      });
+    } else {
+      sessionsById.set(session.id, session);
+    }
+  }
+  return sortSessionsByUpdatedAt([...sessionsById.values()]);
+}
+
+function loadSessionsFromFiles(root = codexRoot) {
+  const { titles, archived } = loadTitleMaps(root);
   const files = [
-    ...walkFiles(path.join(codexRoot, 'sessions'), (filePath) => filePath.endsWith('.jsonl')),
-    ...walkFiles(path.join(codexRoot, 'archived_sessions'), (filePath) => filePath.endsWith('.jsonl'))
+    ...walkFiles(path.join(root, 'sessions'), (filePath) => filePath.endsWith('.jsonl')),
+    ...walkFiles(path.join(root, 'archived_sessions'), (filePath) => filePath.endsWith('.jsonl'))
   ];
 
   return files.map((filePath) => {
@@ -496,7 +530,7 @@ function loadSessionsFromFiles() {
       archived: archived.has(id) ? archived.get(id) : filePath.includes(`${path.sep}archived_sessions${path.sep}`)
     };
     return makeSession(row, true, stat.size);
-  }).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  }).filter((session) => session.id).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 }
 
 function inferSnapshotReason(snapshot) {

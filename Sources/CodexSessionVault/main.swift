@@ -96,6 +96,15 @@ private struct SessionDatabaseRow: Decodable {
     let archived: Int
 }
 
+private struct RolloutFileMetadata {
+    var cwd = ""
+    var modelProvider = "unknown"
+    var model = "unknown"
+    var source = "jsonl"
+    var title = ""
+    var createdAt: Date?
+}
+
 enum AppSection: String, CaseIterable, Identifiable {
     case sessions = "会话管理"
     case snapshots = "快照恢复"
@@ -307,7 +316,7 @@ final class VaultModel: ObservableObject {
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
-    private let appVersion = "1.0.8"
+    private let appVersion = "1.0.9"
     private var didRunLaunchAutoRestore = false
     private var conversationLoadID = UUID()
     private var sessionSearchTask: Task<Void, Never>?
@@ -1170,34 +1179,52 @@ final class VaultModel: ObservableObject {
     private func loadSessions() throws -> [CodexSession] {
         let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
         let database = root.appendingPathComponent("state_5.sqlite")
-        guard fileManager.fileExists(atPath: database.path) else { return [] }
-
-        return try loadSessionRows(from: database).map { row in
-            let rolloutURL = resolvedRolloutFileURL(sessionID: row.id, rolloutPath: row.rolloutPath, dataRoot: root, snapshotCodexRoot: codexRoot)
-            let exists = rolloutURL != nil
-            return makeSession(
-                row: row,
-                existsOnDisk: exists,
-                sizeBytes: rolloutURL.map(fileSize) ?? 0,
-                rolloutPathOverride: rolloutURL?.path
-            )
+        if fileManager.fileExists(atPath: database.path),
+           let sessions = try? loadSessionsFromStateDatabase(database: database, dataRoot: root, snapshotCodexRoot: codexRoot),
+           !sessions.isEmpty {
+            return sessions
         }
+        return try loadSessionsFromFiles(root: root)
     }
 
     private func loadSessions(in snapshot: SnapshotMeta) throws -> [CodexSession] {
         let dataURL = snapshotDataURL(snapshot)
         let database = dataURL.appendingPathComponent("state_5.sqlite")
-        guard fileManager.fileExists(atPath: database.path) else { return [] }
+        guard fileManager.fileExists(atPath: database.path) else {
+            return try loadSessionsFromFiles(root: dataURL)
+        }
 
-        return try loadSessionRows(from: database).map { row in
+        let databaseSessions = (try? loadSessionsFromStateDatabase(
+            database: database,
+            dataRoot: dataURL,
+            snapshotCodexRoot: snapshot.codexRoot
+        )) ?? []
+        if !databaseSessions.isEmpty, databaseSessions.allSatisfy(\.existsOnDisk) {
+            return databaseSessions
+        }
+        let fileSessions = try loadSessionsFromFiles(root: dataURL)
+        return mergedSessions(primary: databaseSessions, fallback: fileSessions)
+    }
+
+    private func loadSessionsFromStateDatabase(
+        database: URL,
+        dataRoot: URL,
+        snapshotCodexRoot: String
+    ) throws -> [CodexSession] {
+        try loadSessionRows(from: database).map { row in
             let snapshotFileURL = resolvedRolloutFileURL(
                 sessionID: row.id,
                 rolloutPath: row.rolloutPath,
-                dataRoot: dataURL,
-                snapshotCodexRoot: snapshot.codexRoot
+                dataRoot: dataRoot,
+                snapshotCodexRoot: snapshotCodexRoot
             )
             let exists = snapshotFileURL != nil
-            return makeSession(row: row, existsOnDisk: exists, sizeBytes: snapshotFileURL.map(fileSize) ?? 0)
+            return makeSession(
+                row: row,
+                existsOnDisk: exists,
+                sizeBytes: snapshotFileURL.map(fileSize) ?? 0,
+                rolloutPathOverride: snapshotFileURL?.path
+            )
         }
     }
 
@@ -1219,6 +1246,169 @@ final class VaultModel: ObservableObject {
         """
         let output = try runCommand(executable: "/usr/bin/sqlite3", arguments: ["-json", database.path, sql])
         return try JSONDecoder().decode([SessionDatabaseRow].self, from: Data(output.utf8))
+    }
+
+    private func loadSessionsFromFiles(root: URL) throws -> [CodexSession] {
+        let titleMaps = loadTitleMaps(root: root)
+        var fileURLs: [URL] = []
+        for directory in ["sessions", "archived_sessions"] {
+            let dirURL = root.appendingPathComponent(directory, isDirectory: true)
+            guard let enumerator = fileManager.enumerator(
+                at: dirURL,
+                includingPropertiesForKeys: [.isRegularFileKey, .creationDateKey, .contentModificationDateKey, .fileSizeKey]
+            ) else {
+                continue
+            }
+            for case let fileURL as URL in enumerator where fileURL.pathExtension == "jsonl" {
+                fileURLs.append(fileURL)
+            }
+        }
+
+        let sessions = fileURLs.compactMap { fileURL -> CodexSession? in
+            let id = extractSessionID(from: fileURL)
+            guard !id.isEmpty else { return nil }
+            let metadata = rolloutFileMetadata(fileURL)
+            let values = try? fileURL.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey, .fileSizeKey])
+            let updatedAt = values?.contentModificationDate ?? metadata.createdAt ?? Date(timeIntervalSince1970: 0)
+            let createdAt = values?.creationDate ?? metadata.createdAt ?? updatedAt
+            let relPath = relativePath(fileURL, under: root)
+            let archived = titleMaps.archived[id] ?? (relPath?.hasPrefix("archived_sessions/") == true)
+            return CodexSession(
+                id: id,
+                title: titleMaps.titles[id] ?? (metadata.title.isEmpty ? id : metadata.title),
+                rolloutPath: fileURL.path,
+                cwd: metadata.cwd,
+                modelProvider: metadata.modelProvider,
+                model: metadata.model,
+                source: metadata.source,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                archived: archived,
+                sizeBytes: Int64(values?.fileSize ?? 0),
+                existsOnDisk: true
+            )
+        }
+        return sessions.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func loadTitleMaps(root: URL) -> (titles: [String: String], archived: [String: Bool]) {
+        var titles: [String: String] = [:]
+        var archived: [String: Bool] = [:]
+
+        for line in (try? readLineData(root.appendingPathComponent("history.jsonl"))) ?? [] {
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let id = object["session_id"] as? String else {
+                continue
+            }
+            if let firstText = object["first_text"] as? String, !firstText.isEmpty {
+                titles[id] = firstText
+            }
+            if let isArchived = object["is_archived"] as? Bool {
+                archived[id] = isArchived
+            } else if let isArchived = object["is_archived"] as? NSNumber {
+                archived[id] = isArchived.boolValue
+            }
+        }
+
+        for line in (try? readLineData(root.appendingPathComponent("session_index.jsonl"))) ?? [] {
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let id = object["id"] as? String,
+                  let title = object["thread_name"] as? String,
+                  !title.isEmpty else {
+                continue
+            }
+            titles[id] = title
+        }
+
+        return (titles, archived)
+    }
+
+    private func mergedSessions(primary: [CodexSession], fallback: [CodexSession]) -> [CodexSession] {
+        var sessionsByID: [String: CodexSession] = [:]
+        for session in fallback where !session.id.isEmpty {
+            sessionsByID[session.id] = session
+        }
+        for session in primary where !session.id.isEmpty {
+            if let fallbackSession = sessionsByID[session.id],
+               !session.existsOnDisk,
+               fallbackSession.existsOnDisk {
+                sessionsByID[session.id] = CodexSession(
+                    id: session.id,
+                    title: session.title.isEmpty ? fallbackSession.title : session.title,
+                    rolloutPath: fallbackSession.rolloutPath,
+                    cwd: session.cwd,
+                    modelProvider: session.modelProvider,
+                    model: session.model,
+                    source: session.source,
+                    createdAt: session.createdAt,
+                    updatedAt: session.updatedAt,
+                    archived: session.archived || fallbackSession.archived,
+                    sizeBytes: fallbackSession.sizeBytes,
+                    existsOnDisk: true
+                )
+            } else {
+                sessionsByID[session.id] = session
+            }
+        }
+        return sessionsByID.values.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func extractSessionID(from fileURL: URL) -> String {
+        let pattern = #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return "" }
+        let text = fileURL.lastPathComponent
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              let idRange = Range(match.range, in: text) else {
+            return ""
+        }
+        return String(text[idRange]).lowercased()
+    }
+
+    private func rolloutFileMetadata(_ fileURL: URL) -> RolloutFileMetadata {
+        var metadata = RolloutFileMetadata()
+        for line in ((try? readLineData(fileURL)) ?? []).prefix(160) {
+            guard !line.isWhitespaceOrEmpty,
+                  let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                continue
+            }
+            let objectType = object["type"] as? String
+            let payload = object["payload"] as? [String: Any]
+
+            if objectType == "session_meta", let payload {
+                metadata.cwd = (payload["cwd"] as? String) ?? metadata.cwd
+                metadata.modelProvider = (payload["model_provider"] as? String) ?? metadata.modelProvider
+                metadata.model = (payload["model"] as? String) ?? metadata.model
+                metadata.source = (payload["source"] as? String) ?? metadata.source
+                if let timestamp = payload["timestamp"] as? String {
+                    metadata.createdAt = parseCodexTimestamp(timestamp) ?? metadata.createdAt
+                }
+            }
+
+            let payloadType = payload?["type"] as? String
+            if objectType == "user_message" || payloadType == "user_message" || payload?["role"] as? String == "user" {
+                if let title = userMessageTitle(from: payload), !title.isEmpty {
+                    metadata.title = title
+                    break
+                }
+            }
+        }
+        return metadata
+    }
+
+    private func userMessageTitle(from payload: [String: Any]?) -> String? {
+        guard let payload else { return nil }
+        if let message = payload["message"] as? String {
+            return message.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let content = payload["content"] as? [[String: Any]] {
+            for item in content {
+                if let text = item["text"] as? String {
+                    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        }
+        return nil
     }
 
     private func makeSession(
@@ -4484,7 +4674,7 @@ struct SnapshotSessionRestoreCard: View {
                 }
 
                 if model.snapshotSessions.isEmpty {
-                    Text("这个快照里没有可读取的会话索引。")
+                    Text("这个快照里没有可读取的会话文件或索引。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else if model.filteredSnapshotSessions.isEmpty {

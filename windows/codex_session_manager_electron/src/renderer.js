@@ -440,7 +440,7 @@ function renderSnapshotDetail(snapshot) {
   const sessionListHtml = state.snapshotSessionsLoading
     ? '<div class="snapshot-session-empty">正在读取快照内会话...</div>'
     : state.snapshotSessions.length === 0
-      ? '<div class="snapshot-session-empty">这个快照里没有可读取的会话索引。</div>'
+      ? '<div class="snapshot-session-empty">这个快照里没有可读取的会话文件或索引。</div>'
       : snapshotSessions.length === 0
         ? '<div class="snapshot-session-empty">没有匹配会话，换个关键词试试。</div>'
         : snapshotSessions.map((session) => `
