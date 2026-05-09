@@ -13,6 +13,8 @@
 - macOS：下载 `codex_session_keeper_macos_v1.0.10.zip`，解压后运行 `codex_会话管理.app`。
 - Windows：下载 `codex_session_keeper_windows_v1.0.10.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
 
+[下载地址](https://github.com/a110q/CodexSessionKeeper/releases)
+
 Windows 版本是免安装便携版。不要只拷贝单独的 exe 文件，Electron 运行时需要同目录下的 `resources`、`locales` 和 `.dll` 文件。
 
 ## 核心功能
@@ -60,6 +62,30 @@ Windows 使用当前用户目录下的等效路径：
 只有你明确想把账号、登录态和 `config.toml` 一起回滚到快照状态时，才使用“完整恢复”。
 
 恢复或删除会话前，建议先退出 Codex 客户端。恢复完成后如果 Codex 已经打开，请重启 Codex 再查看恢复结果。
+
+## 快照说明
+
+快照一般会同时保存会话文件、历史索引和 SQLite 线程索引。
+
+如果 Windows 环境下 Codex 正在写入 `state_5.sqlite`，或者这个数据库临时不可读，工具会自动降级创建“文件型快照”。文件型快照仍包含 `history.jsonl`、`session_index.jsonl`、`sessions` 和 `archived_sessions`，可以继续恢复会话文件；只是会跳过 SQLite 索引清洗。看到“已降级创建文件型快照”不是创建失败。
+
+如果你想创建包含完整 SQLite 索引的快照，先退出 Codex 客户端，再重新点击“创建快照”。
+
+## 常见问题
+
+### Windows 提示 `database disk image is malformed`
+
+这通常说明 Codex 的 `state_5.sqlite` 在当时不可读，可能是 Codex 正在写入、WAL 文件还没合并，或者数据库文件已经损坏。
+
+`v1.0.10` 起不会因此中断创建快照，会自动降级为文件型快照。建议先退出 Codex 后再创建一次快照，如果仍反复出现，可以先使用文件型快照恢复重要会话。
+
+### 快照里没有 `state_5.sqlite` 还能恢复吗
+
+可以。只要快照里有 `sessions` 或 `archived_sessions` 下的 jsonl 会话文件，工具会从这些文件识别并恢复会话。恢复后建议重启 Codex。
+
+### Windows 打开 exe 没反应
+
+请确认解压了整个文件夹，不要只拷贝 `codex_session_manager.exe`。Electron 便携版必须和 `resources`、`locales`、`.dll` 等文件放在同一个目录。
 
 ## 从源码构建
 
