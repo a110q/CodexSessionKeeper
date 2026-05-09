@@ -92,7 +92,8 @@ function showToast(message, isError = false) {
   els.toast.textContent = message;
   els.toast.style.background = isError ? 'rgba(194, 65, 45, 0.96)' : 'rgba(31, 122, 90, 0.96)';
   els.toast.classList.remove('hidden');
-  setTimeout(() => els.toast.classList.add('hidden'), 3600);
+  const textLength = String(message || '').length;
+  setTimeout(() => els.toast.classList.add('hidden'), textLength > 80 ? 9000 : 3600);
 }
 
 function showRestoreComplete(message) {

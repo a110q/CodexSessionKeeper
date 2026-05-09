@@ -7,7 +7,7 @@ const crypto = require('crypto');
 let mainWindow;
 let sqlPromise;
 
-const appVersion = '1.0.9';
+const appVersion = '1.0.10';
 const codexRoot = path.join(os.homedir(), '.codex');
 const vaultRoot = path.join(os.homedir(), '.codex-session-vault');
 const snapshotRoot = path.join(vaultRoot, 'snapshots');
@@ -655,6 +655,30 @@ function copyPathIntoSnapshot(relativePath, dataPath) {
   return true;
 }
 
+async function copyStateDatabaseIntoSnapshot(dataPath) {
+  if (!copyPathIntoSnapshot('state_5.sqlite', dataPath)) {
+    return { ok: false, warning: '' };
+  }
+
+  const databasePath = path.join(dataPath, 'state_5.sqlite');
+  let db;
+  try {
+    db = await openDatabase(databasePath);
+    const rows = execRows(db, 'PRAGMA integrity_check;');
+    const result = String(rows[0]?.integrity_check || '').toLowerCase();
+    if (result && result !== 'ok') throw new Error(`integrity_check: ${result}`);
+    return { ok: true, warning: '' };
+  } catch (error) {
+    if (exists(databasePath)) fs.rmSync(databasePath, { force: true });
+    return {
+      ok: false,
+      warning: `SQLite 索引库当前不可读，已降级创建文件型快照。原因：${error.message || error}`
+    };
+  } finally {
+    if (db) db.close();
+  }
+}
+
 function removeStateDatabaseSidecars(dataPath) {
   for (const relativePath of ['state_5.sqlite-shm', 'state_5.sqlite-wal']) {
     const targetPath = path.join(dataPath, relativePath);
@@ -687,7 +711,7 @@ function repairSnapshotStateDatabaseRolloutPaths(db, dataPath, snapshotCodexRoot
 
 async function sanitizeSnapshotData(dataPath, snapshotCodexRoot) {
   const databasePath = path.join(dataPath, 'state_5.sqlite');
-  if (!exists(databasePath)) return new Set();
+  if (!exists(databasePath)) return { restorableSessionIds: new Set(), warning: '' };
 
   const snapshot = { dataPath, codexRoot: snapshotCodexRoot };
   const restorableSessionIds = new Set(
@@ -702,6 +726,13 @@ async function sanitizeSnapshotData(dataPath, snapshotCodexRoot) {
     pruneStateDatabase(db, restorableSessionIds);
     repairSnapshotStateDatabaseRolloutPaths(db, dataPath, snapshotCodexRoot, restorableSessionIds);
     writeDatabase(databasePath, db);
+  } catch (error) {
+    if (exists(databasePath)) fs.rmSync(databasePath, { force: true });
+    removeStateDatabaseSidecars(dataPath);
+    return {
+      restorableSessionIds,
+      warning: `SQLite 索引库清洗失败，已降级创建文件型快照。原因：${error.message || error}`
+    };
   } finally {
     if (db) db.close();
   }
@@ -714,7 +745,7 @@ async function sanitizeSnapshotData(dataPath, snapshotCodexRoot) {
     );
   }
   removeStateDatabaseSidecars(dataPath);
-  return restorableSessionIds;
+  return { restorableSessionIds, warning: '' };
 }
 
 function pruneSnapshots(snapshots, limit) {
@@ -747,13 +778,25 @@ async function createSnapshot(name, reason, candidates = backupCandidates) {
     .filter((candidate) => !stateDatabaseSnapshotPaths.has(candidate))
     .filter((candidate) => copyPathIntoSnapshot(candidate, dataPath));
 
-  if (candidates.includes('state_5.sqlite') && copyPathIntoSnapshot('state_5.sqlite', dataPath)) {
-    includedPaths.push('state_5.sqlite');
+  const warnings = [];
+  if (candidates.includes('state_5.sqlite')) {
+    const stateCopy = await copyStateDatabaseIntoSnapshot(dataPath);
+    if (stateCopy.ok) {
+      includedPaths.push('state_5.sqlite');
+    } else if (stateCopy.warning) {
+      warnings.push(stateCopy.warning);
+    }
   }
 
   let sanitizedCounts = null;
   if (includedPaths.includes('state_5.sqlite')) {
-    const restorableSessionIds = await sanitizeSnapshotData(dataPath, codexRoot);
+    const sanitized = await sanitizeSnapshotData(dataPath, codexRoot);
+    if (sanitized.warning) warnings.push(sanitized.warning);
+    if (!exists(path.join(dataPath, 'state_5.sqlite'))) {
+      const index = includedPaths.indexOf('state_5.sqlite');
+      if (index >= 0) includedPaths.splice(index, 1);
+    }
+    const restorableSessionIds = sanitized.restorableSessionIds;
     sanitizedCounts = snapshotSessionCounts(dataPath, restorableSessionIds);
   }
 
@@ -772,7 +815,8 @@ async function createSnapshot(name, reason, candidates = backupCandidates) {
     archivedSessionCount: sanitizedCounts?.archived ?? currentState.archivedSessionCount,
     sizeBytes: directorySize(dataPath),
     includedPaths,
-    appVersion: `win-exe-${appVersion}`
+    appVersion: `win-exe-${appVersion}`,
+    warnings
   };
   fs.writeFileSync(path.join(snapshotPath, 'snapshot.json'), JSON.stringify(meta, null, 2), 'utf8');
   return meta;
@@ -847,11 +891,20 @@ async function createSessionProtectionSnapshot(name, reason, sessions) {
   if (copyShellSnapshotsForSessions(sessionIds, dataPath)) {
     includedPaths.add('shell_snapshots');
   }
-  if (copyPathIntoSnapshot('state_5.sqlite', dataPath)) {
+  const warnings = [];
+  const stateCopy = await copyStateDatabaseIntoSnapshot(dataPath);
+  if (stateCopy.ok) {
     includedPaths.add('state_5.sqlite');
+  } else if (stateCopy.warning) {
+    warnings.push(stateCopy.warning);
   }
 
-  const restorableSessionIds = await sanitizeSnapshotData(dataPath, codexRoot);
+  const sanitized = await sanitizeSnapshotData(dataPath, codexRoot);
+  if (sanitized.warning) warnings.push(sanitized.warning);
+  if (!exists(path.join(dataPath, 'state_5.sqlite'))) includedPaths.delete('state_5.sqlite');
+  const restorableSessionIds = sanitized.restorableSessionIds.size
+    ? sanitized.restorableSessionIds
+    : new Set(loadSessionsFromFiles(dataPath).map((session) => session.id));
   const counts = snapshotSessionCounts(dataPath, restorableSessionIds);
   const currentState = inspectCurrentState();
   const meta = {
@@ -868,7 +921,8 @@ async function createSessionProtectionSnapshot(name, reason, sessions) {
     archivedSessionCount: counts.archived,
     sizeBytes: directorySize(dataPath),
     includedPaths: [...includedPaths].sort(),
-    appVersion: `win-exe-${appVersion}`
+    appVersion: `win-exe-${appVersion}`,
+    warnings
   };
   fs.writeFileSync(path.join(snapshotPath, 'snapshot.json'), JSON.stringify(meta, null, 2), 'utf8');
   enforceAutomaticSnapshotRetention();
@@ -1440,7 +1494,11 @@ ipcMain.handle('set-auto-restore', async (_event, enabled) => {
 
 ipcMain.handle('create-snapshot', async (_event, name) => {
   const meta = await createSnapshot(name, 'manual', backupCandidates);
-  return { ok: true, message: `快照已创建：${meta.name}` };
+  const warning = (meta.warnings || []).filter(Boolean).join('\n');
+  return {
+    ok: true,
+    message: warning ? `快照已创建：${meta.name}\n${warning}` : `快照已创建：${meta.name}`
+  };
 });
 
 ipcMain.handle('load-snapshot-sessions', async (_event, snapshotId) => {
