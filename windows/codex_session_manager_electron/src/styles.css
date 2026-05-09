@@ -905,6 +905,12 @@ p {
   font-size: 12px;
 }
 
+.busy-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
 @keyframes busySpin {
   to {
     transform: rotate(360deg);

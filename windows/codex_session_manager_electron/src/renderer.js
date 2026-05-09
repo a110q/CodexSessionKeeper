@@ -53,8 +53,11 @@ const els = {
   conversationRevealFile: $('#conversationRevealFile'),
   busyOverlay: $('#busyOverlay'),
   busyTitle: $('#busyTitle'),
-  busyDetail: $('#busyDetail')
+  busyDetail: $('#busyDetail'),
+  busyCancelBtn: $('#busyCancelBtn')
 };
+
+let activeBusyController = null;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -119,24 +122,45 @@ function busyDetailFor(message) {
   return '正在处理本地 Codex 数据。文件较多或磁盘较忙时会需要一些时间，请耐心等待。';
 }
 
-function showBusy(message) {
+function showBusy(message, controller) {
+  activeBusyController = controller;
   els.busyTitle.textContent = message || '正在处理...';
   els.busyDetail.textContent = busyDetailFor(message);
+  els.busyCancelBtn.textContent = '取消';
+  els.busyCancelBtn.disabled = false;
   els.busyOverlay.classList.remove('hidden');
 }
 
 function hideBusy() {
   els.busyOverlay.classList.add('hidden');
+  activeBusyController = null;
 }
 
 async function withBusy(message, operation) {
-  showBusy(message);
+  const controller = { cancelled: false };
+  showBusy(message, controller);
   await new Promise((resolve) => requestAnimationFrame(resolve));
   try {
-    return await operation();
+    const result = await operation();
+    if (controller.cancelled) {
+      return { cancelled: true };
+    }
+    return result;
   } finally {
     hideBusy();
   }
+}
+
+function busyWasCancelled(result) {
+  return Boolean(result?.cancelled);
+}
+
+function cancelActiveBusyOperation() {
+  if (!activeBusyController || activeBusyController.cancelled) return;
+  activeBusyController.cancelled = true;
+  els.busyCancelBtn.textContent = '正在取消...';
+  els.busyCancelBtn.disabled = true;
+  els.busyDetail.textContent = '已请求取消。Windows 版会等待当前文件步骤结束后停止后续刷新和提示，请稍等。';
 }
 
 function setSection(section) {
@@ -559,6 +583,7 @@ async function maybeRunLaunchAutoRestore(suggestion) {
   );
   if (!ok) return;
   const result = await withBusy('正在自动找回会话...', () => window.codexManager.restoreSnapshotConversations(suggestion.snapshotId));
+  if (busyWasCancelled(result)) return;
   showRestoreComplete(result.message || '已自动找回会话');
   await refresh({ skipAutoRestore: true });
   setSection('sessions');
@@ -675,6 +700,7 @@ async function runSessionAction(action, session) {
       );
       if (!protectionMode) return;
       const result = await withBusy('正在恢复单个会话...', () => window.codexManager.restoreSession(session.id, protectionMode));
+      if (busyWasCancelled(result)) return;
       showRestoreComplete(result.message || '恢复完成');
       await refresh();
       state.selectedSessionId = session.id;
@@ -683,6 +709,7 @@ async function runSessionAction(action, session) {
     if (action === 'delete') {
       if (!confirm(`删除这个 Codex 会话？\n\n${session.title}\n\n删除前会自动创建轻量恢复点，只保存将被删除的会话。`)) return;
       const result = await withBusy('正在删除会话...', () => window.codexManager.deleteSession(session.id));
+      if (busyWasCancelled(result)) return;
       showToast(result.message || '删除完成');
       await refresh();
     }
@@ -699,6 +726,7 @@ async function deleteCheckedSessions() {
   if (!confirm(`批量删除 Codex 会话？\n\n将删除 ${sessions.length} 个会话，并清理会话文件、索引和线程记录。删除前会自动创建轻量恢复点，只保存将被删除的会话。\n\n${preview}${suffix}`)) return;
   try {
     const result = await withBusy('正在批量删除会话...', () => window.codexManager.deleteSessions(sessions.map((session) => session.id)));
+    if (busyWasCancelled(result)) return;
     state.checkedSessionIds.clear();
     showToast(result.message || '批量删除完成');
     await refresh({ skipAutoRestore: true });
@@ -739,6 +767,7 @@ async function runSnapshotAction(action) {
       );
       if (!protectionMode) return;
       const result = await withBusy('正在恢复对话...', () => window.codexManager.restoreSnapshotConversations(snapshot.id, protectionMode));
+      if (busyWasCancelled(result)) return;
       showRestoreComplete(result.message || '恢复完成');
       await refresh({ skipAutoRestore: true });
       return;
@@ -751,6 +780,7 @@ async function runSnapshotAction(action) {
       );
       if (!protectionMode) return;
       const result = await withBusy('正在完整恢复快照...', () => window.codexManager.restoreSnapshotFull(snapshot.id, protectionMode));
+      if (busyWasCancelled(result)) return;
       showRestoreComplete(result.message || '完整恢复完成');
       await refresh({ skipAutoRestore: true });
       return;
@@ -769,6 +799,7 @@ async function runSnapshotAction(action) {
       );
       if (!protectionMode) return;
       const result = await withBusy('正在恢复单个会话...', () => window.codexManager.restoreSnapshotSession(snapshot.id, session.id, protectionMode));
+      if (busyWasCancelled(result)) return;
       showRestoreComplete(result.message || '单个会话已恢复');
       await refresh({ skipAutoRestore: true });
       state.selectedSessionId = session.id;
@@ -787,6 +818,7 @@ async function runSnapshotAction(action) {
       );
       if (!protectionMode) return;
       const result = await withBusy('正在批量恢复会话...', () => window.codexManager.restoreSnapshotSessions(snapshot.id, sessions.map((session) => session.id), protectionMode));
+      if (busyWasCancelled(result)) return;
       showRestoreComplete(result.message || '批量恢复完成');
       state.checkedSnapshotSessionIds.clear();
       await refresh({ skipAutoRestore: true });
@@ -796,6 +828,7 @@ async function runSnapshotAction(action) {
     if (action === 'deleteSnapshot') {
       if (!confirm(`删除这个快照？\n\n${snapshot.name}\n\n删除后无法从这个快照恢复，不会影响当前 Codex 会话。`)) return;
       const result = await withBusy('正在删除快照...', () => window.codexManager.deleteSnapshot(snapshot.id));
+      if (busyWasCancelled(result)) return;
       showToast(result.message || '快照已删除');
       state.selectedSnapshotId = null;
       state.snapshotSessions = [];
@@ -815,6 +848,7 @@ async function deleteCheckedSnapshots() {
   if (!confirm(`批量删除快照？\n\n将删除 ${snapshots.length} 个快照，该操作不可撤销。不会影响当前 Codex 会话。\n\n${preview}${suffix}`)) return;
   try {
     const result = await withBusy('正在批量删除快照...', () => window.codexManager.deleteSnapshots(snapshots.map((snapshot) => snapshot.id)));
+    if (busyWasCancelled(result)) return;
     state.checkedSnapshotIds.clear();
     state.selectedSnapshotId = null;
     showToast(result.message || '批量删除完成');
@@ -979,9 +1013,11 @@ els.clearCheckedSessionsBtn.addEventListener('click', () => {
   renderSessions();
 });
 els.deleteCheckedSessionsBtn.addEventListener('click', deleteCheckedSessions);
+els.busyCancelBtn.addEventListener('click', cancelActiveBusyOperation);
 $('#createSnapshotBtn').addEventListener('click', async () => {
   try {
     const result = await withBusy('正在创建快照...', () => window.codexManager.createSnapshot(els.snapshotName.value.trim()));
+    if (busyWasCancelled(result)) return;
     els.snapshotName.value = '';
     showToast(result.message || '快照已创建');
     await refresh();
