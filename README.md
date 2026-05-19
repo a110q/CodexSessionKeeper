@@ -9,15 +9,15 @@
 | 位置 | 状态 |
 | --- | --- |
 | GitHub `main` | 已包含最新 UI 改造：macOS 与 Windows 视觉统一、Windows 侧栏状态卡、会话列表层级优化、详情页会话预览、暗色模式等。 |
-| GitHub Releases | 当前最新公开包仍是 `v1.0.11`，对应修复 Windows 快照复制时 `EPERM lstat` 中断的问题。 |
-| 最新安装包 | 如果要体验 `main` 最新改造，请先从源码重新构建，或发布新的 release 后再下载。 |
+| GitHub Releases | 最新公开包为 `v1.0.12`，包含本轮 UI 改造和 `v1.0.11` 的 Windows 快照容错修复。 |
+| 最新安装包 | 请优先下载 `v1.0.12` 的 macOS 或 Windows zip。 |
 
 下载稳定版：
 
 [GitHub Releases](https://github.com/a110q/CodexSessionKeeper/releases)
 
-- macOS：下载 `codex_session_keeper_macos_v1.0.11.zip`，解压后运行 `codex_会话管理.app`。
-- Windows：下载 `codex_session_keeper_windows_v1.0.11.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
+- macOS：下载 `codex_session_keeper_macos_v1.0.12.zip`，解压后运行 `codex_会话管理.app`。
+- Windows：下载 `codex_session_keeper_windows_v1.0.12.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
 
 Windows 版本是免安装便携版。不要只拷贝单独的 exe 文件，Electron 运行时需要同目录下的 `resources`、`locales` 和 `.dll` 文件。
 
@@ -165,7 +165,7 @@ git push origin main
 
 ### 为什么 GitHub 代码更新了，但 Releases 还是旧包
 
-GitHub 的源码提交和 Releases 附件是两套流程。`git push origin main` 只会更新仓库源码；安装包 zip 需要另外在 GitHub Releases 上传。看到 Releases 仍显示 `v1.0.11`，说明最新源码已推送，但最新包还没有发布成 release asset。
+GitHub 的源码提交和 Releases 附件是两套流程。`git push origin main` 只会更新仓库源码；安装包 zip 需要另外在 GitHub Releases 上传。如果 Releases 仍显示旧版本，说明最新源码已推送，但最新包还没有发布成 release asset。
 
 ## 技术结构
 
