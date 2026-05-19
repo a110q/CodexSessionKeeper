@@ -11,7 +11,7 @@
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand-block">
-        <div class="brand-mark">C</div>
+        <img class="brand-mark" src="./assets/CodexSessionVaultIcon.png" alt="" />
         <div>
           <h1>codex_会话管理</h1>
           <p>管理、备份和恢复 Codex 对话</p>
@@ -30,6 +30,14 @@
         <button class="nav-button active" data-section="sessions">会话管理</button>
         <button class="nav-button" data-section="snapshots">快照恢复</button>
       </nav>
+
+      <div class="sidebar-settings">
+        <label class="switch-line" title="打开应用时检测会话丢失，确认后只恢复对话">
+          <span>打开时自动找回</span>
+          <input id="autoRestoreSwitch" type="checkbox" />
+        </label>
+        <p>仅在需要自动补回丢失对话时开启。</p>
+      </div>
     </aside>
 
     <main class="main">
@@ -42,10 +50,6 @@
           </div>
         </div>
         <div class="top-actions">
-          <label class="switch-line" title="打开应用时检测会话丢失，确认后只恢复对话">
-            <span>打开时自动找回</span>
-            <input id="autoRestoreSwitch" type="checkbox" />
-          </label>
           <button id="refreshBtn" class="ghost-button">刷新</button>
           <div class="open-dir-wrap">
             <button id="openDirsBtn" class="ghost-button">打开目录</button>
@@ -63,7 +67,7 @@
             <div class="panel-heading">
               <div>
                 <h2>会话列表</h2>
-                <p>单击选中会话；双击查看对话记录；右键可从快照恢复指定会话。</p>
+                <p>选择后右侧会预览对话；双击仍可打开完整记录。</p>
               </div>
               <span id="sessionCount" class="count-pill">0 / 0</span>
             </div>

@@ -312,7 +312,6 @@ final class VaultModel: ObservableObject {
     @Published var lastError: String?
 
     private static let autoRestoreDefaultsKey = "autoRestoreOnLaunch"
-    private static let autoRestoreDefaultOffMigrationKey = "autoRestoreDefaultOffMigration.v1"
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
@@ -335,13 +334,8 @@ final class VaultModel: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         codexRoot = explicitCodexRoot ?? "\(home)/.codex"
         vaultRoot = explicitVaultRoot ?? "\(home)/.codex-session-vault"
-        if UserDefaults.standard.bool(forKey: Self.autoRestoreDefaultOffMigrationKey) {
-            autoRestoreOnLaunch = UserDefaults.standard.object(forKey: Self.autoRestoreDefaultsKey) as? Bool ?? false
-        } else {
-            autoRestoreOnLaunch = false
-            UserDefaults.standard.set(false, forKey: Self.autoRestoreDefaultsKey)
-            UserDefaults.standard.set(true, forKey: Self.autoRestoreDefaultOffMigrationKey)
-        }
+        autoRestoreOnLaunch = false
+        UserDefaults.standard.set(false, forKey: Self.autoRestoreDefaultsKey)
         if refreshOnInit {
             refresh()
         }
@@ -3878,7 +3872,7 @@ struct CodexSessionVaultApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 1180, minHeight: 760)
+                .frame(minWidth: 1280, minHeight: 760)
         }
         .windowStyle(.titleBar)
         .commands {
@@ -3903,34 +3897,80 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             AppSidebar()
+                .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 360)
         } detail: {
-            VStack(spacing: 0) {
-                HStack {
-                    Picker("功能", selection: sectionBinding) {
-                        ForEach(AppSection.allCases) { section in
-                            Text(section.rawValue).tag(section)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 260)
-                    Spacer()
-                    Toggle("打开时自动找回", isOn: $model.autoRestoreOnLaunch)
-                        .toggleStyle(.switch)
-                        .help("启动 app 时自动从最新会话保护点找回丢失的对话，不覆盖账号和模型供应商配置")
-                }
-                .padding(.horizontal, 24)
-                .padding(.top, 16)
-                .padding(.bottom, 10)
-                Divider()
+            ZStack {
+                auroraBackground
 
-                switch model.selectedSection ?? .sessions {
-                case .sessions:
-                    SessionsPane()
-                case .snapshots:
-                    SnapshotPane()
+                VStack(spacing: 0) {
+                    HStack(alignment: .center, spacing: 18) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Spark Workspace")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Color(red: 0.31, green: 0.43, blue: 0.67))
+                            Picker("功能", selection: sectionBinding) {
+                                ForEach(AppSection.allCases) { section in
+                                    Text(section.rawValue).tag(section)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 260)
+                        }
+                        Spacer()
+                        HStack(spacing: 12) {
+                            VStack(alignment: .trailing, spacing: 3) {
+                                Text("打开时自动找回")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(Color(red: 0.18, green: 0.26, blue: 0.44))
+                                Text("默认关闭，仅在需要自动补回丢失对话时开启")
+                                    .font(.caption2)
+                                    .foregroundStyle(Color(red: 0.42, green: 0.50, blue: 0.66))
+                            }
+                            Toggle("", isOn: $model.autoRestoreOnLaunch)
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .help("启动 app 时自动从最新会话保护点找回丢失的对话，不覆盖账号和模型供应商配置")
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .fill(.white.opacity(0.52))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(.white.opacity(0.82), lineWidth: 1)
+                        )
+                        .shadow(color: Color(red: 0.18, green: 0.37, blue: 0.74).opacity(0.08), radius: 18, x: 0, y: 10)
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 16)
+                    .padding(.bottom, 16)
+
+                    Rectangle()
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    .clear,
+                                    Color.white.opacity(0.95),
+                                    .clear
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .frame(height: 1)
+
+                    switch model.selectedSection ?? .sessions {
+                    case .sessions:
+                        SessionsPane()
+                    case .snapshots:
+                        SnapshotPane()
+                    }
                 }
             }
         }
+        .navigationSplitViewStyle(.balanced)
         .toolbar {
             ToolbarItemGroup {
                 Button {
@@ -3980,34 +4020,91 @@ struct ContentView: View {
             model.runLaunchAutoRestoreIfNeeded()
         }
     }
+
+    private var auroraBackground: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.97, green: 0.985, blue: 1.0),
+                    Color(red: 0.92, green: 0.96, blue: 1.0),
+                    Color(red: 0.92, green: 0.99, blue: 0.97)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            RadialGradient(
+                colors: [
+                    Color(red: 0.24, green: 0.59, blue: 1.0).opacity(0.16),
+                    .clear
+                ],
+                center: .topLeading,
+                startRadius: 20,
+                endRadius: 420
+            )
+            RadialGradient(
+                colors: [
+                    Color(red: 0.27, green: 0.91, blue: 0.78).opacity(0.12),
+                    .clear
+                ],
+                center: .bottomTrailing,
+                startRadius: 20,
+                endRadius: 400
+            )
+        }
+        .ignoresSafeArea()
+    }
 }
 
 struct AppSidebar: View {
     @EnvironmentObject private var model: VaultModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("codex_会话管理")
-                    .font(.title2.bold())
-                Text("管理、删除、备份和恢复 Codex 对话。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Divider()
-                CurrentStateCard(state: model.currentState)
-            }
-            .padding()
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.84),
+                    Color(red: 0.93, green: 0.96, blue: 1.0).opacity(0.92),
+                    Color(red: 0.93, green: 0.99, blue: 0.97).opacity(0.9)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
 
-            List(selection: $model.selectedSection) {
-                Section("功能") {
-                    Label("会话管理", systemImage: "bubble.left.and.bubble.right")
-                        .tag(AppSection.sessions)
-                    Label("快照恢复", systemImage: "archivebox")
-                        .tag(AppSection.snapshots)
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("codex_会话管理")
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(Color(red: 0.14, green: 0.24, blue: 0.42))
+                    Text("管理、删除、备份和恢复 Codex 对话。")
+                        .font(.caption)
+                        .foregroundStyle(Color(red: 0.39, green: 0.50, blue: 0.65))
+                    CurrentStateCard(state: model.currentState)
                 }
+                .padding(18)
+
+                List(selection: $model.selectedSection) {
+                    Section("功能") {
+                        Label("会话管理", systemImage: "bubble.left.and.bubble.right")
+                            .tag(AppSection.sessions)
+                            .listRowBackground(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill((model.selectedSection ?? .sessions) == .sessions ? Color(red: 0.19, green: 0.54, blue: 1.0).opacity(0.18) : Color.clear)
+                                    .padding(.vertical, 2)
+                            )
+                        Label("快照恢复", systemImage: "archivebox")
+                            .tag(AppSection.snapshots)
+                            .listRowBackground(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill((model.selectedSection ?? .sessions) == .snapshots ? Color(red: 0.19, green: 0.54, blue: 1.0).opacity(0.18) : Color.clear)
+                                    .padding(.vertical, 2)
+                            )
+                    }
+                }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
             }
         }
-        .frame(minWidth: 300)
     }
 }
 
@@ -4018,13 +4115,89 @@ struct CurrentStateCard: View {
         VStack(alignment: .leading, spacing: 6) {
             Label("当前 Codex 状态", systemImage: "dot.radiowaves.left.and.right")
                 .font(.headline)
+                .foregroundStyle(Color(red: 0.16, green: 0.28, blue: 0.48))
             InfoLine("Provider", state.modelProvider)
             InfoLine("Model", state.model)
             InfoLine("Account", state.accountFingerprint)
             InfoLine("Sessions", "\(state.sessionCount) active / \(state.archivedSessionCount) archived")
         }
-        .padding(12)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+        .padding(16)
+        .background(
+            LinearGradient(
+                colors: [
+                    .white.opacity(0.7),
+                    Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.62)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(.white.opacity(0.86), lineWidth: 1)
+        )
+        .shadow(color: Color(red: 0.16, green: 0.37, blue: 0.84).opacity(0.07), radius: 22, x: 0, y: 12)
+    }
+}
+
+struct ResizableSplitView<Leading: View, Trailing: View>: View {
+    let minLeadingWidth: CGFloat
+    let minTrailingWidth: CGFloat
+    let initialLeadingWidth: CGFloat
+    @ViewBuilder let leading: () -> Leading
+    @ViewBuilder let trailing: () -> Trailing
+
+    @State private var leadingWidth: CGFloat?
+    @State private var isDragging = false
+
+    private let dividerWidth: CGFloat = 18
+
+    var body: some View {
+        GeometryReader { proxy in
+            let totalWidth = proxy.size.width
+            let resolvedLeadingWidth = currentLeadingWidth(totalWidth: totalWidth)
+
+            HStack(spacing: 0) {
+                leading()
+                    .frame(width: resolvedLeadingWidth)
+
+                ZStack {
+                    RoundedRectangle(cornerRadius: 999)
+                        .fill(isDragging ? Color(red: 0.19, green: 0.54, blue: 1.0).opacity(0.16) : Color.clear)
+                        .frame(width: 12)
+                    RoundedRectangle(cornerRadius: 999)
+                        .fill(isDragging ? Color(red: 0.19, green: 0.54, blue: 1.0).opacity(0.75) : Color(red: 0.56, green: 0.65, blue: 0.78).opacity(0.36))
+                        .frame(width: 3)
+                }
+                .frame(width: dividerWidth)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { value in
+                            isDragging = true
+                            leadingWidth = clampedLeadingWidth(value.location.x, totalWidth: totalWidth)
+                        }
+                        .onEnded { value in
+                            leadingWidth = clampedLeadingWidth(value.location.x, totalWidth: totalWidth)
+                            isDragging = false
+                        }
+                )
+
+                trailing()
+                    .frame(width: max(minTrailingWidth, totalWidth - resolvedLeadingWidth - dividerWidth))
+            }
+            .animation(.easeInOut(duration: 0.14), value: isDragging)
+        }
+    }
+
+    private func currentLeadingWidth(totalWidth: CGFloat) -> CGFloat {
+        clampedLeadingWidth(leadingWidth ?? initialLeadingWidth, totalWidth: totalWidth)
+    }
+
+    private func clampedLeadingWidth(_ proposed: CGFloat, totalWidth: CGFloat) -> CGFloat {
+        let maximumLeadingWidth = max(minLeadingWidth, totalWidth - minTrailingWidth - dividerWidth)
+        return min(max(proposed, minLeadingWidth), maximumLeadingWidth)
     }
 }
 
@@ -4041,24 +4214,45 @@ struct SnapshotRow: View {
                     .font(.caption2)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(snapshot.isManualSnapshot ? .blue.opacity(0.14) : .orange.opacity(0.14), in: Capsule())
+                    .background(snapshot.isManualSnapshot ? Color(red: 0.26, green: 0.66, blue: 1.0).opacity(0.20) : Color(red: 1.0, green: 0.72, blue: 0.42).opacity(0.18), in: Capsule())
             }
             Text("\(snapshot.modelProvider) / \(snapshot.model)")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color(red: 0.39, green: 0.50, blue: 0.66))
             Text(snapshot.createdAt.formatted(date: .numeric, time: .shortened))
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(Color(red: 0.50, green: 0.60, blue: 0.74))
         }
-        .padding(.vertical, 5)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.86),
+                    Color(red: 0.93, green: 0.97, blue: 1.0).opacity(0.72)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.white.opacity(0.86), lineWidth: 1)
+        )
     }
 }
 
 struct SessionsPane: View {
     @EnvironmentObject private var model: VaultModel
+    @State private var leadingPaneWidth: CGFloat = 520
 
     var body: some View {
-        HSplitView {
+        ResizableSplitView(
+            minLeadingWidth: 430,
+            minTrailingWidth: 520,
+            initialLeadingWidth: leadingPaneWidth
+        ) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
@@ -4071,36 +4265,60 @@ struct SessionsPane: View {
                     CountBadge(value: "\(model.filteredSessions.count) / \(model.sessions.count)")
                 }
 
-                HStack(spacing: 10) {
-                    TextField(
-                        "搜索标题、目录、模型、ID",
-                        text: Binding(
-                            get: { model.sessionSearchInput },
-                            set: { model.updateSessionSearchInput($0) }
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        TextField(
+                            "搜索标题、目录、模型、ID",
+                            text: Binding(
+                                get: { model.sessionSearchInput },
+                                set: { model.updateSessionSearchInput($0) }
+                            )
                         )
-                    )
-                        .textFieldStyle(.roundedBorder)
-                    if !model.sessionSearchInput.isEmpty {
-                        Button("清空") { model.clearSessionSearch() }
-                    }
-                    Toggle("归档", isOn: $model.showArchivedSessions)
-                        .toggleStyle(.switch)
-                        .font(.caption)
-                        .help("显示或隐藏已归档会话")
-                    Divider()
-                        .frame(height: 22)
-                    Button("全选可见") { model.checkAllVisibleSessions() }
-                        .disabled(model.filteredSessions.isEmpty)
-                    if !model.checkedSessionIDs.isEmpty {
-                        Button("清空选择") { model.clearCheckedSessions() }
-                        Button("删除选中 \(model.checkedSessionIDs.count)", role: .destructive) {
-                            model.deleteCheckedSessions()
+                            .textFieldStyle(.roundedBorder)
+                        if !model.sessionSearchInput.isEmpty {
+                            Button("清空") { model.clearSessionSearch() }
                         }
-                        .disabled(model.isBusy)
+                        Toggle("归档", isOn: $model.showArchivedSessions)
+                            .toggleStyle(.switch)
+                            .font(.caption)
+                            .help("显示或隐藏已归档会话")
+                    }
+                    HStack(spacing: 10) {
+                        Text("批量操作")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if !model.checkedSessionIDs.isEmpty {
+                            Button("清空选择") { model.clearCheckedSessions() }
+                        }
+                        Button("全选可见") { model.checkAllVisibleSessions() }
+                            .disabled(model.filteredSessions.isEmpty)
+                        if !model.checkedSessionIDs.isEmpty {
+                            Button("删除选中 \(model.checkedSessionIDs.count)", role: .destructive) {
+                                model.deleteCheckedSessions()
+                            }
+                            .frame(minWidth: 126)
+                            .disabled(model.isBusy)
+                        }
                     }
                 }
-                .padding(10)
-                .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 12))
+                .padding(12)
+                .background(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.68),
+                            Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.66),
+                            Color(red: 0.92, green: 0.99, blue: 0.97).opacity(0.62)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(.white.opacity(0.9), lineWidth: 1)
+                )
 
                 if model.filteredSessions.isEmpty {
                     ContentUnavailableView(
@@ -4160,14 +4378,13 @@ struct SessionsPane: View {
                 }
             }
             .padding(24)
-            .frame(minWidth: 460)
             .onChange(of: model.sessionSearch) { _, _ in
                 model.selectFirstVisibleSessionIfNeeded()
             }
             .onChange(of: model.showArchivedSessions) { _, _ in
                 model.selectFirstVisibleSessionIfNeeded()
             }
-
+        } trailing: {
             VStack(alignment: .leading, spacing: 18) {
                 if let session = model.selectedSession {
                     SessionDetail(session: session)
@@ -4181,7 +4398,6 @@ struct SessionsPane: View {
                 Spacer()
             }
             .padding(24)
-            .frame(minWidth: 560)
         }
     }
 }
@@ -4200,25 +4416,41 @@ struct SessionRow: View {
                         .font(.caption2)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(.orange.opacity(0.16), in: Capsule())
+                        .background(Color(red: 1.0, green: 0.72, blue: 0.42).opacity(0.18), in: Capsule())
                 }
                 if !session.existsOnDisk {
                     Text("缺文件")
                         .font(.caption2)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(.red.opacity(0.14), in: Capsule())
+                        .background(Color(red: 1.0, green: 0.52, blue: 0.58).opacity(0.16), in: Capsule())
                 }
             }
             Text("\(session.modelProvider) / \(session.model) · \(session.source)")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color(red: 0.39, green: 0.50, blue: 0.66))
                 .lineLimit(1)
             Text(session.updatedAt.formatted(date: .numeric, time: .shortened))
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(Color(red: 0.50, green: 0.60, blue: 0.74))
         }
-        .padding(.vertical, 5)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.86),
+                    Color(red: 0.93, green: 0.97, blue: 1.0).opacity(0.72)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.white.opacity(0.86), lineWidth: 1)
+        )
     }
 }
 
@@ -4442,9 +4674,43 @@ struct ConversationMessageRow: View {
 
 struct SnapshotPane: View {
     @EnvironmentObject private var model: VaultModel
+    @State private var leadingPaneWidth: CGFloat = 560
+
+    @ViewBuilder
+    private var snapshotCreationControls: some View {
+        HStack(spacing: 10) {
+            TextField("快照备注，可留空", text: $model.snapshotName)
+                .textFieldStyle(.roundedBorder)
+            Button("创建快照") {
+                model.createManualSnapshot()
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut("s", modifiers: [.command])
+            .disabled(model.isBusy)
+            .fixedSize()
+        }
+    }
+
+    @ViewBuilder
+    private var snapshotFilterControls: some View {
+        HStack(spacing: 10) {
+            Picker("类型", selection: $model.snapshotFilter) {
+                ForEach(SnapshotFilter.allCases) { filter in
+                    Text(filter.rawValue).tag(filter)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 220)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
 
     var body: some View {
-        HSplitView {
+        ResizableSplitView(
+            minLeadingWidth: 470,
+            minTrailingWidth: 540,
+            initialLeadingWidth: leadingPaneWidth
+        ) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
@@ -4457,36 +4723,54 @@ struct SnapshotPane: View {
                     CountBadge(value: "\(model.filteredSnapshots.count) / \(model.snapshots.count)")
                 }
 
-                HStack(spacing: 10) {
-                    TextField("快照备注，可留空", text: $model.snapshotName)
-                        .textFieldStyle(.roundedBorder)
-                    Button("创建快照") {
-                        model.createManualSnapshot()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut("s", modifiers: [.command])
-                    .disabled(model.isBusy)
-                    Divider()
-                        .frame(height: 22)
-                    Picker("类型", selection: $model.snapshotFilter) {
-                        ForEach(SnapshotFilter.allCases) { filter in
-                            Text(filter.rawValue).tag(filter)
+                VStack(alignment: .leading, spacing: 10) {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 10) {
+                            snapshotCreationControls
+                            snapshotFilterControls
+                        }
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            snapshotCreationControls
+                            snapshotFilterControls
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .frame(width: 220)
-                    Button("全选") { model.checkAllSnapshots() }
-                        .disabled(model.filteredSnapshots.isEmpty)
-                    if !model.checkedSnapshotIDs.isEmpty {
-                        Button("清空选择") { model.clearCheckedSnapshots() }
-                        Button("删除选中 \(model.checkedSnapshotIDs.count)", role: .destructive) {
-                            model.deleteCheckedSnapshots()
+                    HStack(spacing: 10) {
+                        Text("批量操作")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if !model.checkedSnapshotIDs.isEmpty {
+                            Button("清空选择") { model.clearCheckedSnapshots() }
                         }
-                        .disabled(model.isBusy)
+                        Button("全选") { model.checkAllSnapshots() }
+                            .disabled(model.filteredSnapshots.isEmpty)
+                        if !model.checkedSnapshotIDs.isEmpty {
+                            Button("删除选中 \(model.checkedSnapshotIDs.count)", role: .destructive) {
+                                model.deleteCheckedSnapshots()
+                            }
+                            .frame(minWidth: 126)
+                            .disabled(model.isBusy)
+                        }
                     }
                 }
-                .padding(10)
-                .background(.quaternary.opacity(0.22), in: RoundedRectangle(cornerRadius: 12))
+                .padding(12)
+                .background(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.68),
+                            Color(red: 0.92, green: 0.96, blue: 1.0).opacity(0.66),
+                            Color(red: 0.92, green: 0.99, blue: 0.97).opacity(0.62)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(.white.opacity(0.9), lineWidth: 1)
+                )
 
                 if model.filteredSnapshots.isEmpty {
                     ContentUnavailableView(
@@ -4522,7 +4806,6 @@ struct SnapshotPane: View {
                 }
             }
             .padding(24)
-            .frame(minWidth: 390)
             .onAppear {
                 model.refreshSelectedSnapshotSessions()
             }
@@ -4535,7 +4818,7 @@ struct SnapshotPane: View {
                 model.clearCheckedSnapshotSessions()
                 model.refreshSelectedSnapshotSessions()
             }
-
+        } trailing: {
             VStack(alignment: .leading, spacing: 18) {
                 if let snapshot = model.selectedSnapshot {
                     SnapshotDetail(snapshot: snapshot)
@@ -4549,7 +4832,6 @@ struct SnapshotPane: View {
                 Spacer()
             }
             .padding(24)
-            .frame(minWidth: 590)
         }
     }
 }
@@ -4782,11 +5064,38 @@ struct SnapshotSessionPickRow: View {
             if !session.existsOnDisk {
                 Text("缺文件")
                     .font(.caption2)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Color(red: 0.86, green: 0.31, blue: 0.39))
             }
         }
-        .padding(8)
-        .background(isSelected ? .blue.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 10))
+        .padding(10)
+        .background(
+            isSelected
+                ? AnyShapeStyle(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.15, green: 0.48, blue: 1.0).opacity(0.16),
+                            Color(red: 0.24, green: 0.83, blue: 0.78).opacity(0.10)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                : AnyShapeStyle(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.84),
+                            Color(red: 0.93, green: 0.97, blue: 1.0).opacity(0.68)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                ),
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isSelected ? Color(red: 0.30, green: 0.63, blue: 1.0).opacity(0.55) : .white.opacity(0.84), lineWidth: 1)
+        )
     }
 }
 
@@ -4796,10 +5105,17 @@ struct CountBadge: View {
     var body: some View {
         Text(value)
             .font(.title3.monospacedDigit())
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(.quaternary.opacity(0.25), in: Capsule())
+            .foregroundStyle(Color(red: 0.17, green: 0.32, blue: 0.55))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                Capsule()
+                    .fill(.white.opacity(0.64))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(.white.opacity(0.85), lineWidth: 1)
+            )
     }
 }
 
@@ -4814,10 +5130,26 @@ struct PrimaryActionCard<Actions: View, Footer: View>: View {
             }
             footer()
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color(red: 0.34, green: 0.46, blue: 0.63))
         }
-        .padding(14)
-        .background(.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+        .padding(18)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.13, green: 0.47, blue: 1.0).opacity(0.14),
+                    Color.white.opacity(0.82),
+                    Color(red: 0.90, green: 0.98, blue: 0.97).opacity(0.75)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(.white.opacity(0.9), lineWidth: 1)
+        )
+        .shadow(color: Color(red: 0.17, green: 0.36, blue: 0.92).opacity(0.10), radius: 24, x: 0, y: 14)
     }
 }
 
@@ -4830,10 +5162,26 @@ struct DetailCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 10) {
             Label(title, systemImage: systemImage)
                 .font(.headline)
+                .foregroundStyle(Color(red: 0.16, green: 0.28, blue: 0.48))
             content()
         }
-        .padding(14)
-        .background(.quaternary.opacity(0.24), in: RoundedRectangle(cornerRadius: 14))
+        .padding(18)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.76),
+                    Color(red: 0.94, green: 0.97, blue: 1.0).opacity(0.7)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(.white.opacity(0.88), lineWidth: 1)
+        )
+        .shadow(color: Color(red: 0.20, green: 0.34, blue: 0.68).opacity(0.05), radius: 18, x: 0, y: 10)
     }
 }
 
@@ -4847,15 +5195,30 @@ struct DangerZoneCard<Action: View>: View {
             VStack(alignment: .leading, spacing: 5) {
                 Label(title, systemImage: "trash")
                     .font(.headline)
+                    .foregroundStyle(Color(red: 0.62, green: 0.20, blue: 0.28))
                 Text(message)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color(red: 0.53, green: 0.38, blue: 0.41))
             }
             Spacer()
             action()
         }
-        .padding(14)
-        .background(.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+        .padding(18)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 1.0, green: 0.95, blue: 0.96).opacity(0.88),
+                    Color.white.opacity(0.76)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Color(red: 0.96, green: 0.78, blue: 0.81).opacity(0.8), lineWidth: 1)
+        )
     }
 }
 
@@ -4868,19 +5231,35 @@ struct MetricCard: View {
         HStack(spacing: 10) {
             Image(systemName: systemImage)
                 .font(.title3)
-                .foregroundStyle(.blue)
+                .foregroundStyle(Color(red: 0.10, green: 0.49, blue: 1.0))
                 .frame(width: 28)
             VStack(alignment: .leading) {
                 Text(title)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color(red: 0.39, green: 0.50, blue: 0.65))
                 Text(value)
                     .font(.headline)
+                    .foregroundStyle(Color(red: 0.16, green: 0.27, blue: 0.46))
                     .lineLimit(1)
             }
         }
-        .padding(12)
-        .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 12))
+        .padding(15)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.78),
+                    Color(red: 0.93, green: 0.97, blue: 1.0).opacity(0.68)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(.white.opacity(0.9), lineWidth: 1)
+        )
+        .shadow(color: Color(red: 0.18, green: 0.39, blue: 0.82).opacity(0.05), radius: 12, x: 0, y: 8)
     }
 }
 
@@ -4916,20 +5295,29 @@ struct StatusBar: View {
                     .controlSize(.small)
             }
             Text(model.lastError ?? model.status)
-                .foregroundStyle(model.lastError == nil ? Color.secondary : Color.red)
+                .foregroundStyle(model.lastError == nil ? Color(red: 0.29, green: 0.42, blue: 0.58) : Color(red: 0.76, green: 0.24, blue: 0.31))
                 Spacer()
                 Text(model.codexRoot)
                     .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(Color(red: 0.46, green: 0.56, blue: 0.69))
                 if !model.autoRestoreOnLaunch {
                     Text("自动找回：关闭")
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(Color(red: 0.46, green: 0.56, blue: 0.69))
                 }
         }
         .font(.caption)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(.regularMaterial)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.68),
+                    Color(red: 0.93, green: 0.97, blue: 1.0).opacity(0.62)
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        )
     }
 }
 

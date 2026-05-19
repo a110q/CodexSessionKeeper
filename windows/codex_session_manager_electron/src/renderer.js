@@ -16,7 +16,11 @@ const state = {
   snapshotFilter: 'all',
   snapshotSessionsLoading: false,
   settings: { autoRestoreOnLaunch: false },
-  autoRestorePromptedSnapshotId: null
+  autoRestorePromptedSnapshotId: null,
+  sessionPreviewId: null,
+  sessionPreviewMessages: [],
+  sessionPreviewLoading: false,
+  sessionPreviewError: ''
 };
 
 let sessionSearchTimer = null;
@@ -75,6 +79,23 @@ function formatDate(value) {
   return date.toLocaleString('zh-CN', { hour12: false });
 }
 
+function formatRelativeTime(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '-';
+  const diffMs = Date.now() - date.getTime();
+  if (diffMs < 0) return formatDate(value);
+  const minutes = Math.floor(diffMs / 60000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} 天前`;
+  if (days < 30) return `${Math.floor(days / 7)} 周前`;
+  return date.toLocaleDateString('zh-CN');
+}
+
 function formatBytes(bytes) {
   const value = Number(bytes || 0);
   if (value < 1024) return `${value} B`;
@@ -86,6 +107,51 @@ function formatBytes(bytes) {
     index += 1;
   }
   return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
+}
+
+function freshDotClass(session) {
+  if (!session.existsOnDisk) return 'missing';
+  const updated = new Date(session.updatedAt);
+  if (Number.isNaN(updated.getTime())) return 'stale';
+  const ageDays = (Date.now() - updated.getTime()) / 86400000;
+  if (ageDays < 1) return 'today';
+  if (ageDays > 7) return 'stale';
+  return '';
+}
+
+function shortPath(value) {
+  const text = String(value || '').replaceAll('\\', '/');
+  if (!text) return '-';
+  const homeIndex = text.lastIndexOf('/Users/');
+  if (homeIndex >= 0) {
+    const pieces = text.slice(homeIndex).split('/').filter(Boolean);
+    if (pieces.length > 2) return `~/${pieces.slice(2).join('/')}`;
+  }
+  const pieces = text.split('/').filter(Boolean);
+  if (pieces.length <= 3) return text;
+  return `.../${pieces.slice(-3).join('/')}`;
+}
+
+function renderMessageHtml(message, options = {}) {
+  const text = String(message.text || '');
+  const limit = options.limit || 16000;
+  const clipped = text.length > limit;
+  const visible = clipped ? `${text.slice(0, limit)}\n\n... 内容较长，已截断展示。可打开完整对话继续查看。` : text;
+  const role = message.role === '用户' ? 'user' : message.role === '助手' ? 'assistant' : 'other';
+  const roleClass = role === 'user' ? 'role-user' : role === 'assistant' ? 'role-assistant' : '';
+  const rowClass = role === 'user' ? 'from-user' : role === 'assistant' ? 'from-assistant' : '';
+  return `
+    <div class="${options.preview ? 'preview-message' : 'message-row'} ${rowClass}">
+      <div class="message-role">
+        <span class="role-badge ${roleClass}">${escapeHtml(message.role || '记录')}</span>
+        ${message.phase ? `<div class="message-phase" title="${escapeHtml(message.phase)}">${escapeHtml(message.phase)}</div>` : ''}
+      </div>
+      <div class="message-card">
+        <div class="message-time">${formatDate(message.timestamp)}</div>
+        ${escapeHtml(visible)}
+      </div>
+    </div>
+  `;
 }
 
 function showToast(message, isError = false) {
@@ -252,14 +318,18 @@ function renderSessions() {
   els.sessionList.innerHTML = sessions.map((session) => `
     <article class="session-row ${session.id === state.selectedSessionId ? 'selected' : ''}" data-id="${escapeHtml(session.id)}">
       <button class="row-check ${state.checkedSessionIds.has(session.id) ? 'checked' : ''}" data-check-session="${escapeHtml(session.id)}">✓</button>
+      <div class="fresh-dot ${freshDotClass(session)}" title="${session.existsOnDisk ? '会话文件存在' : '会话文件缺失'}"></div>
       <div class="row-content">
         <div class="row-title">
           ${escapeHtml(session.title || session.id)}
           ${session.archived ? '<span class="tag archive">归档</span>' : ''}
-          ${session.existsOnDisk ? '' : '<span class="tag missing">缺文件</span>'}
         </div>
-        <div class="row-meta">${escapeHtml(session.provider)} / ${escapeHtml(session.model)} · ${escapeHtml(session.source)}</div>
-        <div class="row-time">${formatDate(session.updatedAt)}</div>
+        <div class="row-meta">${escapeHtml(session.model)} · ${escapeHtml(shortPath(session.cwd || session.rolloutPath))}</div>
+      </div>
+      <div class="row-side">
+        <div class="row-time" title="${formatDate(session.updatedAt)}">${formatRelativeTime(session.updatedAt)}</div>
+        ${session.existsOnDisk ? '' : '<span class="tag missing">缺文件</span>'}
+        <div class="row-stats">${formatBytes(session.sizeBytes)} · ${escapeHtml(session.source)}</div>
       </div>
     </article>
   `).join('');
@@ -342,10 +412,76 @@ function scheduleRenderSessions() {
   }, 220);
 }
 
+function renderPreviewMessages() {
+  const preview = $('#sessionConversationPreview');
+  const meta = $('#sessionPreviewMeta');
+  if (!preview) return;
+
+  if (state.sessionPreviewLoading) {
+    preview.innerHTML = '<div class="preview-loading">正在读取对话预览...</div>';
+    if (meta) meta.textContent = '加载中';
+    return;
+  }
+
+  if (state.sessionPreviewError) {
+    preview.innerHTML = `<div class="preview-empty">${escapeHtml(state.sessionPreviewError)}</div>`;
+    if (meta) meta.textContent = '打开失败';
+    return;
+  }
+
+  const messages = state.sessionPreviewMessages || [];
+  if (!messages.length) {
+    preview.innerHTML = '<div class="preview-empty">没有解析到可预览的用户或助手消息。</div>';
+    if (meta) meta.textContent = '0 条消息';
+    return;
+  }
+
+  if (meta) meta.textContent = `${messages.length} 条消息，预览前 ${Math.min(messages.length, 20)} 条`;
+  preview.innerHTML = messages.slice(0, 20).map((message) => renderMessageHtml(message, {
+    preview: true,
+    limit: 200
+  })).join('');
+}
+
+async function loadSessionPreview(session) {
+  if (!session || !session.existsOnDisk) {
+    state.sessionPreviewId = session?.id || null;
+    state.sessionPreviewMessages = [];
+    state.sessionPreviewLoading = false;
+    state.sessionPreviewError = session ? '这个会话文件缺失，无法生成预览。' : '';
+    renderPreviewMessages();
+    return;
+  }
+
+  const previewId = session.id;
+  state.sessionPreviewId = previewId;
+  state.sessionPreviewMessages = [];
+  state.sessionPreviewLoading = true;
+  state.sessionPreviewError = '';
+  renderPreviewMessages();
+  try {
+    const messages = await window.codexManager.loadConversation(previewId);
+    if (state.sessionPreviewId !== previewId) return;
+    state.sessionPreviewMessages = messages || [];
+    state.sessionPreviewLoading = false;
+    renderPreviewMessages();
+  } catch (error) {
+    if (state.sessionPreviewId !== previewId) return;
+    state.sessionPreviewMessages = [];
+    state.sessionPreviewLoading = false;
+    state.sessionPreviewError = error.message || String(error);
+    renderPreviewMessages();
+  }
+}
+
 function renderSessionDetail(session) {
   if (!session) {
     els.sessionDetail.className = 'detail-empty';
     els.sessionDetail.innerHTML = '<div class="empty-icon">⌁</div><h3>没有选中会话</h3><p>从左侧选择一个会话，或调整搜索条件。</p>';
+    state.sessionPreviewId = null;
+    state.sessionPreviewMessages = [];
+    state.sessionPreviewLoading = false;
+    state.sessionPreviewError = '';
     return;
   }
 
@@ -368,6 +504,17 @@ function renderSessionDetail(session) {
         <button class="ghost-button" data-detail-action="reveal">在文件夹中显示</button>
       </div>
       <p class="row-meta" style="margin-top: 10px;">常用操作放在这里：先打开文件或定位文件，再决定是否清理。</p>
+    </div>
+
+    <div class="detail-card conversation-preview-card">
+      <div class="preview-header">
+        <div>
+          <h3>会话预览</h3>
+          <p id="sessionPreviewMeta" class="row-meta">正在准备</p>
+        </div>
+        <button class="ghost-button" data-detail-action="view">查看完整对话</button>
+      </div>
+      <div id="sessionConversationPreview" class="preview-messages"></div>
     </div>
 
     <div class="metric-grid detail-card">
@@ -397,6 +544,12 @@ function renderSessionDetail(session) {
       </div>
     </div>
   `;
+
+  if (state.sessionPreviewId === session.id) {
+    renderPreviewMessages();
+  } else {
+    loadSessionPreview(session);
+  }
 }
 
 function renderSnapshots() {
@@ -663,24 +816,7 @@ async function openConversation(session) {
       els.conversationBody.innerHTML = '<div class="detail-empty"><h3>没有解析到对话内容</h3><p>这个会话文件存在，但没有找到用户或助手消息。</p></div>';
       return;
     }
-    els.conversationBody.innerHTML = messages.map((message) => {
-      const roleClass = message.role === '用户' ? 'role-user' : 'role-assistant';
-      const text = String(message.text || '');
-      const clipped = text.length > 16000;
-      const visible = clipped ? `${text.slice(0, 16000)}\n\n... 内容较长，已截断展示。可打开原始文件查看完整内容。` : text;
-      return `
-        <div class="message-row">
-          <div>
-            <span class="role-badge ${roleClass}">${escapeHtml(message.role || '记录')}</span>
-            ${message.phase ? `<div class="row-meta" style="margin-top: 6px;">${escapeHtml(message.phase)}</div>` : ''}
-          </div>
-          <div class="message-card">
-            <div class="message-time">${formatDate(message.timestamp)}</div>
-            ${escapeHtml(visible)}
-          </div>
-        </div>
-      `;
-    }).join('');
+    els.conversationBody.innerHTML = messages.map((message) => renderMessageHtml(message)).join('');
   } catch (error) {
     els.conversationMeta.textContent = '打开失败';
     els.conversationBody.innerHTML = `<div class="detail-empty"><h3>打开失败</h3><p>${escapeHtml(error.message || String(error))}</p></div>`;
