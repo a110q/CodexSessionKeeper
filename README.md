@@ -8,16 +8,16 @@
 
 | 位置 | 状态 |
 | --- | --- |
-| GitHub `main` | 已包含最新 UI 改造：macOS 与 Windows 视觉统一、Windows 侧栏状态卡、会话列表层级优化、详情页会话预览、暗色模式等。 |
-| GitHub Releases | 最新公开包为 `v1.0.12`，包含本轮 UI 改造和 `v1.0.11` 的 Windows 快照容错修复。 |
-| 最新安装包 | 请优先下载 `v1.0.12` 的 macOS 或 Windows zip。 |
+| GitHub `main` | 已包含 Codex 新版 SQLite 表结构兼容修复，以及前一版 UI 改造。 |
+| GitHub Releases | 最新公开包为 `v1.0.13`，修复 Codex 更新后创建快照、恢复快照、删除会话等操作失败的问题。 |
+| 最新安装包 | 请优先下载 `v1.0.13` 的 macOS 或 Windows zip。 |
 
 下载稳定版：
 
 [GitHub Releases](https://github.com/a110q/CodexSessionKeeper/releases)
 
-- macOS：下载 `codex_session_keeper_macos_v1.0.12.zip`，解压后运行 `codex_会话管理.app`。
-- Windows：下载 `codex_session_keeper_windows_v1.0.12.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
+- macOS：下载 `codex_session_keeper_macos_v1.0.13.zip`，解压后运行 `codex_会话管理.app`。
+- Windows：下载 `codex_session_keeper_windows_v1.0.13.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
 
 Windows 版本是免安装便携版。不要只拷贝单独的 exe 文件，Electron 运行时需要同目录下的 `resources`、`locales` 和 `.dll` 文件。
 
@@ -89,6 +89,8 @@ Windows 使用当前用户目录下的等效路径：
 
 快照一般会同时保存会话文件、历史索引和 SQLite 线程索引。
 
+Codex 更新后，`state_5.sqlite` 里的线程相关表可能会变化。`v1.0.13` 起，工具会先检测表是否存在，再清洗或合并 SQLite 索引；如果新版 Codex 已移除 `thread_goals`、`stage1_outputs` 等旧表，不会再导致创建快照、恢复快照或删除会话整体失败。
+
 如果 Windows 环境下 Codex 正在写入 `state_5.sqlite`，或者这个数据库临时不可读，工具会自动降级创建“文件型快照”。文件型快照仍包含 `history.jsonl`、`session_index.jsonl`、`sessions` 和 `archived_sessions`，可以继续恢复会话文件；只是会跳过 SQLite 索引清洗。看到“已降级创建文件型快照”不是创建失败。
 
 如果你想创建包含完整 SQLite 索引的快照，先退出 Codex 客户端，再重新点击“创建快照”。
@@ -136,7 +138,7 @@ git push origin main
 发布安装包：
 
 1. 构建 macOS 与 Windows 产物。
-2. 为新版本创建 tag，例如 `v1.0.12`。
+2. 为新版本创建 tag，例如 `v1.0.13`。
 3. 在 GitHub Releases 创建对应 release。
 4. 上传 macOS zip 和 Windows zip。
 5. 确认 Releases 侧栏的 `Latest` 指向新版本。
@@ -158,6 +160,10 @@ git push origin main
 ### 快照里没有 `state_5.sqlite` 还能恢复吗
 
 可以。只要快照里有 `sessions` 或 `archived_sessions` 下的 jsonl 会话文件，工具会从这些文件识别并恢复会话。恢复后建议重启 Codex。
+
+### Codex 更新后所有快照功能都失败
+
+如果错误里包含 `no such table: thread_goals` 或 `no such table: stage1_outputs`，说明 Codex 升级后本地 `state_5.sqlite` 表结构已经变化。请升级到 `v1.0.13` 或更新后的安装包；新版会跳过不存在的旧表，并继续处理仍存在的 `threads`、`thread_dynamic_tools`、`thread_spawn_edges` 和 `agent_job_items` 等线程索引。
 
 ### Windows 打开 exe 没反应
 

@@ -315,7 +315,7 @@ final class VaultModel: ObservableObject {
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
-    private let appVersion = "1.0.11"
+    private let appVersion = "1.0.13"
     private var didRunLaunchAutoRestore = false
     private var conversationLoadID = UUID()
     private var sessionSearchTask: Task<Void, Never>?
@@ -1985,18 +1985,33 @@ final class VaultModel: ObservableObject {
         let database = root.appendingPathComponent("state_5.sqlite")
         guard fileManager.fileExists(atPath: database.path) else { return }
 
-        let sql = """
-        PRAGMA foreign_keys = OFF;
-        BEGIN IMMEDIATE;
-        DELETE FROM thread_dynamic_tools WHERE thread_id = \(sqliteStringLiteral(sessionID));
-        DELETE FROM thread_goals WHERE thread_id = \(sqliteStringLiteral(sessionID));
-        DELETE FROM thread_spawn_edges WHERE parent_thread_id = \(sqliteStringLiteral(sessionID)) OR child_thread_id = \(sqliteStringLiteral(sessionID));
-        DELETE FROM stage1_outputs WHERE thread_id = \(sqliteStringLiteral(sessionID));
-        DELETE FROM agent_job_items WHERE assigned_thread_id = \(sqliteStringLiteral(sessionID));
-        DELETE FROM threads WHERE id = \(sqliteStringLiteral(sessionID));
-        COMMIT;
-        PRAGMA foreign_keys = ON;
-        """
+        var statements = [
+            "PRAGMA foreign_keys = OFF;",
+            "BEGIN IMMEDIATE;"
+        ]
+        if try sqliteTableExists(database: database, table: "thread_dynamic_tools") {
+            statements.append("DELETE FROM thread_dynamic_tools WHERE thread_id = \(sqliteStringLiteral(sessionID));")
+        }
+        if try sqliteTableExists(database: database, table: "thread_goals") {
+            statements.append("DELETE FROM thread_goals WHERE thread_id = \(sqliteStringLiteral(sessionID));")
+        }
+        if try sqliteTableExists(database: database, table: "thread_spawn_edges") {
+            statements.append("DELETE FROM thread_spawn_edges WHERE parent_thread_id = \(sqliteStringLiteral(sessionID)) OR child_thread_id = \(sqliteStringLiteral(sessionID));")
+        }
+        if try sqliteTableExists(database: database, table: "stage1_outputs") {
+            statements.append("DELETE FROM stage1_outputs WHERE thread_id = \(sqliteStringLiteral(sessionID));")
+        }
+        if try sqliteTableExists(database: database, table: "agent_job_items") {
+            statements.append("DELETE FROM agent_job_items WHERE assigned_thread_id = \(sqliteStringLiteral(sessionID));")
+        }
+        if try sqliteTableExists(database: database, table: "threads") {
+            statements.append("DELETE FROM threads WHERE id = \(sqliteStringLiteral(sessionID));")
+        }
+        statements.append(contentsOf: [
+            "COMMIT;",
+            "PRAGMA foreign_keys = ON;"
+        ])
+        let sql = statements.joined(separator: "\n")
         try runCommand(executable: "/usr/bin/sqlite3", arguments: [database.path, sql])
     }
 
@@ -2569,10 +2584,15 @@ final class VaultModel: ObservableObject {
     }
 
     private func purgeAccountBindings(database: URL, sqlite: String) throws {
-        let sql = """
-        DELETE FROM device_key_bindings WHERE EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'device_key_bindings');
-        DELETE FROM remote_control_enrollments WHERE EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'remote_control_enrollments');
-        """
+        var statements: [String] = []
+        if try sqliteTableExists(database: database, table: "device_key_bindings") {
+            statements.append("DELETE FROM device_key_bindings;")
+        }
+        if try sqliteTableExists(database: database, table: "remote_control_enrollments") {
+            statements.append("DELETE FROM remote_control_enrollments;")
+        }
+        let sql = statements.joined(separator: "\n")
+        guard !sql.isEmpty else { return }
         _ = try? runCommand(executable: sqlite, arguments: [database.path, sql])
     }
 
@@ -2598,35 +2618,52 @@ final class VaultModel: ObservableObject {
     }
 
     private func pruneStateDatabase(database: URL, sqlite: String, allowedSessionIDs: Set<String>) throws {
+        let existingTables = Set(try conversationStateTables.filter { try sqliteTableExists(database: database, table: $0) })
         if allowedSessionIDs.isEmpty {
-            let sql = """
-            PRAGMA foreign_keys = OFF;
-            BEGIN IMMEDIATE;
-            DELETE FROM thread_dynamic_tools;
-            DELETE FROM thread_goals;
-            DELETE FROM thread_spawn_edges;
-            DELETE FROM stage1_outputs;
-            DELETE FROM threads;
-            COMMIT;
-            PRAGMA foreign_keys = ON;
-            """
+            var statements = [
+                "PRAGMA foreign_keys = OFF;",
+                "BEGIN IMMEDIATE;"
+            ]
+            for table in conversationStateTables where existingTables.contains(table) {
+                statements.append("DELETE FROM \(sqliteIdentifier(table));")
+            }
+            statements.append(contentsOf: [
+                "COMMIT;",
+                "PRAGMA foreign_keys = ON;"
+            ])
+            let sql = statements.joined(separator: "\n")
             try runCommand(executable: sqlite, arguments: [database.path, sql])
             return
         }
 
         let ids = allowedSessionIDs.map(sqliteStringLiteral).joined(separator: ", ")
-        let sql = """
-        PRAGMA foreign_keys = OFF;
-        BEGIN IMMEDIATE;
-        DELETE FROM thread_dynamic_tools WHERE thread_id NOT IN (\(ids));
-        DELETE FROM thread_goals WHERE thread_id NOT IN (\(ids));
-        DELETE FROM thread_spawn_edges WHERE parent_thread_id NOT IN (\(ids)) AND child_thread_id NOT IN (\(ids));
-        DELETE FROM stage1_outputs WHERE thread_id NOT IN (\(ids));
-        DELETE FROM threads WHERE id NOT IN (\(ids));
-        COMMIT;
-        PRAGMA foreign_keys = ON;
-        """
+        var statements = [
+            "PRAGMA foreign_keys = OFF;",
+            "BEGIN IMMEDIATE;"
+        ]
+        for table in conversationStateTables where existingTables.contains(table) {
+            let whereClause = stateDatabasePruneWhereClause(table: table, ids: ids)
+            statements.append("DELETE FROM \(sqliteIdentifier(table)) WHERE \(whereClause);")
+        }
+        statements.append(contentsOf: [
+            "COMMIT;",
+            "PRAGMA foreign_keys = ON;"
+        ])
+        let sql = statements.joined(separator: "\n")
         try runCommand(executable: sqlite, arguments: [database.path, sql])
+    }
+
+    private func stateDatabasePruneWhereClause(table: String, ids: String) -> String {
+        switch table {
+        case "thread_spawn_edges":
+            return "parent_thread_id NOT IN (\(ids)) AND child_thread_id NOT IN (\(ids))"
+        case "agent_job_items":
+            return "assigned_thread_id IS NOT NULL AND assigned_thread_id NOT IN (\(ids))"
+        case "threads":
+            return "id NOT IN (\(ids))"
+        default:
+            return "thread_id NOT IN (\(ids))"
+        }
     }
 
     private func stateDatabaseWhereClause(table: String, allowedSessionIDs: Set<String>?) -> String {
@@ -2639,6 +2676,8 @@ final class VaultModel: ObservableObject {
             return " WHERE id IN (\(ids))"
         case "thread_spawn_edges":
             return " WHERE parent_thread_id IN (\(ids)) OR child_thread_id IN (\(ids))"
+        case "agent_job_items":
+            return " WHERE assigned_thread_id IN (\(ids))"
         default:
             return " WHERE thread_id IN (\(ids))"
         }
@@ -2665,8 +2704,13 @@ final class VaultModel: ObservableObject {
         try appendInsert(table: "thread_dynamic_tools", whereClause: "thread_id = \(quotedSessionID)")
         try appendInsert(table: "stage1_outputs", whereClause: "thread_id = \(quotedSessionID)")
         try appendInsert(table: "thread_spawn_edges", whereClause: "parent_thread_id = \(quotedSessionID) OR child_thread_id = \(quotedSessionID)")
+        try appendInsert(table: "agent_job_items", whereClause: "assigned_thread_id = \(quotedSessionID)")
 
         return statements
+    }
+
+    private func sqliteTableExists(database: URL, table: String) throws -> Bool {
+        !((try? sqliteTableColumns(database: database, table: table)) ?? []).isEmpty
     }
 
     private func sqliteTableColumns(database: URL, table: String) throws -> [String] {
@@ -3183,7 +3227,8 @@ final class VaultModel: ObservableObject {
             "thread_goals",
             "thread_dynamic_tools",
             "thread_spawn_edges",
-            "stage1_outputs"
+            "stage1_outputs",
+            "agent_job_items"
         ]
     }
 

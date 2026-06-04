@@ -7,7 +7,7 @@ const crypto = require('crypto');
 let mainWindow;
 let sqlPromise;
 
-const appVersion = '1.0.11';
+const appVersion = '1.0.13';
 const codexRoot = path.join(os.homedir(), '.codex');
 const vaultRoot = path.join(os.homedir(), '.codex-session-vault');
 const snapshotRoot = path.join(vaultRoot, 'snapshots');
@@ -63,7 +63,8 @@ const conversationStateTables = [
   'thread_goals',
   'thread_dynamic_tools',
   'thread_spawn_edges',
-  'stage1_outputs'
+  'stage1_outputs',
+  'agent_job_items'
 ];
 
 const stateDatabaseSnapshotPaths = new Set([
@@ -1188,34 +1189,30 @@ function stateDatabaseWhereClause(table, allowedSessionIds) {
   const ids = sessionIdList(allowedSessionIds);
   if (table === 'threads') return ` WHERE id IN (${ids})`;
   if (table === 'thread_spawn_edges') return ` WHERE parent_thread_id IN (${ids}) OR child_thread_id IN (${ids})`;
+  if (table === 'agent_job_items') return ` WHERE assigned_thread_id IN (${ids})`;
   return ` WHERE thread_id IN (${ids})`;
+}
+
+function stateDatabasePruneWhereClause(table, ids) {
+  if (table === 'thread_spawn_edges') return `parent_thread_id NOT IN (${ids}) AND child_thread_id NOT IN (${ids})`;
+  if (table === 'agent_job_items') return `assigned_thread_id IS NOT NULL AND assigned_thread_id NOT IN (${ids})`;
+  if (table === 'threads') return `id NOT IN (${ids})`;
+  return `thread_id NOT IN (${ids})`;
 }
 
 function pruneStateDatabase(db, allowedSessionIds) {
   if (allowedSessionIds.size === 0) {
-    const statements = [
-      { table: 'thread_dynamic_tools', sql: 'DELETE FROM thread_dynamic_tools;' },
-      { table: 'thread_goals', sql: 'DELETE FROM thread_goals;' },
-      { table: 'thread_spawn_edges', sql: 'DELETE FROM thread_spawn_edges;' },
-      { table: 'stage1_outputs', sql: 'DELETE FROM stage1_outputs;' },
-      { table: 'threads', sql: 'DELETE FROM threads;' }
-    ];
-    for (const statement of statements) {
-      if (tableExists(db, statement.table)) db.run(statement.sql);
+    for (const table of conversationStateTables) {
+      if (tableExists(db, table)) db.run(`DELETE FROM ${quoteIdent(table)};`);
     }
     return;
   }
 
   const ids = sessionIdList(allowedSessionIds);
-  const statements = [
-    { table: 'thread_dynamic_tools', sql: `DELETE FROM thread_dynamic_tools WHERE thread_id NOT IN (${ids});` },
-    { table: 'thread_goals', sql: `DELETE FROM thread_goals WHERE thread_id NOT IN (${ids});` },
-    { table: 'thread_spawn_edges', sql: `DELETE FROM thread_spawn_edges WHERE parent_thread_id NOT IN (${ids}) AND child_thread_id NOT IN (${ids});` },
-    { table: 'stage1_outputs', sql: `DELETE FROM stage1_outputs WHERE thread_id NOT IN (${ids});` },
-    { table: 'threads', sql: `DELETE FROM threads WHERE id NOT IN (${ids});` }
-  ];
-  for (const statement of statements) {
-    if (tableExists(db, statement.table)) db.run(statement.sql);
+  for (const table of conversationStateTables) {
+    if (tableExists(db, table)) {
+      db.run(`DELETE FROM ${quoteIdent(table)} WHERE ${stateDatabasePruneWhereClause(table, ids)};`);
+    }
   }
 }
 
@@ -1391,7 +1388,8 @@ async function mergeSingleSessionStateDb(snapshotDbPath, destinationDbPath, sess
       { table: 'thread_goals', where: `thread_id = ${quoteLiteral(sessionId)}` },
       { table: 'thread_dynamic_tools', where: `thread_id = ${quoteLiteral(sessionId)}` },
       { table: 'stage1_outputs', where: `thread_id = ${quoteLiteral(sessionId)}` },
-      { table: 'thread_spawn_edges', where: `parent_thread_id = ${quoteLiteral(sessionId)} OR child_thread_id = ${quoteLiteral(sessionId)}` }
+      { table: 'thread_spawn_edges', where: `parent_thread_id = ${quoteLiteral(sessionId)} OR child_thread_id = ${quoteLiteral(sessionId)}` },
+      { table: 'agent_job_items', where: `assigned_thread_id = ${quoteLiteral(sessionId)}` }
     ];
     destinationDb.run('BEGIN TRANSACTION;');
     for (const rule of rules) {
@@ -1432,6 +1430,7 @@ async function deleteSingleSessionStateDb(destinationDbPath, sessionId) {
       { table: 'thread_goals', sql: `DELETE FROM thread_goals WHERE thread_id = ${quoteLiteral(sessionId)};` },
       { table: 'thread_spawn_edges', sql: `DELETE FROM thread_spawn_edges WHERE parent_thread_id = ${quoteLiteral(sessionId)} OR child_thread_id = ${quoteLiteral(sessionId)};` },
       { table: 'stage1_outputs', sql: `DELETE FROM stage1_outputs WHERE thread_id = ${quoteLiteral(sessionId)};` },
+      { table: 'agent_job_items', sql: `DELETE FROM agent_job_items WHERE assigned_thread_id = ${quoteLiteral(sessionId)};` },
       { table: 'threads', sql: `DELETE FROM threads WHERE id = ${quoteLiteral(sessionId)};` }
     ];
     db.run('BEGIN TRANSACTION;');
