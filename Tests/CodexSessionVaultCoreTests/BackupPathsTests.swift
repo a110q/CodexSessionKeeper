@@ -33,7 +33,24 @@ func relativeBackupPathUsesForwardSlashPathRelativeToBackupRoot() {
     let paths = BackupPaths(homeDirectory: home)
     let file = URL(fileURLWithPath: "/Users/alice/.codex-session-vault/incremental-backups/sessions/2026/07/04/session-123.jsonl")
 
-    #expect(paths.relativeBackupPath(for: file) == "sessions/2026/07/04/session-123.jsonl")
+    #expect(paths.relativeBackupPath(for: file) == Optional("sessions/2026/07/04/session-123.jsonl"))
+}
+
+@Test
+func relativeBackupPathReturnsNilForFilesOutsideBackupRoot() {
+    let home = URL(fileURLWithPath: "/Users/alice", isDirectory: true)
+    let paths = BackupPaths(homeDirectory: home)
+    let file = URL(fileURLWithPath: "/Users/alice/Documents/session-123.jsonl")
+
+    #expect(paths.relativeBackupPath(for: file) == nil)
+}
+
+@Test
+func relativeBackupPathReturnsNilForBackupRootItself() {
+    let home = URL(fileURLWithPath: "/Users/alice", isDirectory: true)
+    let paths = BackupPaths(homeDirectory: home)
+
+    #expect(paths.relativeBackupPath(for: paths.backupRoot) == nil)
 }
 
 @Test
@@ -46,7 +63,7 @@ func backupFilePathSanitizesSessionIDForSafeLocalFilenames() throws {
 
     #expect(url.lastPathComponent == "session-123-evil.jsonl")
     #expect(url.deletingLastPathComponent().path == "/Users/alice/.codex-session-vault/incremental-backups/sessions/2026/07/04")
-    #expect(paths.relativeBackupPath(for: url) == "sessions/2026/07/04/session-123-evil.jsonl")
+    #expect(paths.relativeBackupPath(for: url) == Optional("sessions/2026/07/04/session-123-evil.jsonl"))
 }
 
 @Test

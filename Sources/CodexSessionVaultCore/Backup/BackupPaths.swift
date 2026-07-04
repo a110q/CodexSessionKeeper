@@ -54,12 +54,12 @@ public struct BackupPaths: Sendable {
             .appendingPathComponent(filename, isDirectory: false)
     }
 
-    public func relativeBackupPath(for fileURL: URL) -> String {
+    public func relativeBackupPath(for fileURL: URL) -> String? {
         let rootComponents = backupRoot.standardizedFileURL.pathComponents
         let fileComponents = fileURL.standardizedFileURL.pathComponents
 
-        guard fileComponents.starts(with: rootComponents) else {
-            return fileURL.lastPathComponent
+        guard fileComponents.starts(with: rootComponents), fileComponents.count > rootComponents.count else {
+            return nil
         }
 
         return fileComponents.dropFirst(rootComponents.count).joined(separator: "/")
