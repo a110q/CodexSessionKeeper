@@ -6,6 +6,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
+    "test": "node --test test/backup/*.test.js",
     "package:win": "electron-packager . codex_session_manager --platform=win32 --arch=x64 --out=../../dist/win10-exe --overwrite --prune=true"
   },
   "dependencies": {
