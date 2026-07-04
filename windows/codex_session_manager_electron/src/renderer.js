@@ -25,6 +25,9 @@ const state = {
 };
 
 let sessionSearchTimer = null;
+const BACKUP_STATUS_REFRESH_INTERVAL_MS = 10000;
+let backupStatusRefreshTimer = null;
+let backupStatusRefreshInFlight = false;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -795,6 +798,31 @@ async function refresh(options = {}) {
   }
 }
 
+async function refreshBackupStatusOnly() {
+  if (backupStatusRefreshInFlight) return;
+  backupStatusRefreshInFlight = true;
+
+  try {
+    state.backupStatus = await window.codexManager.loadBackupStatus() || {};
+    renderBackupStatus();
+  } catch {
+    // Lightweight polling should not interrupt the main UI or show a toast.
+  } finally {
+    backupStatusRefreshInFlight = false;
+  }
+}
+
+function startBackupStatusPolling() {
+  if (backupStatusRefreshTimer) return;
+  backupStatusRefreshTimer = setInterval(refreshBackupStatusOnly, BACKUP_STATUS_REFRESH_INTERVAL_MS);
+}
+
+function stopBackupStatusPolling() {
+  if (!backupStatusRefreshTimer) return;
+  clearInterval(backupStatusRefreshTimer);
+  backupStatusRefreshTimer = null;
+}
+
 function selectedSession() {
   return state.sessions.find((session) => session.id === state.selectedSessionId);
 }
@@ -1219,4 +1247,6 @@ els.conversationRevealFile.addEventListener('click', async () => {
   if (session) await window.codexManager.revealPath(session.rolloutPath);
 });
 
+window.addEventListener('beforeunload', stopBackupStatusPolling);
+startBackupStatusPolling();
 refresh();

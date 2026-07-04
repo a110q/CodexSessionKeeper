@@ -457,21 +457,42 @@ test('session tailer stops after the first chunk containing a newline', async (t
   });
 });
 
-test('session tailer uses byte offsets, preserves blank lines, and waits for long lines', async (t) => {
+test('session tailer does not consume a line when newline is beyond the read limit', async (t) => {
   const { root } = await makeTestPaths(t);
   const filePath = path.join(root, 'tailer.jsonl');
   const longLine = 'a'.repeat(8);
   await fs.writeFile(filePath, `${longLine}\n\npending`, 'utf8');
 
   assert.deepEqual(readNewCompleteLines(filePath, 0, 4), {
-    lines: [longLine, ''],
-    nextOffset: Buffer.byteLength(`${longLine}\n\n`),
-    pendingPartialLine: 'pe',
+    lines: [],
+    nextOffset: 0,
+    pendingPartialLine: '',
   });
 
-  assert.deepEqual(readNewCompleteLines(filePath, Buffer.byteLength(`${longLine}\n`), 1024), {
-    lines: [''],
+  assert.deepEqual(readNewCompleteLines(filePath, 0, 1024), {
+    lines: [longLine, ''],
     nextOffset: Buffer.byteLength(`${longLine}\n\n`),
     pendingPartialLine: 'pending',
+  });
+});
+
+test('session tailer keeps data available when an oversized partial line is later completed', async (t) => {
+  const { root } = await makeTestPaths(t);
+  const filePath = path.join(root, 'tailer-completed-later.jsonl');
+  const longLine = 'b'.repeat(8);
+  await fs.writeFile(filePath, longLine, 'utf8');
+
+  assert.deepEqual(readNewCompleteLines(filePath, 0, 4), {
+    lines: [],
+    nextOffset: 0,
+    pendingPartialLine: '',
+  });
+
+  await fs.appendFile(filePath, '\nnext\n', 'utf8');
+
+  assert.deepEqual(readNewCompleteLines(filePath, 0, 64), {
+    lines: [longLine, 'next'],
+    nextOffset: Buffer.byteLength(`${longLine}\nnext\n`),
+    pendingPartialLine: '',
   });
 });

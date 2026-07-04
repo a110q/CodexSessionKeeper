@@ -20,10 +20,11 @@ function readNewCompleteLines(filePath, offset, maxReadBytes = 1024 * 1024) {
   const chunks = [];
   let totalBytesRead = 0;
   let position = startOffset;
+  const readLimit = Math.min(chunkSize, fileSize - startOffset);
 
   try {
-    while (position < fileSize) {
-      const bytesToRead = Math.min(chunkSize, fileSize - position);
+    while (totalBytesRead < readLimit) {
+      const bytesToRead = readLimit - totalBytesRead;
       const buffer = Buffer.allocUnsafe(bytesToRead);
       const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead, position);
       if (bytesRead === 0) {
@@ -34,10 +35,6 @@ function readNewCompleteLines(filePath, offset, maxReadBytes = 1024 * 1024) {
       chunks.push(chunk);
       totalBytesRead += bytesRead;
       position += bytesRead;
-
-      if (chunk.includes(NEWLINE_BYTE)) {
-        break;
-      }
     }
   } finally {
     fs.closeSync(fd);
@@ -69,7 +66,7 @@ function readNewCompleteLines(filePath, offset, maxReadBytes = 1024 * 1024) {
   return {
     lines,
     nextOffset: startOffset + consumedByteCount,
-    pendingPartialLine: lineStart < data.length
+    pendingPartialLine: lineStart < data.length && totalBytesRead < chunkSize
       ? data.subarray(lineStart).toString('utf8')
       : '',
   };
