@@ -34,6 +34,10 @@ function readNewCompleteLines(filePath, offset, maxReadBytes = 1024 * 1024) {
       chunks.push(chunk);
       totalBytesRead += bytesRead;
       position += bytesRead;
+
+      if (chunk.includes(NEWLINE_BYTE)) {
+        break;
+      }
     }
   } finally {
     fs.closeSync(fd);

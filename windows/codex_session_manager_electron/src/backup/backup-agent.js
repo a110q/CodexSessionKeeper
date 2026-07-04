@@ -180,7 +180,6 @@ class BackupAgent {
     const needsBackupStats = this.shouldReadBackupFileStats({
       baselineCursor,
       existingRecord,
-      hasNewCompleteLines: tailResult.lines.length > 0,
       sourcePathMigrated,
     });
     const backupStatsBeforeAppend = needsBackupStats
@@ -294,22 +293,18 @@ class BackupAgent {
     existingRecord,
     baselineCursor,
     sourcePathMigrated,
-    hasNewCompleteLines,
   }) {
-    if (hasNewCompleteLines) {
-      return true;
-    }
-
     if (!existingRecord) {
       return false;
+    }
+
+    if (!baselineCursor) {
+      return true;
     }
 
     const baselineLineCount = baselineCursor?.lineCount;
     const recordedLineCount = Math.max(existingRecord.lineCount ?? 0, baselineLineCount ?? 0);
     if (sourcePathMigrated) {
-      if (!baselineCursor) {
-        return true;
-      }
       if (baselineCursor.lineCount !== existingRecord.lineCount) {
         return true;
       }

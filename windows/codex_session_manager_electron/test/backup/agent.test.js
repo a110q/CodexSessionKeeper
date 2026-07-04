@@ -122,6 +122,35 @@ test('second scan appends only new completed lines and repeated scan has no dupl
   assert.equal(manifest.sessions.append.lineCount, 2);
 });
 
+test('normal second scan append does not read existing backup file contents', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'write-only-backup.jsonl');
+  await writeSessionFile(sourcePath, [
+    jsonLine({ role: 'user', content: 'Start' }),
+  ]);
+
+  const agent = new BackupAgent({ paths, now: makeClock() });
+  await agent.performOneShotScan();
+
+  let manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const backupPath = path.join(paths.backupRoot, manifest.sessions['write-only-backup'].backupPath);
+  await fs.chmod(backupPath, 0o200);
+  t.after(async () => {
+    await fs.chmod(backupPath, 0o600).catch(() => {});
+  });
+
+  await fs.appendFile(sourcePath, jsonLine({ role: 'assistant', content: 'New answer' }), 'utf8');
+  await agent.performOneShotScan();
+  await fs.chmod(backupPath, 0o600);
+
+  manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  assert.deepEqual(await readLines(backupPath), [
+    JSON.stringify({ role: 'user', content: 'Start' }),
+    JSON.stringify({ role: 'assistant', content: 'New answer' }),
+  ]);
+  assert.equal(manifest.sessions['write-only-backup'].lineCount, 2);
+});
+
 test('partial trailing line is not backed up until completed', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'partial.jsonl');
@@ -293,28 +322,39 @@ test('cursor store preserves tricky values and pending partial line', async (t) 
   assert.deepEqual(await store.get(sourcePath), cursor);
 });
 
+test('session tailer stops after the first chunk containing a newline', async (t) => {
+  const { root } = await makeTestPaths(t);
+  const filePath = path.join(root, 'tailer-bounded.jsonl');
+  await fs.writeFile(filePath, 'one\ntwo\nthree\n', 'utf8');
+
+  assert.deepEqual(readNewCompleteLines(filePath, 0, 4), {
+    lines: ['one'],
+    nextOffset: Buffer.byteLength('one\n'),
+    pendingPartialLine: '',
+  });
+
+  assert.deepEqual(readNewCompleteLines(filePath, Buffer.byteLength('one\n'), 4), {
+    lines: ['two'],
+    nextOffset: Buffer.byteLength('one\ntwo\n'),
+    pendingPartialLine: '',
+  });
+});
+
 test('session tailer uses byte offsets, preserves blank lines, and waits for long lines', async (t) => {
   const { root } = await makeTestPaths(t);
   const filePath = path.join(root, 'tailer.jsonl');
   const longLine = 'a'.repeat(8);
-  await fs.writeFile(filePath, `one\n\n${longLine}`, 'utf8');
+  await fs.writeFile(filePath, `${longLine}\n\npending`, 'utf8');
 
   assert.deepEqual(readNewCompleteLines(filePath, 0, 4), {
-    lines: ['one', ''],
-    nextOffset: Buffer.byteLength('one\n\n'),
-    pendingPartialLine: longLine,
+    lines: [longLine, ''],
+    nextOffset: Buffer.byteLength(`${longLine}\n\n`),
+    pendingPartialLine: 'pe',
   });
 
-  await fs.appendFile(filePath, '\n', 'utf8');
-  assert.deepEqual(readNewCompleteLines(filePath, Buffer.byteLength('one\n\n'), 4), {
-    lines: [longLine],
-    nextOffset: Buffer.byteLength(`one\n\n${longLine}\n`),
-    pendingPartialLine: '',
-  });
-
-  assert.deepEqual(readNewCompleteLines(filePath, 9999, 4), {
-    lines: ['one', '', longLine],
-    nextOffset: Buffer.byteLength(`one\n\n${longLine}\n`),
-    pendingPartialLine: '',
+  assert.deepEqual(readNewCompleteLines(filePath, Buffer.byteLength(`${longLine}\n`), 1024), {
+    lines: [''],
+    nextOffset: Buffer.byteLength(`${longLine}\n\n`),
+    pendingPartialLine: 'pending',
   });
 });
