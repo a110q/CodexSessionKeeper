@@ -65,13 +65,14 @@ public final class BackupRecoveryBuilder {
 
         var usedFilenames = Set<String>()
         var indexEntries: [SessionIndexEntry] = []
-        var includedPaths: [String] = ["session_index.jsonl"]
+        var includedPaths: [String] = ["session_index.jsonl", "sessions"]
 
         for source in backupSources {
             let filename = uniqueRecoveredFilename(
                 for: source.record.sessionId,
                 usedFilenames: &usedFilenames
             )
+            let displayTitle = displayTitle(for: source.record)
             let recoveredRelativePath = "sessions/recovered/\(filename)"
             let recoveredURL = recoveredSessionsURL.appendingPathComponent(filename, isDirectory: false)
             let contents = try Data(contentsOf: source.fileURL)
@@ -80,7 +81,8 @@ public final class BackupRecoveryBuilder {
             includedPaths.append(recoveredRelativePath)
             indexEntries.append(SessionIndexEntry(
                 id: source.record.sessionId,
-                title: source.record.title ?? "",
+                title: displayTitle,
+                threadName: displayTitle,
                 rolloutPath: paths.codexRoot
                     .appendingPathComponent("sessions", isDirectory: true)
                     .appendingPathComponent("recovered", isDirectory: true)
@@ -100,7 +102,7 @@ public final class BackupRecoveryBuilder {
         let snapshotJSON = packageRoot.appendingPathComponent("snapshot.json", isDirectory: false)
         let createdAtString = Self.iso8601String(from: createdAt)
         let snapshot = RecoverySnapshotMetadata(
-            id: "incremental-recovery-\(Self.safePathComponent(from: createdAtString))",
+            id: packageRoot.lastPathComponent,
             name: "Incremental Recovery \(createdAtString)",
             createdAt: createdAt,
             codexRoot: paths.codexRoot.path,
@@ -195,7 +197,7 @@ public final class BackupRecoveryBuilder {
         let packagesRoot = paths.backupRoot.appendingPathComponent("recovery-packages", isDirectory: true)
         try fileManager.createDirectory(at: packagesRoot, withIntermediateDirectories: true)
 
-        let baseName = Self.safePathComponent(from: Self.iso8601String(from: createdAt))
+        let baseName = "incremental-recovery-\(Self.safePathComponent(from: Self.iso8601String(from: createdAt)))"
         var candidate = packagesRoot.appendingPathComponent(baseName, isDirectory: true)
         var suffix = 2
         while fileManager.fileExists(atPath: candidate.path) {
@@ -204,6 +206,11 @@ public final class BackupRecoveryBuilder {
         }
         try fileManager.createDirectory(at: candidate, withIntermediateDirectories: true)
         return candidate
+    }
+
+    private func displayTitle(for record: BackupSessionRecord) -> String {
+        let trimmedTitle = record.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmedTitle.isEmpty ? record.sessionId : trimmedTitle
     }
 
     private func writeSessionIndex(_ entries: [SessionIndexEntry], to url: URL) throws {
@@ -277,6 +284,7 @@ private struct BackupSource {
 private struct SessionIndexEntry: Encodable {
     var id: String
     var title: String
+    var threadName: String
     var rolloutPath: String
     var sourcePath: String
     var backupPath: String
@@ -287,6 +295,7 @@ private struct SessionIndexEntry: Encodable {
     enum CodingKeys: String, CodingKey {
         case id
         case title
+        case threadName = "thread_name"
         case rolloutPath = "rollout_path"
         case sourcePath = "source_path"
         case backupPath = "backup_path"

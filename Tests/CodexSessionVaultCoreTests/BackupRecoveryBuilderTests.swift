@@ -46,6 +46,7 @@ func buildsPackageFromOneIncrementalBackup() throws {
     }
     #expect(entry.id == sessionID)
     #expect(entry.title == "Recover this")
+    #expect(entry.threadName == "Recover this")
     #expect(entry.rolloutPath == fixture.paths.codexRoot
         .appendingPathComponent("sessions", isDirectory: true)
         .appendingPathComponent("recovered", isDirectory: true)
@@ -58,14 +59,17 @@ func buildsPackageFromOneIncrementalBackup() throws {
     #expect(entry.bytesBackedUp == Int64(Data(contents.utf8).count))
 
     let snapshot = try readSnapshot(at: package.snapshotJSON)
+    #expect(package.rootURL.lastPathComponent == snapshot.id)
     #expect(snapshot.reason == "incremental-recovery")
     #expect(snapshot.kind == "system")
     #expect(snapshot.codexRoot == fixture.paths.codexRoot.path)
     #expect(snapshot.backupRoot == fixture.paths.backupRoot.path)
     #expect(snapshot.sessionCount == 1)
     #expect(snapshot.archivedSessionCount == 0)
+    #expect(snapshot.includedPaths.contains("sessions"))
     #expect(snapshot.includedPaths == [
         "session_index.jsonl",
+        "sessions",
         "sessions/recovered/session-1.jsonl"
     ])
 }
@@ -156,11 +160,32 @@ func rejectsBackupPathTraversalAndAbsolutePathsEscapingBackupRoot() throws {
         _ = try builder.buildRecoveryPackage(sessionIDs: ["absolute"])
     }
 }
+
+@Test
+func rejectsBackupPathSymlinkEscapingBackupRoot() throws {
+    let fixture = try BackupRecoveryFixture()
+    defer { fixture.cleanup() }
+    let outsideDirectory = fixture.tempDirectory.appendingPathComponent("outside", isDirectory: true)
+    try FileManager.default.createDirectory(at: outsideDirectory, withIntermediateDirectories: true)
+    let outsideFile = outsideDirectory.appendingPathComponent("escaped.jsonl", isDirectory: false)
+    try Data(#"{"role":"user","content":"outside"}"#.utf8).write(to: outsideFile)
+    let symlinkURL = fixture.paths.backupRoot.appendingPathComponent("escaped-link.jsonl", isDirectory: false)
+    try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: outsideFile)
+    try fixture.saveManifest(records: [
+        fixture.makeRecord(sessionID: "symlink", backupPath: "escaped-link.jsonl")
+    ])
+    let builder = BackupRecoveryBuilder(paths: fixture.paths, now: { fixture.now })
+
+    expectLocalizedError(containing: "escapes backup root") {
+        _ = try builder.buildRecoveryPackage(sessionIDs: ["symlink"])
+    }
+}
 }
 
 private struct RecoveryIndexEntry: Decodable {
     let id: String
     let title: String
+    let threadName: String
     let rolloutPath: String
     let sourcePath: String
     let backupPath: String
@@ -171,6 +196,7 @@ private struct RecoveryIndexEntry: Decodable {
     enum CodingKeys: String, CodingKey {
         case id
         case title
+        case threadName = "thread_name"
         case rolloutPath = "rollout_path"
         case sourcePath = "source_path"
         case backupPath = "backup_path"
@@ -181,6 +207,7 @@ private struct RecoveryIndexEntry: Decodable {
 }
 
 private struct RecoverySnapshot: Decodable {
+    let id: String
     let reason: String
     let kind: String
     let codexRoot: String
