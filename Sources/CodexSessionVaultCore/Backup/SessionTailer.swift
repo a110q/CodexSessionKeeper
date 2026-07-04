@@ -43,9 +43,7 @@ public final class SessionTailer {
 
         for index in data.indices where data[index] == Self.newlineByte {
             let line = data[lineStart..<index]
-            if !line.isEmpty {
-                lines.append(Data(line))
-            }
+            lines.append(Data(line))
             consumedByteCount = index + 1
             lineStart = index + 1
         }

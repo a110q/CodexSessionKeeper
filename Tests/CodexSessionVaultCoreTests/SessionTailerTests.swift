@@ -14,6 +14,7 @@ func tailerReadsCompleteLinesFromStartAndKeepsPendingPartialLine() throws {
 
     #expect(result.lines == [
         Data("first".utf8),
+        Data(),
         Data("second".utf8)
     ])
     #expect(result.nextOffset == Int64(Data("first\n\nsecond\n".utf8).count))
