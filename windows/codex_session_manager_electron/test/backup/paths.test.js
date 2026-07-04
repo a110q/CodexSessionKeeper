@@ -73,3 +73,9 @@ test('relativeBackupPath returns null outside or equal to the backup root', () =
   assert.equal(paths.relativeBackupPath('C:\\Users\\Ada\\.codex-session-vault\\incremental-backups-other\\abc.jsonl'), null);
   assert.equal(paths.relativeBackupPath('C:\\Users\\Ada\\.codex\\sessions\\abc.jsonl'), null);
 });
+
+test('relativeBackupPath returns null for files on another Windows drive', () => {
+  const paths = backupPaths(homeDir);
+
+  assert.equal(paths.relativeBackupPath('D:\\Backups\\abc.jsonl'), null);
+});
