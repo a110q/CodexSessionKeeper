@@ -98,6 +98,22 @@ func tailerRespectsMaxReadBytesWithoutConsumingPartialLine() throws {
     #expect(result.pendingPartialLine == Data("se".utf8))
 }
 
+@Test
+func tailerContinuesReadingUntilNewlineBeyondChunkSize() throws {
+    let tempDirectory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: tempDirectory) }
+    let fileURL = tempDirectory.appendingPathComponent("session.jsonl")
+    let longLine = "abcdefghij"
+    try Data("\(longLine)\npartial".utf8).write(to: fileURL)
+    let tailer = SessionTailer(maxReadBytes: 4)
+
+    let result = try tailer.readNewCompleteLines(from: fileURL, offset: 0)
+
+    #expect(result.lines == [Data(longLine.utf8)])
+    #expect(result.nextOffset == Int64(Data("\(longLine)\n".utf8).count))
+    #expect(result.pendingPartialLine == Data("p".utf8))
+}
+
 private func makeTemporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("CodexSessionVaultCoreTests-\(UUID().uuidString)", isDirectory: true)

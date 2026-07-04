@@ -113,6 +113,71 @@ func cursorStoreHandlesQuotesPipesAndNewlinesWithoutCorruptingParsing() throws {
     #expect(loaded == cursor)
 }
 
+@Test
+func cursorStoreReportsUsefulSqliteFailureDescriptions() throws {
+    let tempDirectory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: tempDirectory) }
+    let sqliteScript = try writeExecutableScript(
+        """
+        #!/bin/sh
+        echo "simulated sqlite failure" >&2
+        exit 7
+        """,
+        named: "sqlite-fail.sh",
+        in: tempDirectory
+    )
+    let store = BackupCursorStore(
+        databaseURL: tempDirectory.appendingPathComponent("cursors.sqlite"),
+        sqlitePath: sqliteScript.path
+    )
+
+    do {
+        try store.open()
+        #expect(Bool(false), "Expected sqlite failure")
+    } catch {
+        #expect(error.localizedDescription.contains("sqlite3 failed with exit status 7"))
+        #expect(error.localizedDescription.contains("simulated sqlite failure"))
+    }
+}
+
+@Test
+func cursorStorePassesBusyTimeoutBeforeDatabasePath() throws {
+    let tempDirectory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: tempDirectory) }
+    let sqliteScript = try writeExecutableScript(
+        """
+        #!/bin/sh
+        args_path="$0.args"
+        : > "$args_path"
+        for arg in "$@"; do
+          printf '%s\\n' "$arg" >> "$args_path"
+        done
+        exit 1
+        """,
+        named: "sqlite-record-args.sh",
+        in: tempDirectory
+    )
+    let databaseURL = tempDirectory.appendingPathComponent("cursors.sqlite")
+    let store = BackupCursorStore(databaseURL: databaseURL, sqlitePath: sqliteScript.path)
+
+    do {
+        try store.open()
+        #expect(Bool(false), "Expected fake sqlite to fail")
+    } catch {
+        let argumentsURL = URL(fileURLWithPath: "\(sqliteScript.path).args")
+        let arguments = try String(contentsOf: argumentsURL, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        let commandIndex = try #require(arguments.firstIndex(of: "-cmd"))
+        let timeoutIndex = commandIndex + 1
+        let databaseIndex = try #require(arguments.firstIndex(of: databaseURL.path))
+
+        #expect(arguments.indices.contains(timeoutIndex))
+        #expect(arguments[timeoutIndex] == ".timeout 5000")
+        #expect(commandIndex < databaseIndex)
+    }
+}
+
 private func makeCursor(sourcePath: String) -> BackupCursor {
     BackupCursor(
         sessionId: "session-123",
@@ -133,5 +198,12 @@ private func makeTemporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("CodexSessionVaultCoreTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+}
+
+private func writeExecutableScript(_ contents: String, named name: String, in directory: URL) throws -> URL {
+    let url = directory.appendingPathComponent(name)
+    try Data(contents.utf8).write(to: url)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     return url
 }

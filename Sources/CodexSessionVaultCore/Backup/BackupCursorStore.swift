@@ -151,11 +151,15 @@ public final class BackupCursorStore {
     }
 
     private func execute(_ sql: String) throws {
-        _ = try runSQLite(arguments: ["-batch", "-bail", databaseURL.path, sql])
+        _ = try runSQLite(arguments: baseSQLiteArguments + [databaseURL.path, sql])
     }
 
     private func queryJSON(_ sql: String) throws -> String {
-        try runSQLite(arguments: ["-batch", "-bail", "-json", databaseURL.path, sql])
+        try runSQLite(arguments: baseSQLiteArguments + ["-json", databaseURL.path, sql])
+    }
+
+    private var baseSQLiteArguments: [String] {
+        ["-batch", "-bail", "-cmd", ".timeout 5000"]
     }
 
     private func runSQLite(arguments: [String]) throws -> String {
@@ -168,18 +172,24 @@ public final class BackupCursorStore {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
+        let outputCollector = PipeDataCollector()
+        let errorCollector = PipeDataCollector()
+        let readGroup = DispatchGroup()
+
         do {
             try process.run()
         } catch {
             throw BackupCursorStoreError.launchFailed(sqlitePath: sqlitePath, underlying: error)
         }
 
-        process.waitUntilExit()
+        Self.drain(outputPipe, into: outputCollector, group: readGroup)
+        Self.drain(errorPipe, into: errorCollector, group: readGroup)
 
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: outputData, encoding: .utf8) ?? ""
-        let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
+        process.waitUntilExit()
+        readGroup.wait()
+
+        let output = String(data: outputCollector.collectedData(), encoding: .utf8) ?? ""
+        let errorOutput = String(data: errorCollector.collectedData(), encoding: .utf8) ?? ""
 
         guard process.terminationStatus == 0 else {
             throw BackupCursorStoreError.sqliteFailed(
@@ -189,6 +199,15 @@ public final class BackupCursorStore {
         }
 
         return output
+    }
+
+    private static func drain(_ pipe: Pipe, into collector: PipeDataCollector, group: DispatchGroup) {
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            collector.append(data)
+            group.leave()
+        }
     }
 
     private static func sqlText(_ value: String) -> String {
@@ -255,4 +274,38 @@ private enum BackupCursorStoreError: Error, Sendable {
     case launchFailed(sqlitePath: String, underlying: Error)
     case sqliteFailed(status: Int32, stderr: String)
     case invalidPendingPartialLine
+}
+
+extension BackupCursorStoreError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case let .launchFailed(sqlitePath, underlying):
+            "Failed to launch sqlite3 at \(sqlitePath): \(underlying.localizedDescription)"
+        case let .sqliteFailed(status, stderr):
+            if stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                "sqlite3 failed with exit status \(status)."
+            } else {
+                "sqlite3 failed with exit status \(status): \(stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+            }
+        case .invalidPendingPartialLine:
+            "Stored backup cursor has invalid base64 pending partial line data."
+        }
+    }
+}
+
+private final class PipeDataCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func append(_ newData: Data) {
+        lock.lock()
+        data.append(newData)
+        lock.unlock()
+    }
+
+    func collectedData() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
 }
