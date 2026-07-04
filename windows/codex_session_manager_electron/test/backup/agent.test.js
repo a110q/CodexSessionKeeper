@@ -72,6 +72,15 @@ async function fileHash(filePath) {
     .digest('hex');
 }
 
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function makeClock() {
   let tick = 0;
   return () => new Date(Date.UTC(2026, 0, 2, 3, 4, tick++));
@@ -157,6 +166,44 @@ test('first scan reconciles existing backup file without duplicate append', asyn
   const cursor = await store.get(sourcePath);
   assert.equal(cursor.lineCount, 2);
   assert.equal(cursor.lastByteOffset, Buffer.byteLength(`${firstLine}\n${secondLine}\n`));
+});
+
+test('missing manifest recovers backup path from existing cursor on a later day', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'cursor-retry.jsonl');
+  const line = JSON.stringify({ role: 'user', content: 'Cursor survived' });
+  await writeSessionFile(sourcePath, [`${line}\n`]);
+
+  const firstAgent = new BackupAgent({
+    paths,
+    now: () => new Date(Date.UTC(2026, 0, 2, 3, 4, 0)),
+  });
+  await firstAgent.performOneShotScan();
+
+  const firstManifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const originalBackupPath = firstManifest.sessions['cursor-retry'].backupPath;
+  const originalBackupFilePath = path.join(paths.backupRoot, originalBackupPath);
+  await fs.rm(paths.manifestPath, { force: true });
+
+  const retryAgent = new BackupAgent({
+    paths,
+    now: () => new Date(Date.UTC(2026, 0, 3, 3, 4, 0)),
+  });
+  await retryAgent.performOneShotScan();
+
+  const retryManifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const retryRecord = retryManifest.sessions['cursor-retry'];
+  assert.equal(retryRecord.backupPath, originalBackupPath);
+  assert.deepEqual(await readLines(originalBackupFilePath), [line]);
+  assert.equal(await fileExists(paths.backupFilePath('cursor-retry', new Date(Date.UTC(2026, 0, 3, 3, 4, 0)))), false);
+
+  const store = new CursorStore({ paths });
+  await store.open();
+  t.after(async () => {
+    await store.close();
+  });
+  const cursor = await store.get(sourcePath);
+  assert.equal(cursor.backupPath, originalBackupPath);
 });
 
 test('normal second scan append does not read existing backup file contents', async (t) => {

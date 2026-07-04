@@ -165,7 +165,7 @@ class BackupAgent {
     const firstSeenAt = existingRecord?.firstSeenAt
       ? new Date(existingRecord.firstSeenAt)
       : scanDate;
-    const backupPath = this.backupFilePathFor(sessionId, firstSeenAt, existingRecord);
+    const backupPath = this.backupFilePathFor(sessionId, firstSeenAt, existingRecord, baselineCursor);
     const relativeBackupPath = this.validatedRelativeBackupPath(backupPath);
     const readOffset = baselineCursor?.lastByteOffset ?? 0;
     const lineCountBeforeReadOffset = readOffset > 0 ? baselineCursor?.lineCount ?? 0 : 0;
@@ -266,16 +266,17 @@ class BackupAgent {
     return cursorStore.get(existingRecord.sourcePath);
   }
 
-  backupFilePathFor(sessionId, firstSeenAt, existingRecord) {
-    if (!existingRecord) {
-      return this.paths.backupFilePath(sessionId, firstSeenAt);
+  backupFilePathFor(sessionId, firstSeenAt, existingRecord, baselineCursor) {
+    const recordedBackupPath = existingRecord?.backupPath ?? baselineCursor?.backupPath;
+    if (recordedBackupPath) {
+      if (path.isAbsolute(recordedBackupPath)) {
+        return recordedBackupPath;
+      }
+
+      return path.join(this.paths.backupRoot, recordedBackupPath);
     }
 
-    if (path.isAbsolute(existingRecord.backupPath)) {
-      return existingRecord.backupPath;
-    }
-
-    return path.join(this.paths.backupRoot, existingRecord.backupPath);
+    return this.paths.backupFilePath(sessionId, firstSeenAt);
   }
 
   validatedRelativeBackupPath(backupPath) {
