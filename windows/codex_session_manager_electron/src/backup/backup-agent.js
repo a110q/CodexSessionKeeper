@@ -177,9 +177,11 @@ class BackupAgent {
     );
     const recordedBytesBackedUp = Number(existingRecord?.bytesBackedUp ?? 0);
     const sourcePathMigrated = existingRecord ? existingRecord.sourcePath !== sourcePath : false;
+    const firstSeenBackupExists = !existingRecord && !baselineCursor && await fileExists(backupPath);
     const needsBackupStats = this.shouldReadBackupFileStats({
       baselineCursor,
       existingRecord,
+      firstSeenBackupExists,
       sourcePathMigrated,
     });
     const backupStatsBeforeAppend = needsBackupStats
@@ -235,7 +237,7 @@ class BackupAgent {
       manifest.sessions[sessionId] = updatedRecord;
     }
 
-    await cursorStore.upsert({
+    const updatedCursor = {
       sessionId,
       sourcePath,
       backupPath: relativeBackupPath,
@@ -247,7 +249,11 @@ class BackupAgent {
       status: ACTIVE_STATUS,
       lastError: null,
       updatedAt: scanDate.getTime() / 1000,
-    });
+    };
+
+    if (!sameCursor(currentCursor, updatedCursor)) {
+      await cursorStore.upsert(updatedCursor);
+    }
 
     return manifestChanged;
   }
@@ -292,8 +298,13 @@ class BackupAgent {
   shouldReadBackupFileStats({
     existingRecord,
     baselineCursor,
+    firstSeenBackupExists,
     sourcePathMigrated,
   }) {
+    if (firstSeenBackupExists) {
+      return true;
+    }
+
     if (!existingRecord) {
       return false;
     }
@@ -491,6 +502,27 @@ function sameRecord(lhs, rhs) {
     'lineCount',
     'bytesBackedUp',
     'status',
+  ];
+
+  return keys.every((key) => lhs[key] === rhs[key]);
+}
+
+function sameCursor(lhs, rhs) {
+  if (!lhs) {
+    return false;
+  }
+
+  const keys = [
+    'sessionId',
+    'sourcePath',
+    'backupPath',
+    'lastByteOffset',
+    'lastSourceSize',
+    'lastSourceModifiedAt',
+    'lineCount',
+    'pendingPartialLine',
+    'status',
+    'lastError',
   ];
 
   return keys.every((key) => lhs[key] === rhs[key]);

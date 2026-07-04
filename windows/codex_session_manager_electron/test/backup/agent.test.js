@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -65,6 +66,12 @@ async function readLines(filePath) {
   return text.split('\n').slice(0, -1);
 }
 
+async function fileHash(filePath) {
+  return crypto.createHash('sha256')
+    .update(await fs.readFile(filePath))
+    .digest('hex');
+}
+
 function makeClock() {
   let tick = 0;
   return () => new Date(Date.UTC(2026, 0, 2, 3, 4, tick++));
@@ -122,6 +129,36 @@ test('second scan appends only new completed lines and repeated scan has no dupl
   assert.equal(manifest.sessions.append.lineCount, 2);
 });
 
+test('first scan reconciles existing backup file without duplicate append', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'retry.jsonl');
+  const firstLine = JSON.stringify({ role: 'user', content: 'Already copied' });
+  const secondLine = JSON.stringify({ role: 'assistant', content: 'Copied after retry' });
+  await writeSessionFile(sourcePath, [`${firstLine}\n`, `${secondLine}\n`]);
+
+  const firstScanAt = new Date(Date.UTC(2026, 0, 2, 3, 4, 0));
+  const backupPath = paths.backupFilePath('retry', firstScanAt);
+  await fs.mkdir(path.dirname(backupPath), { recursive: true });
+  await fs.writeFile(backupPath, `${firstLine}\n`, 'utf8');
+
+  const agent = new BackupAgent({ paths, now: makeClock() });
+  await agent.performOneShotScan();
+
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  assert.deepEqual(await readLines(backupPath), [firstLine, secondLine]);
+  assert.equal(manifest.sessions.retry.lineCount, 2);
+  assert.equal(manifest.sessions.retry.bytesBackedUp, Buffer.byteLength(`${firstLine}\n${secondLine}\n`));
+
+  const store = new CursorStore({ paths });
+  await store.open();
+  t.after(async () => {
+    await store.close();
+  });
+  const cursor = await store.get(sourcePath);
+  assert.equal(cursor.lineCount, 2);
+  assert.equal(cursor.lastByteOffset, Buffer.byteLength(`${firstLine}\n${secondLine}\n`));
+});
+
 test('normal second scan append does not read existing backup file contents', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'write-only-backup.jsonl');
@@ -149,6 +186,39 @@ test('normal second scan append does not read existing backup file contents', as
     JSON.stringify({ role: 'assistant', content: 'New answer' }),
   ]);
   assert.equal(manifest.sessions['write-only-backup'].lineCount, 2);
+});
+
+test('no-op scan does not rewrite the cursor database', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'noop.jsonl');
+  await writeSessionFile(sourcePath, [
+    jsonLine({ role: 'user', content: 'Stable' }),
+  ]);
+
+  const agent = new BackupAgent({ paths, now: makeClock() });
+  await agent.performOneShotScan();
+
+  const beforeHash = await fileHash(paths.cursorDatabasePath);
+  const originalWriteFile = fs.writeFile;
+  let cursorDatabaseWriteCount = 0;
+  fs.writeFile = async (filePath, ...args) => {
+    if (String(filePath).startsWith(`${paths.cursorDatabasePath}.tmp-`)) {
+      cursorDatabaseWriteCount += 1;
+    }
+
+    return originalWriteFile.call(fs, filePath, ...args);
+  };
+
+  try {
+    await agent.performOneShotScan();
+  } finally {
+    fs.writeFile = originalWriteFile;
+  }
+
+  const afterHash = await fileHash(paths.cursorDatabasePath);
+
+  assert.equal(cursorDatabaseWriteCount, 0);
+  assert.equal(afterHash, beforeHash);
 });
 
 test('partial trailing line is not backed up until completed', async (t) => {

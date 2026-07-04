@@ -85,7 +85,9 @@ class CursorStore {
         updated_at REAL NOT NULL
       );
     `);
-    await this.flush();
+    if (!data) {
+      await this.flush();
+    }
 
     return this;
   }
