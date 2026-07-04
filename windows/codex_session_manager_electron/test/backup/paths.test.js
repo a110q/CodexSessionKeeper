@@ -57,6 +57,15 @@ test('relativeBackupPath returns paths inside the backup root', () => {
   );
 });
 
+test('relativeBackupPath allows in-root names beginning with dots', () => {
+  const paths = backupPaths(homeDir);
+
+  assert.equal(
+    paths.relativeBackupPath('C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\..backup\\a.jsonl'),
+    '..backup\\a.jsonl',
+  );
+});
+
 test('relativeBackupPath returns null outside or equal to the backup root', () => {
   const paths = backupPaths(homeDir);
 

@@ -39,7 +39,13 @@ function backupPaths(homeDir) {
   function relativeBackupPath(filePath) {
     const relative = path.relative(path.resolve(backupRoot), path.resolve(filePath));
 
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    if (
+      !relative
+      || relative === '..'
+      || relative.startsWith('..\\')
+      || relative.startsWith('../')
+      || path.isAbsolute(relative)
+    ) {
       return null;
     }
 
