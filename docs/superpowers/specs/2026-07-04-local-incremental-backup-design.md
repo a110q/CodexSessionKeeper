@@ -37,7 +37,7 @@
 - 按 byte offset 读取新增内容。
 - 只追加完整 JSONL 行到本地备份文件。
 - 更新 cursor 和 manifest。
-- 写入本机状态文件和滚动日志。
+- 写入本机状态文件；滚动日志路径仅预留给后续阶段。
 - 在监听失败时切换到轮询模式。
 
 现有快照恢复模块继续负责：
@@ -70,8 +70,7 @@ incremental-backups/
       MM/
         DD/
           <session-id>.jsonl
-  logs/
-    backup-agent.log
+  logs/              # 预留，第一阶段诊断以 status/manifest/cursor 为准
 ```
 
 命名规则：
@@ -247,7 +246,6 @@ UI、菜单栏或托盘提供：
 
 - 查看当前备份状态。
 - 复制诊断信息。
-- 打开日志目录。
 - 打开备份目录。
 - 查看最近错误。
 
@@ -261,13 +259,9 @@ IT 可以直接扫描 NAS 上的 `status.json` 做安装率和健康状态统计
 
 ## 日志
 
-滚动日志路径：
+第一阶段当前实现只预留 `logs/` 目录，不把滚动日志作为排查入口。常用诊断以 `status.json`、`manifest.json` 和 `cursors.sqlite` 为准。
 
-```text
-~/.codex-session-vault/incremental-backups/logs/backup-agent.log
-```
-
-日志记录：
+后续如接入滚动日志，可记录：
 
 - agent 启动和停止。
 - 自检结果。

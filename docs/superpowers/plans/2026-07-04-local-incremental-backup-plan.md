@@ -111,7 +111,7 @@ final class BackupPathsTests: XCTestCase {
         XCTAssertEqual(paths.manifestURL.path, "/Users/alice/.codex-session-vault/incremental-backups/manifest.json")
         XCTAssertEqual(paths.cursorDatabaseURL.path, "/Users/alice/.codex-session-vault/incremental-backups/cursors.sqlite")
         XCTAssertEqual(paths.statusURL.path, "/Users/alice/.codex-session-vault/incremental-backups/status.json")
-        XCTAssertEqual(paths.logURL.path, "/Users/alice/.codex-session-vault/incremental-backups/logs/backup-agent.log")
+        XCTAssertEqual(paths.logURL.path, "/Users/alice/.codex-session-vault/incremental-backups/logs/backup-agent.log") // reserved path; first stage does not write rolling logs
     }
 
     func testBackupFilePathUsesFirstSeenDateDirectoriesAndSessionIdFileName() {
@@ -360,6 +360,7 @@ public struct BackupPaths: Sendable {
     }
 
     public var logURL: URL {
+        // Reserved for a future rolling log; first-stage diagnostics use status/manifest/cursor files.
         logsRootURL.appendingPathComponent("backup-agent.log", isDirectory: false)
     }
 
@@ -1697,7 +1698,7 @@ function backupPaths(homeDir) {
     statusPath: path.join(backupRoot, 'status.json'),
     sessionsRoot: path.join(backupRoot, 'sessions'),
     logsRoot: path.join(backupRoot, 'logs'),
-    logPath: path.join(backupRoot, 'logs', 'backup-agent.log'),
+    logPath: path.join(backupRoot, 'logs', 'backup-agent.log'), // reserved; first stage does not write rolling logs
     restoreStagingRoot: path.join(vaultRoot, 'incremental-restore-staging'),
     backupFilePath(sessionId, firstSeenAt) {
       const date = new Date(firstSeenAt);
@@ -2360,7 +2361,7 @@ Add to `docs/操作手册.md`:
 1. 查看界面里的“本地增量备份”状态。
 2. 点击或手动打开备份目录。
 3. 检查 `status.json` 的 `lastBackupAt`、`sessionCount`、`lastError`。
-4. 检查 `logs/backup-agent.log`。
+4. 检查 `manifest.json` 的会话索引和 `cursors.sqlite` 的读取游标。
 
 第一阶段恢复会生成文件型恢复包，不强行重建 `state_5.sqlite`。恢复后如果 Codex 已打开，请重启 Codex。
 ```
