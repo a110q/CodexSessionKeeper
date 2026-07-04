@@ -3,18 +3,23 @@ import Foundation
 public struct BackupPaths: Sendable {
     public let homeDirectory: URL
     public let codexRoot: URL
-    public let vaultRoot: URL
     public let backupRoot: URL
 
     public init(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         codexRoot: URL? = nil,
-        vaultRoot: URL? = nil
+        backupRoot: URL? = nil
     ) {
         self.homeDirectory = homeDirectory
         self.codexRoot = codexRoot ?? homeDirectory.appendingPathComponent(".codex", isDirectory: true)
-        self.vaultRoot = vaultRoot ?? homeDirectory.appendingPathComponent(".codex-session-vault", isDirectory: true)
-        self.backupRoot = self.vaultRoot.appendingPathComponent("incremental-backups", isDirectory: true)
+        self.backupRoot = backupRoot
+            ?? homeDirectory
+                .appendingPathComponent(".codex-session-vault", isDirectory: true)
+                .appendingPathComponent("incremental-backups", isDirectory: true)
+    }
+
+    public var sessionsRoot: URL {
+        backupRoot.appendingPathComponent("sessions", isDirectory: true)
     }
 
     public var manifestURL: URL {
@@ -29,39 +34,68 @@ public struct BackupPaths: Sendable {
         backupRoot.appendingPathComponent("status.json", isDirectory: false)
     }
 
-    public var sessionsRootURL: URL {
-        backupRoot.appendingPathComponent("sessions", isDirectory: true)
-    }
-
-    public var logsRootURL: URL {
-        backupRoot.appendingPathComponent("logs", isDirectory: true)
-    }
-
     public var logURL: URL {
-        logsRootURL.appendingPathComponent("backup-agent.log", isDirectory: false)
-    }
-
-    public var restoreStagingRootURL: URL {
-        vaultRoot.appendingPathComponent("incremental-restore-staging", isDirectory: true)
+        backupRoot
+            .appendingPathComponent("logs", isDirectory: true)
+            .appendingPathComponent("backup-agent.log", isDirectory: false)
     }
 
     public func backupFileURL(sessionID: String, firstSeenAt: Date) -> URL {
-        let calendar = Calendar(identifier: .gregorian)
-        let components = calendar.dateComponents(in: TimeZone(secondsFromGMT: 0)!, from: firstSeenAt)
-        let year = String(format: "%04d", components.year ?? 1970)
-        let month = String(format: "%02d", components.month ?? 1)
-        let day = String(format: "%02d", components.day ?? 1)
-        return sessionsRootURL
+        let dateComponents = Self.utcCalendar.dateComponents([.year, .month, .day], from: firstSeenAt)
+        let year = String(format: "%04d", dateComponents.year ?? 1970)
+        let month = String(format: "%02d", dateComponents.month ?? 1)
+        let day = String(format: "%02d", dateComponents.day ?? 1)
+        let filename = "\(Self.safeSessionFilenameStem(from: sessionID)).jsonl"
+
+        return sessionsRoot
             .appendingPathComponent(year, isDirectory: true)
             .appendingPathComponent(month, isDirectory: true)
             .appendingPathComponent(day, isDirectory: true)
-            .appendingPathComponent("\(sessionID).jsonl", isDirectory: false)
+            .appendingPathComponent(filename, isDirectory: false)
     }
 
     public func relativeBackupPath(for fileURL: URL) -> String {
-        let root = backupRoot.standardizedFileURL.path
-        let path = fileURL.standardizedFileURL.path
-        guard path.hasPrefix(root + "/") else { return fileURL.lastPathComponent }
-        return String(path.dropFirst(root.count + 1))
+        let rootComponents = backupRoot.standardizedFileURL.pathComponents
+        let fileComponents = fileURL.standardizedFileURL.pathComponents
+
+        guard fileComponents.starts(with: rootComponents) else {
+            return fileURL.lastPathComponent
+        }
+
+        return fileComponents.dropFirst(rootComponents.count).joined(separator: "/")
+    }
+
+    private static let utcCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return calendar
+    }()
+
+    private static func safeSessionFilenameStem(from sessionID: String) -> String {
+        var sanitized = ""
+        var previousWasSeparator = false
+
+        for scalar in sessionID.unicodeScalars {
+            if scalar.isSafeFilenameScalar {
+                sanitized.unicodeScalars.append(scalar)
+                previousWasSeparator = false
+            } else if !previousWasSeparator {
+                sanitized.append("-")
+                previousWasSeparator = true
+            }
+        }
+
+        let trimmed = sanitized.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return trimmed.isEmpty ? "session" : trimmed
+    }
+}
+
+private extension Unicode.Scalar {
+    var isSafeFilenameScalar: Bool {
+        ("a"..."z").contains(self)
+            || ("A"..."Z").contains(self)
+            || ("0"..."9").contains(self)
+            || self == "-"
+            || self == "_"
     }
 }
