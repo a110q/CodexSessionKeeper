@@ -221,34 +221,45 @@ public final class BackupAgent: @unchecked Sendable {
         let lineCountBeforeReadOffset = readOffset > 0 ? (baselineCursor?.lineCount ?? 0) : 0
         let tailResult = try tailer.readNewCompleteLines(from: sourceURL, offset: readOffset)
         let sourceMetadata = try metadata(for: sourceURL)
-        let backupStatsBeforeAppend = try backupFileStats(at: backupURL)
+        let recordedLineCount = max(existingRecord?.lineCount ?? 0, baselineCursor?.lineCount ?? 0)
+        let recordedBytesBackedUp = existingRecord?.bytesBackedUp ?? 0
+        let sourcePathMigrated = existingRecord.map { $0.sourcePath != sourcePath } ?? false
+        let needsBackupStats = shouldReadBackupFileStats(
+            existingRecord: existingRecord,
+            baselineCursor: baselineCursor,
+            sourcePathMigrated: sourcePathMigrated,
+            hasNewCompleteLines: !tailResult.lines.isEmpty
+        )
+        let backupStatsBeforeAppend = needsBackupStats
+            ? try backupFileStats(at: backupURL)
+            : BackupFileStats(byteCount: recordedBytesBackedUp, lineCount: recordedLineCount)
         let skippedAlreadyBackedUpLineCount = min(
             tailResult.lines.count,
             max(0, backupStatsBeforeAppend.lineCount - lineCountBeforeReadOffset)
         )
         let linesToAppend = Array(tailResult.lines.dropFirst(skippedAlreadyBackedUpLineCount))
+        let appendedLineStats = lineStats(for: linesToAppend)
 
-        let appendedByteCount: Int64
-        if linesToAppend.isEmpty {
-            appendedByteCount = 0
-        } else {
-            appendedByteCount = try append(lines: linesToAppend, to: backupURL)
+        if !linesToAppend.isEmpty {
+            _ = try append(lines: linesToAppend, to: backupURL)
         }
-        let backupStatsAfterAppend = appendedByteCount > 0
-            ? try backupFileStats(at: backupURL)
-            : backupStatsBeforeAppend
+        let backupStatsAfterAppend = BackupFileStats(
+            byteCount: backupStatsBeforeAppend.byteCount + appendedLineStats.byteCount,
+            lineCount: backupStatsBeforeAppend.lineCount + appendedLineStats.lineCount
+        )
 
         let consumedCompleteLineCount = lineCountBeforeReadOffset + tailResult.lines.count
-        let recordedLineCount = max(existingRecord?.lineCount ?? 0, baselineCursor?.lineCount ?? 0)
         let totalLineCount = max(
             recordedLineCount,
             consumedCompleteLineCount,
             backupStatsAfterAppend.lineCount
         )
-        let totalBytesBackedUp = max(existingRecord?.bytesBackedUp ?? 0, backupStatsAfterAppend.byteCount)
-        let title = existingRecord?.title
-            ?? firstTitle(in: tailResult.lines)
-            ?? firstTitle(inBackupFileAt: backupURL)
+        let totalBytesBackedUp = max(recordedBytesBackedUp, backupStatsAfterAppend.byteCount)
+        let titleFromNewLines = firstTitle(in: tailResult.lines)
+        let title = existingRecord?.title ?? titleFromNewLines ?? backupTitleIfAlreadyInspectingFile(
+            at: backupURL,
+            needsBackupStats: needsBackupStats
+        )
         let lastBackedUpAt = resolvedLastBackedUpAt(
             existingRecord: existingRecord,
             appendedLineCount: linesToAppend.count,
@@ -302,6 +313,36 @@ public final class BackupAgent: @unchecked Sendable {
         }
 
         return try cursorStore.cursor(sourcePath: previousSourcePath)
+    }
+
+    private func shouldReadBackupFileStats(
+        existingRecord: BackupSessionRecord?,
+        baselineCursor: BackupCursor?,
+        sourcePathMigrated: Bool,
+        hasNewCompleteLines: Bool
+    ) -> Bool {
+        if hasNewCompleteLines {
+            return true
+        }
+
+        guard let existingRecord else {
+            return false
+        }
+
+        let baselineLineCount = baselineCursor?.lineCount
+        let recordedLineCount = max(existingRecord.lineCount, baselineLineCount ?? 0)
+        if sourcePathMigrated {
+            guard let baselineCursor else {
+                return true
+            }
+            if baselineCursor.lineCount != existingRecord.lineCount {
+                return true
+            }
+        } else if let baselineLineCount, baselineLineCount != existingRecord.lineCount {
+            return true
+        }
+
+        return recordedLineCount > 0 && existingRecord.bytesBackedUp == 0
     }
 
     private func resolvedLastBackedUpAt(
@@ -388,6 +429,14 @@ public final class BackupAgent: @unchecked Sendable {
         return nil
     }
 
+    private func backupTitleIfAlreadyInspectingFile(at backupURL: URL, needsBackupStats: Bool) -> String? {
+        guard needsBackupStats else {
+            return nil
+        }
+
+        return firstTitle(inBackupFileAt: backupURL)
+    }
+
     private func firstTitle(inBackupFileAt backupURL: URL) -> String? {
         guard fileManager.fileExists(atPath: backupURL.path),
               let handle = try? FileHandle(forReadingFrom: backupURL)
@@ -412,6 +461,15 @@ public final class BackupAgent: @unchecked Sendable {
         }
 
         return nil
+    }
+
+    private func lineStats(for lines: [Data]) -> BackupFileStats {
+        BackupFileStats(
+            byteCount: lines.reduce(Int64(0)) { total, line in
+                total + Int64(line.count + Self.newline.count)
+            },
+            lineCount: lines.count
+        )
     }
 
     private func metadata(for sourceURL: URL) throws -> (size: Int64, modifiedAt: TimeInterval) {

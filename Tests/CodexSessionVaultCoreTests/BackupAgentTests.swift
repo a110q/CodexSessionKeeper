@@ -148,6 +148,35 @@ func cursorAdvancesAndPreventsDuplicateBackup() throws {
 }
 
 @Test
+func steadyStateScanDoesNotReadExistingBackupFile() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"Steady state"}"# + "\n"
+    )
+    let agent = fixture.makeAgent()
+    try agent.performOneShotScan()
+    let manifest = try fixture.loadManifest()
+    let record = try #require(manifest.sessions[sessionID])
+    let backupURL = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: backupURL.path)
+    defer {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: backupURL.path)
+    }
+
+    try agent.performOneShotScan()
+
+    let updatedManifest = try fixture.loadManifest()
+    let updatedRecord = try #require(updatedManifest.sessions[sessionID])
+    #expect(updatedRecord.lineCount == 1)
+    #expect(updatedRecord.bytesBackedUp == Int64(fixture.lineBytes([
+        #"{"role":"user","content":"Steady state"}"#
+    ])))
+}
+
+@Test
 func archivedSessionsDirectoryIsScannedRecursively() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
