@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CryptoKit
+import CodexSessionVaultCore
 
 struct SnapshotMeta: Codable, Identifiable, Hashable, Sendable {
     let id: String
@@ -314,8 +315,12 @@ final class VaultModel: ObservableObject {
     @Published var isCancellationRequested = false
     @Published var snapshotName = ""
     @Published var lastError: String?
+    @Published private(set) var localBackupStatus: BackupStatus?
+    @Published private(set) var localBackupStatusLabel = "备份：未启动"
+    @Published private(set) var localBackupStatusDetail = "等待启动"
 
     private static let autoRestoreDefaultsKey = "autoRestoreOnLaunch"
+    private static let localBackupStatusRefreshInterval: UInt64 = 3_000_000_000
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
@@ -323,6 +328,9 @@ final class VaultModel: ObservableObject {
     private var didRunLaunchAutoRestore = false
     private var conversationLoadID = UUID()
     private var sessionSearchTask: Task<Void, Never>?
+    private var localBackupAgent: BackupAgent?
+    private var localBackupPaths: BackupPaths?
+    private var localBackupStatusTask: Task<Void, Never>?
     private var currentCancellationURL: URL?
     fileprivate var operationCancellationURL: URL?
 
@@ -342,7 +350,14 @@ final class VaultModel: ObservableObject {
         UserDefaults.standard.set(false, forKey: Self.autoRestoreDefaultsKey)
         if refreshOnInit {
             refresh()
+            startLocalIncrementalBackup()
         }
+    }
+
+    deinit {
+        sessionSearchTask?.cancel()
+        localBackupStatusTask?.cancel()
+        localBackupAgent?.stop()
     }
 
     var selectedSnapshot: SnapshotMeta? {
@@ -367,6 +382,10 @@ final class VaultModel: ObservableObject {
 
     var checkedSnapshotSessions: [CodexSession] {
         snapshotSessions.filter { checkedSnapshotSessionIDs.contains($0.id) }
+    }
+
+    var localBackupStatusIsError: Bool {
+        localBackupStatus?.status == .error || localBackupStatusLabel.contains("错误")
     }
 
     var filteredSnapshots: [SnapshotMeta] {
@@ -434,6 +453,103 @@ final class VaultModel: ObservableObject {
             lastError = error.localizedDescription
             status = "刷新失败"
         }
+    }
+
+    private func startLocalIncrementalBackup() {
+        guard localBackupAgent == nil else {
+            refreshLocalBackupStatus()
+            return
+        }
+
+        let codexRootURL = URL(fileURLWithPath: codexRoot, isDirectory: true)
+        let backupRootURL = URL(fileURLWithPath: vaultRoot, isDirectory: true)
+            .appendingPathComponent("incremental-backups", isDirectory: true)
+        let paths = BackupPaths(codexRoot: codexRootURL, backupRoot: backupRootURL)
+        let agent = BackupAgent(paths: paths)
+
+        localBackupPaths = paths
+        localBackupAgent = agent
+        localBackupStatusLabel = "备份：启动中"
+        localBackupStatusDetail = "准备扫描"
+
+        agent.startPolling(intervalSeconds: 10)
+        refreshLocalBackupStatus()
+        startLocalBackupStatusRefreshLoop()
+    }
+
+    private func startLocalBackupStatusRefreshLoop() {
+        localBackupStatusTask?.cancel()
+        localBackupStatusTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.refreshLocalBackupStatus()
+                do {
+                    try await Task.sleep(nanoseconds: Self.localBackupStatusRefreshInterval)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func refreshLocalBackupStatus() {
+        guard let paths = localBackupPaths else {
+            localBackupStatus = nil
+            localBackupStatusLabel = "备份：未启动"
+            localBackupStatusDetail = "等待启动"
+            return
+        }
+
+        guard fileManager.fileExists(atPath: paths.statusURL.path) else {
+            localBackupStatus = nil
+            localBackupStatusLabel = "备份：启动中"
+            localBackupStatusDetail = "等待状态"
+            return
+        }
+
+        do {
+            let status = try loadLocalBackupStatus(from: paths.statusURL)
+            localBackupStatus = status
+            localBackupStatusLabel = Self.localBackupStatusLabel(for: status.status)
+            localBackupStatusDetail = Self.localBackupStatusDetail(for: status)
+        } catch {
+            localBackupStatus = nil
+            localBackupStatusLabel = "备份：错误"
+            localBackupStatusDetail = Self.shortBackupDetail(error.localizedDescription)
+        }
+    }
+
+    private func loadLocalBackupStatus(from url: URL) throws -> BackupStatus {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(BackupStatus.self, from: Data(contentsOf: url))
+    }
+
+    private static func localBackupStatusLabel(for status: BackupHealthStatus) -> String {
+        switch status {
+        case .running:
+            return "备份：运行中"
+        case .waiting:
+            return "备份：等待"
+        case .error:
+            return "备份：错误"
+        case .paused:
+            return "备份：暂停"
+        }
+    }
+
+    private static func localBackupStatusDetail(for status: BackupStatus) -> String {
+        if let lastError = status.lastError, !lastError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return shortBackupDetail(lastError)
+        }
+
+        let backupTime = status.lastBackupAt?.formatted(date: .omitted, time: .shortened) ?? "尚无备份"
+        return "\(status.sessionCount) 会话 · \(status.lineCount) 行 · \(backupTime)"
+    }
+
+    private static func shortBackupDetail(_ detail: String) -> String {
+        let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 64 else { return trimmed.isEmpty ? "未知错误" : trimmed }
+        return "\(trimmed.prefix(64))..."
     }
 
     func clearSessionSearch() {
@@ -5350,12 +5466,23 @@ struct StatusBar: View {
             Text(model.lastError ?? model.status)
                 .foregroundStyle(model.lastError == nil ? Color(red: 0.29, green: 0.42, blue: 0.58) : Color(red: 0.76, green: 0.24, blue: 0.31))
                 Spacer()
+                HStack(spacing: 4) {
+                    Text(model.localBackupStatusLabel)
+                        .foregroundStyle(model.localBackupStatusIsError ? Color(red: 0.76, green: 0.24, blue: 0.31) : Color(red: 0.29, green: 0.42, blue: 0.58))
+                    Text(model.localBackupStatusDetail)
+                        .foregroundStyle(Color(red: 0.46, green: 0.56, blue: 0.69))
+                        .truncationMode(.middle)
+                }
+                .lineLimit(1)
                 Text(model.codexRoot)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(Color(red: 0.46, green: 0.56, blue: 0.69))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 if !model.autoRestoreOnLaunch {
                     Text("自动找回：关闭")
                         .foregroundStyle(Color(red: 0.46, green: 0.56, blue: 0.69))
+                        .lineLimit(1)
                 }
         }
         .font(.caption)
