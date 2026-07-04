@@ -190,6 +190,64 @@ p {
   font-family: "Cascadia Mono", "Consolas", monospace;
 }
 
+.backup-status-card {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  margin: 0 4px 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--separator);
+  border-radius: 14px;
+  background: var(--card-bg);
+}
+
+.backup-status-card strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.backup-status-text {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  min-width: 0;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.backup-status-text::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.backup-status-text.running {
+  color: var(--green);
+}
+
+.backup-status-text.error {
+  color: var(--danger);
+}
+
+.backup-status-text.waiting {
+  color: var(--secondary);
+}
+
+.backup-status-card small {
+  min-width: 0;
+  color: var(--secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .side-nav {
   display: grid;
   gap: 6px;

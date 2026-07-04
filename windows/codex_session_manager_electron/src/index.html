@@ -26,6 +26,12 @@
         <div class="state-line"><span>Sessions</span><strong id="stateSessions">0 / 0</strong></div>
       </div>
 
+      <div class="backup-status-card">
+        <strong>本地增量备份</strong>
+        <span id="backupStatusText" class="backup-status-text waiting">等待状态</span>
+        <small id="backupStatusDetail">正在读取备份状态...</small>
+      </div>
+
       <nav class="side-nav">
         <button class="nav-button active" data-section="sessions">会话管理</button>
         <button class="nav-button" data-section="snapshots">快照恢复</button>

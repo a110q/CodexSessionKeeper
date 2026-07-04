@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('codexManager', {
   loadState: () => ipcRenderer.invoke('load-state'),
+  loadBackupStatus: () => ipcRenderer.invoke('load-backup-status'),
   setAutoRestore: (enabled) => ipcRenderer.invoke('set-auto-restore', enabled),
   createSnapshot: (name) => ipcRenderer.invoke('create-snapshot', name),
   loadSnapshotSessions: (snapshotId) => ipcRenderer.invoke('load-snapshot-sessions', snapshotId),

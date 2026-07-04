@@ -3,6 +3,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { backupPaths } = require('./backup/paths');
+const { BackupAgent } = require('./backup/backup-agent');
 
 let mainWindow;
 let sqlPromise;
@@ -12,6 +14,8 @@ const codexRoot = path.join(os.homedir(), '.codex');
 const vaultRoot = path.join(os.homedir(), '.codex-session-vault');
 const snapshotRoot = path.join(vaultRoot, 'snapshots');
 const settingsPath = path.join(vaultRoot, 'settings.json');
+const localBackupPaths = backupPaths(os.homedir());
+const localBackupAgent = new BackupAgent({ paths: localBackupPaths });
 
 const backupCandidates = [
   'config.toml',
@@ -92,6 +96,13 @@ function createWindow() {
 }
 
 app.whenReady().then(createWindow);
+app.whenReady().then(async () => {
+  try {
+    localBackupAgent.startPolling(10000);
+  } catch (error) {
+    console.error('Local incremental backup failed to start:', error);
+  }
+});
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
 });
@@ -137,6 +148,17 @@ function saveSettings(nextSettings) {
 
 function readText(targetPath) {
   return exists(targetPath) ? fs.readFileSync(targetPath, 'utf8') : '';
+}
+
+function readBackupStatus() {
+  try {
+    if (!exists(localBackupPaths.statusPath)) {
+      return { status: 'waiting', mode: 'polling', lastError: null };
+    }
+    return JSON.parse(readText(localBackupPaths.statusPath));
+  } catch (error) {
+    return { status: 'error', mode: 'polling', lastError: error.message || String(error) };
+  }
 }
 
 function readLines(targetPath) {
@@ -1516,6 +1538,7 @@ async function loadState() {
     sessions,
     snapshots,
     settings: loadSettings(),
+    backupStatus: readBackupStatus(),
     autoRestoreSuggestion: await autoRestoreSuggestion(sessions, snapshots)
   };
 }
@@ -1544,6 +1567,8 @@ async function deleteSessionArtifacts(session) {
 }
 
 ipcMain.handle('load-state', async () => loadState());
+
+ipcMain.handle('load-backup-status', async () => readBackupStatus());
 
 ipcMain.handle('set-auto-restore', async (_event, enabled) => {
   return { ok: true, settings: saveSettings({ autoRestoreOnLaunch: Boolean(enabled) }) };

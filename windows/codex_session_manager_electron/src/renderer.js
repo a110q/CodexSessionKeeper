@@ -3,6 +3,7 @@ const state = {
   sessions: [],
   snapshots: [],
   currentState: {},
+  backupStatus: {},
   selectedSessionId: null,
   selectedSnapshotId: null,
   checkedSessionIds: new Set(),
@@ -46,6 +47,8 @@ const els = {
   clearCheckedSnapshotsBtn: $('#clearCheckedSnapshotsBtn'),
   deleteCheckedSnapshotsBtn: $('#deleteCheckedSnapshotsBtn'),
   autoRestoreSwitch: $('#autoRestoreSwitch'),
+  backupStatusText: $('#backupStatusText'),
+  backupStatusDetail: $('#backupStatusDetail'),
   openDirsMenu: $('#openDirsMenu'),
   contextMenu: $('#contextMenu'),
   toast: $('#toast'),
@@ -305,6 +308,25 @@ function renderStateCard() {
   $('#stateAccount').textContent = state.currentState.accountFingerprint || 'none';
   $('#stateSessions').textContent = `${state.currentState.sessionCount || 0} active / ${state.currentState.archivedSessionCount || 0} archived`;
   els.autoRestoreSwitch.checked = Boolean(state.settings?.autoRestoreOnLaunch);
+}
+
+function renderBackupStatus() {
+  const backup = state.backupStatus || {};
+  const status = backup.status || 'waiting';
+  const mode = backup.mode || 'unknown';
+  const labels = {
+    running: '运行中',
+    error: '异常',
+    waiting: '等待中'
+  };
+  const statusClass = status === 'running' || status === 'error' ? status : 'waiting';
+  els.backupStatusText.textContent = labels[status] || '等待中';
+  els.backupStatusText.className = `backup-status-text ${statusClass}`;
+
+  const lastBackup = backup.lastBackupAt ? formatDate(backup.lastBackupAt) : '暂无备份';
+  els.backupStatusDetail.textContent = backup.lastError
+    ? backup.lastError
+    : `模式：${mode} · 最近备份：${lastBackup} · 会话：${backup.sessionCount || 0}`;
 }
 
 function renderSessions() {
@@ -700,6 +722,7 @@ function renderSnapshotDetail(snapshot) {
 
 function renderAll() {
   renderStateCard();
+  renderBackupStatus();
   renderSessions();
   renderSnapshots();
 }
@@ -760,6 +783,7 @@ async function refresh(options = {}) {
     state.sessions = data.sessions || [];
     state.snapshots = data.snapshots || [];
     state.currentState = data.currentState || {};
+    state.backupStatus = data.backupStatus || {};
     state.settings = data.settings || state.settings;
     pruneCheckedItems();
     renderAll();
