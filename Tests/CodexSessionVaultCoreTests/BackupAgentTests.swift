@@ -174,6 +174,163 @@ func archivedSessionsDirectoryIsScannedRecursively() throws {
 }
 
 @Test
+func activeSessionIsPreferredWhenArchivedCopyAlsoExists() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+    try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"Use active copy"}"# + "\n"
+    )
+    try fixture.writeArchivedSession(
+        named: "\(sessionID).jsonl",
+        relativeDirectory: "2026/07",
+        contents: #"{"role":"user","content":"Use active copy"}"# + "\n"
+    )
+    let agent = fixture.makeAgent()
+
+    try agent.performOneShotScan()
+
+    let manifest = try fixture.loadManifest()
+    let record = try #require(manifest.sessions[sessionID])
+    let backupURL = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+
+    #expect(record.sourcePath.hasSuffix("/.codex/sessions/\(sessionID).jsonl"))
+    #expect(try String(contentsOf: backupURL, encoding: .utf8) == """
+    {"role":"user","content":"Use active copy"}
+
+    """)
+    #expect(record.lineCount == 1)
+    #expect(record.bytesBackedUp == Int64(fixture.lineBytes([
+        #"{"role":"user","content":"Use active copy"}"#
+    ])))
+}
+
+@Test
+func movingSessionToArchivedDirectoryDoesNotDuplicateExistingBackup() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "99999999-9999-9999-9999-999999999999"
+    let activeSourceURL = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"Moved once"}"# + "\n"
+    )
+    let agent = fixture.makeAgent()
+    try agent.performOneShotScan()
+
+    let archivedDirectory = fixture.paths.codexRoot
+        .appendingPathComponent("archived_sessions", isDirectory: true)
+        .appendingPathComponent("2026/07", isDirectory: true)
+    try FileManager.default.createDirectory(at: archivedDirectory, withIntermediateDirectories: true)
+    let archivedSourceURL = archivedDirectory.appendingPathComponent("\(sessionID).jsonl")
+    try FileManager.default.moveItem(at: activeSourceURL, to: archivedSourceURL)
+
+    try agent.performOneShotScan()
+
+    let manifest = try fixture.loadManifest()
+    let record = try #require(manifest.sessions[sessionID])
+    let backupURL = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    let currentCursor = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+
+    #expect(record.sourcePath.hasSuffix("/.codex/archived_sessions/2026/07/\(sessionID).jsonl"))
+    #expect(try String(contentsOf: backupURL, encoding: .utf8) == """
+    {"role":"user","content":"Moved once"}
+
+    """)
+    #expect(record.lineCount == 1)
+    #expect(record.bytesBackedUp == Int64(fixture.lineBytes([
+        #"{"role":"user","content":"Moved once"}"#
+    ])))
+    #expect(currentCursor.lineCount == 1)
+    #expect(currentCursor.lastByteOffset == Int64(fixture.lineBytes([
+        #"{"role":"user","content":"Moved once"}"#
+    ])))
+}
+
+@Test
+func existingBackupFileAheadOfManifestIsReconciledBeforeAppending() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    let sourceURL = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: """
+        {"role":"user","content":"Already copied"}
+        {"role":"assistant","content":"New after retry"}
+
+        """
+    )
+    let backupURL = fixture.paths.backupFileURL(sessionID: sessionID, firstSeenAt: fixture.now)
+    let relativeBackupPath = try #require(fixture.paths.relativeBackupPath(for: backupURL))
+    try fixture.writeBackupFile(
+        at: backupURL,
+        contents: #"{"role":"user","content":"Already copied"}"# + "\n"
+    )
+    try BackupManifestStore(manifestURL: fixture.paths.manifestURL).save(BackupManifest(
+        codexRoot: fixture.paths.codexRoot.path,
+        backupRoot: fixture.paths.backupRoot.path,
+        createdAt: fixture.now,
+        updatedAt: fixture.now,
+        sessions: [
+            sessionID: BackupSessionRecord(
+                sessionId: sessionID,
+                sourcePath: sourceURL.path,
+                backupPath: relativeBackupPath,
+                title: nil,
+                firstSeenAt: fixture.now,
+                lastBackedUpAt: nil,
+                lineCount: 0,
+                bytesBackedUp: 0,
+                status: "active"
+            )
+        ]
+    ))
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    try cursorStore.upsert(BackupCursor(
+        sessionId: sessionID,
+        sourcePath: sourceURL.path,
+        backupPath: relativeBackupPath,
+        lastByteOffset: 0,
+        lastSourceSize: 0,
+        lastSourceModifiedAt: 0,
+        lineCount: 0,
+        pendingPartialLine: Data(),
+        status: "active",
+        lastError: nil,
+        updatedAt: fixture.now.timeIntervalSince1970
+    ))
+    let agent = fixture.makeAgent()
+
+    try agent.performOneShotScan()
+
+    let manifest = try fixture.loadManifest()
+    let record = try #require(manifest.sessions[sessionID])
+    let currentCursor = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+    let expectedContents = """
+    {"role":"user","content":"Already copied"}
+    {"role":"assistant","content":"New after retry"}
+
+    """
+
+    #expect(try String(contentsOf: backupURL, encoding: .utf8) == expectedContents)
+    #expect(record.title == "Already copied")
+    #expect(record.lineCount == 2)
+    #expect(record.bytesBackedUp == Int64(fixture.lineBytes([
+        #"{"role":"user","content":"Already copied"}"#,
+        #"{"role":"assistant","content":"New after retry"}"#
+    ])))
+    #expect(record.lastBackedUpAt == fixture.now)
+    #expect(currentCursor.lineCount == 2)
+    #expect(currentCursor.lastByteOffset == Int64(fixture.lineBytes([
+        #"{"role":"user","content":"Already copied"}"#,
+        #"{"role":"assistant","content":"New after retry"}"#
+    ])))
+}
+
+@Test
 func statusJSONIsWrittenWithAggregateCountsAndRunningStatus() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
@@ -312,6 +469,14 @@ private struct BackupAgentFixture {
         defer { try? handle.close() }
         try handle.seekToEnd()
         try handle.write(contentsOf: Data(contents.utf8))
+    }
+
+    func writeBackupFile(at url: URL, contents: String) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(contents.utf8).write(to: url)
     }
 
     func loadManifest() throws -> BackupManifest {
