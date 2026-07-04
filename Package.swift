@@ -8,13 +8,23 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "CodexSessionVault", targets: ["CodexSessionVault"])
+        .executable(name: "CodexSessionVault", targets: ["CodexSessionVault"]),
+        .library(name: "CodexSessionVaultCore", targets: ["CodexSessionVaultCore"])
     ],
     targets: [
+        .target(
+            name: "CodexSessionVaultCore",
+            path: "Sources/CodexSessionVaultCore"
+        ),
         .executableTarget(
             name: "CodexSessionVault",
+            dependencies: ["CodexSessionVaultCore"],
             path: "Sources/CodexSessionVault"
+        ),
+        .testTarget(
+            name: "CodexSessionVaultCoreTests",
+            dependencies: ["CodexSessionVaultCore"],
+            path: "Tests/CodexSessionVaultCoreTests"
         )
     ]
 )
-
