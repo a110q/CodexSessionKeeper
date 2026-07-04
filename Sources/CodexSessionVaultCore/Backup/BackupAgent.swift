@@ -214,7 +214,8 @@ public final class BackupAgent: @unchecked Sendable {
         let backupURL = try backupFileURL(
             for: sessionID,
             firstSeenAt: firstSeenAt,
-            existingRecord: existingRecord
+            existingRecord: existingRecord,
+            baselineCursor: baselineCursor
         )
         let relativeBackupPath = try validatedRelativeBackupPath(for: backupURL)
         let readOffset = baselineCursor?.lastByteOffset ?? 0
@@ -284,7 +285,7 @@ public final class BackupAgent: @unchecked Sendable {
             manifest.sessions[sessionID] = updatedRecord
         }
 
-        try cursorStore.upsert(BackupCursor(
+        let updatedCursor = BackupCursor(
             sessionId: sessionID,
             sourcePath: sourcePath,
             backupPath: relativeBackupPath,
@@ -296,7 +297,10 @@ public final class BackupAgent: @unchecked Sendable {
             status: Self.activeStatus,
             lastError: nil,
             updatedAt: scanDate.timeIntervalSince1970
-        ))
+        )
+        if cursorNeedsUpsert(currentCursor: currentCursor, updatedCursor: updatedCursor) {
+            try cursorStore.upsert(updatedCursor)
+        }
 
         return manifestChanged
     }
@@ -326,7 +330,7 @@ public final class BackupAgent: @unchecked Sendable {
         }
 
         guard let existingRecord else {
-            return false
+            return baselineCursor != nil
         }
 
         let baselineLineCount = baselineCursor?.lineCount
@@ -367,17 +371,22 @@ public final class BackupAgent: @unchecked Sendable {
     private func backupFileURL(
         for sessionID: String,
         firstSeenAt: Date,
-        existingRecord: BackupSessionRecord?
+        existingRecord: BackupSessionRecord?,
+        baselineCursor: BackupCursor?
     ) throws -> URL {
-        guard let existingRecord else {
-            return paths.backupFileURL(sessionID: sessionID, firstSeenAt: firstSeenAt)
+        if let backupPath = existingRecord?.backupPath ?? baselineCursor?.backupPath {
+            return backupFileURL(forStoredBackupPath: backupPath)
         }
 
-        if existingRecord.backupPath.hasPrefix("/") {
-            return URL(fileURLWithPath: existingRecord.backupPath)
+        return paths.backupFileURL(sessionID: sessionID, firstSeenAt: firstSeenAt)
+    }
+
+    private func backupFileURL(forStoredBackupPath backupPath: String) -> URL {
+        if backupPath.hasPrefix("/") {
+            return URL(fileURLWithPath: backupPath)
         }
 
-        return paths.backupRoot.appendingPathComponent(existingRecord.backupPath)
+        return paths.backupRoot.appendingPathComponent(backupPath)
     }
 
     private func validatedRelativeBackupPath(for backupURL: URL) throws -> String {
@@ -477,6 +486,23 @@ public final class BackupAgent: @unchecked Sendable {
         let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
         let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         return (size, modifiedAt)
+    }
+
+    private func cursorNeedsUpsert(currentCursor: BackupCursor?, updatedCursor: BackupCursor) -> Bool {
+        guard let currentCursor else {
+            return true
+        }
+
+        return currentCursor.sessionId != updatedCursor.sessionId
+            || currentCursor.sourcePath != updatedCursor.sourcePath
+            || currentCursor.backupPath != updatedCursor.backupPath
+            || currentCursor.lastByteOffset != updatedCursor.lastByteOffset
+            || currentCursor.lastSourceSize != updatedCursor.lastSourceSize
+            || currentCursor.lastSourceModifiedAt != updatedCursor.lastSourceModifiedAt
+            || currentCursor.lineCount != updatedCursor.lineCount
+            || currentCursor.pendingPartialLine != updatedCursor.pendingPartialLine
+            || currentCursor.status != updatedCursor.status
+            || currentCursor.lastError != updatedCursor.lastError
     }
 
     private func backupFileStats(at backupURL: URL) throws -> BackupFileStats {

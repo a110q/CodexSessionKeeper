@@ -177,6 +177,29 @@ func steadyStateScanDoesNotReadExistingBackupFile() throws {
 }
 
 @Test
+func steadyStateScanDoesNotRewriteCursor() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "12121212-1212-1212-1212-121212121212"
+    try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"Stable cursor"}"# + "\n"
+    )
+    try BackupAgent(paths: fixture.paths, now: { fixture.now }).performOneShotScan()
+    let manifest = try fixture.loadManifest()
+    let record = try #require(manifest.sessions[sessionID])
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    let cursorBeforeNoOpScan = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+    let later = fixture.now.addingTimeInterval(10)
+
+    try BackupAgent(paths: fixture.paths, now: { later }).performOneShotScan()
+
+    let cursorAfterNoOpScan = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+    #expect(cursorAfterNoOpScan == cursorBeforeNoOpScan)
+}
+
+@Test
 func archivedSessionsDirectoryIsScannedRecursively() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
@@ -276,6 +299,38 @@ func movingSessionToArchivedDirectoryDoesNotDuplicateExistingBackup() throws {
     #expect(currentCursor.lastByteOffset == Int64(fixture.lineBytes([
         #"{"role":"user","content":"Moved once"}"#
     ])))
+}
+
+@Test
+func missingManifestRecoversBackupPathFromExistingCursorOnLaterDay() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "abababab-abab-abab-abab-abababababab"
+    let sourceURL = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"Original day"}"# + "\n"
+    )
+    let firstAgent = BackupAgent(paths: fixture.paths, now: { fixture.now })
+    try firstAgent.performOneShotScan()
+    let originalManifest = try fixture.loadManifest()
+    let originalRecord = try #require(originalManifest.sessions[sessionID])
+    let originalBackupPath = originalRecord.backupPath
+    let originalBackupURL = fixture.paths.backupRoot.appendingPathComponent(originalBackupPath)
+    let laterDay = fixture.now.addingTimeInterval(86_400)
+
+    try FileManager.default.removeItem(at: fixture.paths.manifestURL)
+    try fixture.append(#"{"role":"assistant","content":"Later day"}"# + "\n", to: sourceURL)
+
+    try BackupAgent(paths: fixture.paths, now: { laterDay }).performOneShotScan()
+
+    let recoveredManifest = try fixture.loadManifest()
+    let recoveredRecord = try #require(recoveredManifest.sessions[sessionID])
+    #expect(recoveredRecord.backupPath == originalBackupPath)
+    #expect(try String(contentsOf: originalBackupURL, encoding: .utf8) == """
+    {"role":"user","content":"Original day"}
+    {"role":"assistant","content":"Later day"}
+
+    """)
 }
 
 @Test

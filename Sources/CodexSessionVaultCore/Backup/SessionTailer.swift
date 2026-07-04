@@ -32,18 +32,7 @@ public final class SessionTailer {
         defer { try? handle.close() }
 
         try handle.seek(toOffset: UInt64(startOffset))
-        var data = Data()
-        while true {
-            let chunk = try handle.read(upToCount: maxReadBytes) ?? Data()
-            guard !chunk.isEmpty else {
-                break
-            }
-
-            data.append(chunk)
-            if chunk.contains(Self.newlineByte) {
-                break
-            }
-        }
+        let data = try handle.read(upToCount: maxReadBytes) ?? Data()
 
         guard !data.isEmpty else {
             return TailReadResult(lines: [], nextOffset: startOffset, pendingPartialLine: Data())
