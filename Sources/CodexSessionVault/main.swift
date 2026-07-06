@@ -73,6 +73,10 @@ struct CodexSession: Codable, Identifiable, Hashable, Sendable {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? id : trimmed
     }
+
+    var displaySource: String {
+        source.lowercased() == "vscode" ? "Codex 桌面端" : source
+    }
 }
 
 struct ConversationMessage: Identifiable, Hashable, Sendable {
@@ -4416,6 +4420,7 @@ struct SessionsPane: View {
                                         .disabled(!session.existsOnDisk)
                                     }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .tag(session.id)
                         }
                     }
@@ -4471,7 +4476,7 @@ struct SessionRow: View {
                         .background(Color(red: 1.0, green: 0.52, blue: 0.58).opacity(0.16), in: Capsule())
                 }
             }
-            Text("\(session.modelProvider) / \(session.model) · \(session.source)")
+            Text("\(session.modelProvider) / \(session.model) · \(session.displaySource)")
                 .font(.caption)
                 .foregroundStyle(Color(red: 0.39, green: 0.50, blue: 0.66))
                 .lineLimit(1)
@@ -4481,6 +4486,7 @@ struct SessionRow: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             LinearGradient(
                 colors: [
@@ -4541,7 +4547,7 @@ struct SessionDetail: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), alignment: .leading)], alignment: .leading, spacing: 12) {
                     MetricCard(title: "模型供应商", value: session.modelProvider, systemImage: "network")
                     MetricCard(title: "模型", value: session.model, systemImage: "cpu")
-                    MetricCard(title: "来源", value: session.source, systemImage: "terminal")
+                    MetricCard(title: "来源", value: session.displaySource, systemImage: "terminal")
                     MetricCard(title: "文件状态", value: session.existsOnDisk ? "存在" : "缺失", systemImage: "doc.text")
                 }
 
