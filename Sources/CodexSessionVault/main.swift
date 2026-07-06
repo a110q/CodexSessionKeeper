@@ -4550,6 +4550,7 @@ struct SessionDetail: View {
                     MetricCard(title: "来源", value: session.displaySource, systemImage: "terminal")
                     MetricCard(title: "文件状态", value: session.existsOnDisk ? "存在" : "缺失", systemImage: "doc.text")
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 DetailCard(title: "位置和时间", systemImage: "clock") {
                     InfoLine("创建时间", session.createdAt.formatted(date: .complete, time: .standard))
@@ -5295,6 +5296,7 @@ struct MetricCard: View {
             }
         }
         .padding(15)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             LinearGradient(
                 colors: [
