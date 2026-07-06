@@ -151,24 +151,26 @@ public final class BackupCursorStore {
     }
 
     private func execute(_ sql: String) throws {
-        _ = try runSQLite(arguments: baseSQLiteArguments + [databaseURL.path, sql])
+        _ = try runSQLite(arguments: baseSQLiteArguments + [databaseURL.path], input: sql)
     }
 
     private func queryJSON(_ sql: String) throws -> String {
-        try runSQLite(arguments: baseSQLiteArguments + ["-json", databaseURL.path, sql])
+        try runSQLite(arguments: baseSQLiteArguments + ["-json", databaseURL.path], input: sql)
     }
 
     private var baseSQLiteArguments: [String] {
         ["-batch", "-bail", "-cmd", ".timeout 5000"]
     }
 
-    private func runSQLite(arguments: [String]) throws -> String {
+    private func runSQLite(arguments: [String], input: String) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: sqlitePath)
         process.arguments = arguments
 
+        let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
+        process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
@@ -182,6 +184,8 @@ public final class BackupCursorStore {
             throw BackupCursorStoreError.launchFailed(sqlitePath: sqlitePath, underlying: error)
         }
 
+        inputPipe.fileHandleForWriting.write(Data(input.utf8))
+        try? inputPipe.fileHandleForWriting.close()
         Self.drain(outputPipe, into: outputCollector, group: readGroup)
         Self.drain(errorPipe, into: errorCollector, group: readGroup)
 

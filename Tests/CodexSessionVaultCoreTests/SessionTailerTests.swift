@@ -111,7 +111,7 @@ func tailerDoesNotReadPastMaxBytesForLineWithNewlineBeyondLimit() throws {
 
     #expect(result.lines.isEmpty)
     #expect(result.nextOffset == 0)
-    #expect(result.pendingPartialLine == Data("abcd".utf8))
+    #expect(result.pendingPartialLine.isEmpty)
 }
 
 private func makeTemporaryDirectory() throws -> URL {

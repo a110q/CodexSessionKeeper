@@ -178,6 +178,46 @@ func cursorStorePassesBusyTimeoutBeforeDatabasePath() throws {
     }
 }
 
+@Test
+func cursorStoreStreamsSQLThroughStandardInput() throws {
+    let tempDirectory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: tempDirectory) }
+    let sqliteScript = try writeExecutableScript(
+        """
+        #!/bin/sh
+        args_path="$0.args"
+        stdin_path="$0.stdin"
+        : > "$args_path"
+        for arg in "$@"; do
+          printf '%s\\n' "$arg" >> "$args_path"
+        done
+        cat > "$stdin_path"
+        exit 1
+        """,
+        named: "sqlite-stdin.sh",
+        in: tempDirectory
+    )
+    let databaseURL = tempDirectory.appendingPathComponent("cursors.sqlite")
+    let store = BackupCursorStore(databaseURL: databaseURL, sqlitePath: sqliteScript.path)
+
+    do {
+        try store.open()
+        #expect(Bool(false), "Expected fake sqlite to fail")
+    } catch {
+        let arguments = try String(
+            contentsOf: URL(fileURLWithPath: "\(sqliteScript.path).args"),
+            encoding: .utf8
+        )
+        let standardInput = try String(
+            contentsOf: URL(fileURLWithPath: "\(sqliteScript.path).stdin"),
+            encoding: .utf8
+        )
+
+        #expect(!arguments.contains("CREATE TABLE"))
+        #expect(standardInput.contains("CREATE TABLE IF NOT EXISTS backup_cursors"))
+    }
+}
+
 private func makeCursor(sourcePath: String) -> BackupCursor {
     BackupCursor(
         sessionId: "session-123",
