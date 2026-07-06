@@ -132,6 +132,12 @@ function shortPath(value) {
   return `.../${pieces.slice(-3).join('/')}`;
 }
 
+function displaySource(value) {
+  const text = String(value || '').trim();
+  if (text.toLowerCase() === 'vscode') return 'Codex 桌面端';
+  return text || 'unknown';
+}
+
 function renderMessageHtml(message, options = {}) {
   const text = String(message.text || '');
   const limit = options.limit || 16000;
@@ -250,6 +256,7 @@ function filteredSessions() {
       session.provider,
       session.model,
       session.source,
+      displaySource(session.source),
       session.rolloutPath
     ].join(' ').toLowerCase().includes(query);
   });
@@ -329,7 +336,7 @@ function renderSessions() {
       <div class="row-side">
         <div class="row-time" title="${formatDate(session.updatedAt)}">${formatRelativeTime(session.updatedAt)}</div>
         ${session.existsOnDisk ? '' : '<span class="tag missing">缺文件</span>'}
-        <div class="row-stats">${formatBytes(session.sizeBytes)} · ${escapeHtml(session.source)}</div>
+        <div class="row-stats">${formatBytes(session.sizeBytes)} · ${escapeHtml(displaySource(session.source))}</div>
       </div>
     </article>
   `).join('');
@@ -364,6 +371,7 @@ function filteredSnapshotSessions() {
     session.provider,
     session.model,
     session.source,
+    displaySource(session.source),
     session.rolloutPath
   ].join(' ').toLowerCase().includes(query));
 }
@@ -486,11 +494,12 @@ function renderSessionDetail(session) {
   }
 
   els.sessionDetail.className = '';
+  const sessionTitle = session.title || session.id;
   els.sessionDetail.innerHTML = `
     <div class="detail-card">
       <div class="detail-title-row">
-        <div>
-          <h2 class="detail-title">${escapeHtml(session.title || session.id)}</h2>
+        <div class="detail-title-copy">
+          <h2 class="detail-title" title="${escapeHtml(sessionTitle)}">${escapeHtml(sessionTitle)}</h2>
           <p class="mono">${escapeHtml(session.id)}</p>
         </div>
         <span class="count-pill">${formatBytes(session.sizeBytes)}</span>
@@ -520,7 +529,7 @@ function renderSessionDetail(session) {
     <div class="metric-grid detail-card">
       <div class="metric"><span>模型供应商</span><strong>${escapeHtml(session.provider)}</strong></div>
       <div class="metric"><span>模型</span><strong>${escapeHtml(session.model)}</strong></div>
-      <div class="metric"><span>来源</span><strong>${escapeHtml(session.source)}</strong></div>
+      <div class="metric"><span>来源</span><strong>${escapeHtml(displaySource(session.source))}</strong></div>
       <div class="metric"><span>文件状态</span><strong>${session.existsOnDisk ? '存在' : '缺失'}</strong></div>
     </div>
 
@@ -610,11 +619,12 @@ function renderSnapshotDetail(snapshot) {
           `).join('');
 
   els.snapshotDetail.className = '';
+  const snapshotTitle = snapshot.name || snapshot.id;
   els.snapshotDetail.innerHTML = `
     <div class="detail-card">
       <div class="detail-title-row">
-        <div>
-          <h2 class="detail-title">${escapeHtml(snapshot.name || snapshot.id)}</h2>
+        <div class="detail-title-copy">
+          <h2 class="detail-title" title="${escapeHtml(snapshotTitle)}">${escapeHtml(snapshotTitle)}</h2>
           <p class="row-meta"><span class="tag ${isManualSnapshot(snapshot) ? 'manual' : 'archive'}">${escapeHtml(snapshot.kindLabel || (isManualSnapshot(snapshot) ? '手动' : '系统自动'))}</span> ${formatDate(snapshot.createdAt)}</p>
         </div>
         <span class="count-pill">${formatBytes(snapshot.sizeBytes)}</span>
