@@ -454,6 +454,70 @@ func statusJSONIsWrittenWithAggregateCountsAndRunningStatus() throws {
 }
 
 @Test
+func oversizedLineWithinLimitBacksUpAndDoesNotBlockFollowingLines() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "99999999-9999-9999-9999-999999999999"
+    let longText = String(repeating: "x", count: 1_048_576 + 10)
+    let longLine = #"{"role":"user","content":""# + longText + #""}"#
+    let nextLine = #"{"role":"assistant","content":"after"}"#
+    try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: "\(longLine)\n\(nextLine)\n"
+    )
+    let agent = fixture.makeAgent()
+
+    try agent.performOneShotScan()
+
+    let manifest = try fixture.loadManifest()
+    let record = try #require(manifest.sessions[sessionID])
+    let backupURL = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    let cursor = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+
+    #expect(try String(contentsOf: backupURL, encoding: .utf8) == "\(longLine)\n\(nextLine)\n")
+    #expect(record.lineCount == 2)
+    #expect(cursor.lastByteOffset == Int64(fixture.lineBytes([longLine, nextLine])))
+    #expect(cursor.lastError == nil)
+    #expect(try fixture.loadStatus().lastError == nil)
+}
+
+@Test
+func oversizedLineBeyondLimitSetsErrorStatusAndContinuesOtherSessions() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let blockedSessionID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    let healthySessionID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    let blockedLine = String(repeating: "x", count: 33_554_433)
+    try fixture.writeSession(named: "\(blockedSessionID).jsonl", contents: blockedLine)
+    try fixture.writeSession(
+        named: "\(healthySessionID).jsonl",
+        contents: #"{"role":"user","content":"healthy"}"# + "\n"
+    )
+    let agent = fixture.makeAgent()
+
+    try agent.performOneShotScan()
+
+    let manifest = try fixture.loadManifest()
+    let blockedRecord = try #require(manifest.sessions[blockedSessionID])
+    let healthyRecord = try #require(manifest.sessions[healthySessionID])
+    let healthyBackupURL = fixture.paths.backupRoot.appendingPathComponent(healthyRecord.backupPath)
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    let blockedCursor = try #require(try cursorStore.cursor(sourcePath: blockedRecord.sourcePath))
+    let status = try fixture.loadStatus()
+
+    #expect(blockedRecord.lineCount == 0)
+    #expect(blockedRecord.bytesBackedUp == 0)
+    #expect(blockedCursor.lastByteOffset == 0)
+    #expect(blockedCursor.lastError?.contains("exceeds maximum JSONL line size") == true)
+    #expect(try String(contentsOf: healthyBackupURL, encoding: .utf8) == #"{"role":"user","content":"healthy"}"# + "\n")
+    #expect(status.status == .error)
+    #expect(status.lastError?.contains("exceeds maximum JSONL line size") == true)
+}
+
+@Test
 func corruptedManifestBackupPathOutsideBackupRootThrowsClearError() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }

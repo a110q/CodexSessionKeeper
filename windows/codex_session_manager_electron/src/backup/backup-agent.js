@@ -100,6 +100,7 @@ class BackupAgent {
       }
 
       const processedSessionIds = new Set();
+      const scanErrors = [];
       for (const sourcePath of await this.discoverSessionFiles()) {
         const sessionId = sessionIdFromPath(sourcePath);
         if (!sessionId || processedSessionIds.has(sessionId)) {
@@ -107,14 +108,17 @@ class BackupAgent {
         }
         processedSessionIds.add(sessionId);
 
-        const changed = await this.processSessionFile({
+        const result = await this.processSessionFile({
           cursorStore,
           manifest,
           scanDate,
           sessionId,
           sourcePath,
         });
-        manifestChanged = manifestChanged || changed;
+        manifestChanged = manifestChanged || result.manifestChanged;
+        if (result.lastError) {
+          scanErrors.push(result.lastError);
+        }
       }
 
       if (manifestChanged) {
@@ -122,7 +126,8 @@ class BackupAgent {
         saveManifest(this.paths, manifest);
       }
 
-      await this.writeStatus(manifest, 'running', null, scanDate);
+      const lastError = scanErrors[0] || null;
+      await this.writeStatus(manifest, lastError ? 'error' : 'running', lastError, scanDate);
       return manifest;
     } finally {
       await cursorStore.close();
@@ -247,7 +252,7 @@ class BackupAgent {
       lineCount: totalLineCount,
       pendingPartialLine: tailResult.pendingPartialLine,
       status: ACTIVE_STATUS,
-      lastError: null,
+      lastError: tailResult.blockedError || null,
       updatedAt: scanDate.getTime() / 1000,
     };
 
@@ -255,7 +260,10 @@ class BackupAgent {
       await cursorStore.upsert(updatedCursor);
     }
 
-    return manifestChanged;
+    return {
+      manifestChanged,
+      lastError: tailResult.blockedError || null,
+    };
   }
 
   async migratedCursor(existingRecord, currentSourcePath, cursorStore) {

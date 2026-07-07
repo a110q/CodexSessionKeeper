@@ -397,6 +397,70 @@ test('status JSON is written with aggregate counts', async (t) => {
   assert.ok(status.lastBackupAt);
 });
 
+test('oversized line within limit backs up and does not block following lines', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sessionId = 'oversized-ok';
+  const sourcePath = path.join(paths.codexRoot, 'sessions', `${sessionId}.jsonl`);
+  const longText = 'x'.repeat(1024 * 1024 + 10);
+  const longLine = JSON.stringify({ role: 'user', content: longText });
+  const nextLine = JSON.stringify({ role: 'assistant', content: 'after' });
+  await writeSessionFile(sourcePath, [`${longLine}\n`, `${nextLine}\n`]);
+
+  const agent = new BackupAgent({ paths, now: makeClock() });
+  await agent.performOneShotScan();
+
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const record = manifest.sessions[sessionId];
+  const backupPath = path.join(paths.backupRoot, record.backupPath);
+  const store = new CursorStore({ paths });
+  await store.open();
+  t.after(async () => {
+    await store.close();
+  });
+  const cursor = await store.get(record.sourcePath);
+  const status = JSON.parse(await fs.readFile(paths.statusPath, 'utf8'));
+
+  assert.deepEqual(await readLines(backupPath), [longLine, nextLine]);
+  assert.equal(record.lineCount, 2);
+  assert.equal(cursor.lastByteOffset, Buffer.byteLength(`${longLine}\n${nextLine}\n`));
+  assert.equal(cursor.lastError, null);
+  assert.equal(status.lastError, null);
+});
+
+test('oversized line beyond limit sets error status and continues other sessions', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const blockedId = 'oversized-blocked';
+  const healthyId = 'healthy';
+  const blockedPath = path.join(paths.codexRoot, 'sessions', `${blockedId}.jsonl`);
+  const healthyPath = path.join(paths.codexRoot, 'sessions', `${healthyId}.jsonl`);
+  await writeSessionFile(blockedPath, ['x'.repeat(32 * 1024 * 1024 + 1)]);
+  await writeSessionFile(healthyPath, [jsonLine({ role: 'user', content: 'healthy' })]);
+
+  const agent = new BackupAgent({ paths, now: makeClock() });
+  await agent.performOneShotScan();
+
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const blockedRecord = manifest.sessions[blockedId];
+  const healthyRecord = manifest.sessions[healthyId];
+  const store = new CursorStore({ paths });
+  await store.open();
+  t.after(async () => {
+    await store.close();
+  });
+  const blockedCursor = await store.get(blockedRecord.sourcePath);
+  const status = JSON.parse(await fs.readFile(paths.statusPath, 'utf8'));
+
+  assert.equal(blockedRecord.lineCount, 0);
+  assert.equal(blockedRecord.bytesBackedUp, 0);
+  assert.equal(blockedCursor.lastByteOffset, 0);
+  assert.match(blockedCursor.lastError, /exceeds maximum JSONL line size/);
+  assert.deepEqual(await readLines(path.join(paths.backupRoot, healthyRecord.backupPath)), [
+    JSON.stringify({ role: 'user', content: 'healthy' }),
+  ]);
+  assert.equal(status.status, 'error');
+  assert.match(status.lastError, /exceeds maximum JSONL line size/);
+});
+
 test('invalid relative backup path throws a clear error', async (t) => {
   const { paths, root } = await makeTestPaths(t);
   await writeSessionFile(path.join(paths.codexRoot, 'sessions', 'escape.jsonl'), [
@@ -439,41 +503,44 @@ test('cursor store preserves tricky values and pending partial line', async (t) 
   assert.deepEqual(await store.get(sourcePath), cursor);
 });
 
-test('session tailer stops after the first chunk containing a newline', async (t) => {
+test('session tailer reads across chunks until complete lines are exhausted', async (t) => {
   const { root } = await makeTestPaths(t);
   const filePath = path.join(root, 'tailer-bounded.jsonl');
   await fs.writeFile(filePath, 'one\ntwo\nthree\n', 'utf8');
 
   assert.deepEqual(readNewCompleteLines(filePath, 0, 4), {
-    lines: ['one'],
-    nextOffset: Buffer.byteLength('one\n'),
+    lines: ['one', 'two', 'three'],
+    nextOffset: Buffer.byteLength('one\ntwo\nthree\n'),
     pendingPartialLine: '',
-  });
-
-  assert.deepEqual(readNewCompleteLines(filePath, Buffer.byteLength('one\n'), 4), {
-    lines: ['two'],
-    nextOffset: Buffer.byteLength('one\ntwo\n'),
-    pendingPartialLine: '',
+    blockedError: null,
   });
 });
 
-test('session tailer does not consume a line when newline is beyond the read limit', async (t) => {
+test('session tailer continues reading when newline is beyond one chunk', async (t) => {
   const { root } = await makeTestPaths(t);
   const filePath = path.join(root, 'tailer.jsonl');
   const longLine = 'a'.repeat(8);
   await fs.writeFile(filePath, `${longLine}\n\npending`, 'utf8');
 
   assert.deepEqual(readNewCompleteLines(filePath, 0, 4), {
-    lines: [],
-    nextOffset: 0,
-    pendingPartialLine: '',
-  });
-
-  assert.deepEqual(readNewCompleteLines(filePath, 0, 1024), {
     lines: [longLine, ''],
     nextOffset: Buffer.byteLength(`${longLine}\n\n`),
     pendingPartialLine: 'pending',
+    blockedError: null,
   });
+});
+
+test('session tailer reports blocked error when line exceeds maximum line bytes', async (t) => {
+  const { root } = await makeTestPaths(t);
+  const filePath = path.join(root, 'tailer-blocked.jsonl');
+  await fs.writeFile(filePath, '123456789\nnext\n', 'utf8');
+
+  const result = readNewCompleteLines(filePath, 0, 4, 8);
+
+  assert.deepEqual(result.lines, []);
+  assert.equal(result.nextOffset, 0);
+  assert.equal(result.pendingPartialLine, '');
+  assert.match(result.blockedError, /exceeds maximum JSONL line size/);
 });
 
 test('session tailer keeps data available when an oversized partial line is later completed', async (t) => {
@@ -485,7 +552,8 @@ test('session tailer keeps data available when an oversized partial line is late
   assert.deepEqual(readNewCompleteLines(filePath, 0, 4), {
     lines: [],
     nextOffset: 0,
-    pendingPartialLine: '',
+    pendingPartialLine: longLine,
+    blockedError: null,
   });
 
   await fs.appendFile(filePath, '\nnext\n', 'utf8');
@@ -494,5 +562,6 @@ test('session tailer keeps data available when an oversized partial line is late
     lines: [longLine, 'next'],
     nextOffset: Buffer.byteLength(`${longLine}\nnext\n`),
     pendingPartialLine: '',
+    blockedError: null,
   });
 });

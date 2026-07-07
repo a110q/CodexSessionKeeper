@@ -15,6 +15,11 @@ public final class BackupAgent: @unchecked Sendable {
     private var pollingTask: Task<Void, Never>?
     private var pollingStartedAt: Date?
 
+    private struct ProcessSessionFileResult {
+        var manifestChanged: Bool
+        var lastError: String?
+    }
+
     public init(
         paths: BackupPaths = BackupPaths(),
         now: @escaping () -> Date = Date.init,
@@ -65,6 +70,7 @@ public final class BackupAgent: @unchecked Sendable {
         }
 
         var processedSessionIDs = Set<String>()
+        var scanErrors: [String] = []
         for sourceURL in try discoverSessionFiles() {
             guard let sessionID = SessionIdentity.sessionID(from: sourceURL) else {
                 continue
@@ -73,14 +79,17 @@ public final class BackupAgent: @unchecked Sendable {
                 continue
             }
 
-            let changed = try processSessionFile(
+            let result = try processSessionFile(
                 sourceURL,
                 sessionID: sessionID,
                 scanDate: scanDate,
                 manifest: &manifest,
                 cursorStore: cursorStore
             )
-            manifestChanged = manifestChanged || changed
+            manifestChanged = manifestChanged || result.manifestChanged
+            if let lastError = result.lastError {
+                scanErrors.append(lastError)
+            }
         }
 
         if manifestChanged {
@@ -88,7 +97,13 @@ public final class BackupAgent: @unchecked Sendable {
             try manifestStore.save(manifest)
         }
 
-        try writeStatus(for: manifest, status: .running, lastError: nil, at: scanDate)
+        let lastError = scanErrors.first
+        try writeStatus(
+            for: manifest,
+            status: lastError == nil ? .running : .error,
+            lastError: lastError,
+            at: scanDate
+        )
     }
 
     public func startPolling(intervalSeconds: UInt64 = 10) {
@@ -201,7 +216,7 @@ public final class BackupAgent: @unchecked Sendable {
         scanDate: Date,
         manifest: inout BackupManifest,
         cursorStore: BackupCursorStore
-    ) throws -> Bool {
+    ) throws -> ProcessSessionFileResult {
         let sourcePath = sourceURL.path
         let existingRecord = manifest.sessions[sessionID]
         let currentCursor = try cursorStore.cursor(sourcePath: sourcePath)
@@ -295,14 +310,17 @@ public final class BackupAgent: @unchecked Sendable {
             lineCount: totalLineCount,
             pendingPartialLine: tailResult.pendingPartialLine,
             status: Self.activeStatus,
-            lastError: nil,
+            lastError: tailResult.blockedError,
             updatedAt: scanDate.timeIntervalSince1970
         )
         if cursorNeedsUpsert(currentCursor: currentCursor, updatedCursor: updatedCursor) {
             try cursorStore.upsert(updatedCursor)
         }
 
-        return manifestChanged
+        return ProcessSessionFileResult(
+            manifestChanged: manifestChanged,
+            lastError: tailResult.blockedError
+        )
     }
 
     private func migratedCursor(
