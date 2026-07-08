@@ -5105,42 +5105,58 @@ struct SnapshotPane: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("快照恢复")
                             .font(.largeTitle.bold())
-                        Text("用于切换账号后找回或回滚对话。")
+                        Text(model.snapshotRestoreSource == .snapshots ? "用于切换账号后找回或回滚对话。" : "从本地增量备份恢复当前缺失的对话。")
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    CountBadge(value: "\(model.filteredSnapshots.count) / \(model.snapshots.count)")
+                    if model.snapshotRestoreSource == .snapshots {
+                        CountBadge(value: "\(model.filteredSnapshots.count) / \(model.snapshots.count)")
+                    } else {
+                        CountBadge(value: "\(model.incrementalBackupCatalogSummary?.missingCount ?? 0) / \(model.incrementalBackupCatalogSummary?.totalCount ?? 0)")
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 10) {
-                            snapshotCreationControls
-                            snapshotFilterControls
-                        }
-
-                        VStack(alignment: .leading, spacing: 10) {
-                            snapshotCreationControls
-                            snapshotFilterControls
+                    Picker("恢复来源", selection: $model.snapshotRestoreSource) {
+                        ForEach(SnapshotRestoreSource.allCases) { source in
+                            Text(source.rawValue).tag(source)
                         }
                     }
-                    HStack(spacing: 10) {
-                        Text("批量操作")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        if !model.checkedSnapshotIDs.isEmpty {
-                            Button("清空选择") { model.clearCheckedSnapshots() }
-                        }
-                        Button("全选") { model.checkAllSnapshots() }
-                            .disabled(model.filteredSnapshots.isEmpty)
-                        if !model.checkedSnapshotIDs.isEmpty {
-                            Button("删除选中 \(model.checkedSnapshotIDs.count)", role: .destructive) {
-                                model.deleteCheckedSnapshots()
+                    .pickerStyle(.segmented)
+                    .frame(width: 220)
+
+                    if model.snapshotRestoreSource == .snapshots {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 10) {
+                                snapshotCreationControls
+                                snapshotFilterControls
                             }
-                            .frame(minWidth: 126)
-                            .disabled(model.isBusy)
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                snapshotCreationControls
+                                snapshotFilterControls
+                            }
                         }
+                        HStack(spacing: 10) {
+                            Text("批量操作")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if !model.checkedSnapshotIDs.isEmpty {
+                                Button("清空选择") { model.clearCheckedSnapshots() }
+                            }
+                            Button("全选") { model.checkAllSnapshots() }
+                                .disabled(model.filteredSnapshots.isEmpty)
+                            if !model.checkedSnapshotIDs.isEmpty {
+                                Button("删除选中 \(model.checkedSnapshotIDs.count)", role: .destructive) {
+                                    model.deleteCheckedSnapshots()
+                                }
+                                .frame(minWidth: 126)
+                                .disabled(model.isBusy)
+                            }
+                        }
+                    } else {
+                        IncrementalBackupRestoreControls()
                     }
                 }
                 .padding(12)
@@ -5161,46 +5177,58 @@ struct SnapshotPane: View {
                         .stroke(.white.opacity(0.9), lineWidth: 1)
                 )
 
-                if model.filteredSnapshots.isEmpty {
-                    ContentUnavailableView(
-                        "没有匹配快照",
-                        systemImage: "archivebox",
-                        description: Text("切换筛选条件，或创建一个手动快照。")
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    List(selection: $model.selectedID) {
-                        ForEach(model.filteredSnapshots) { snapshot in
-                            HStack(spacing: 10) {
-                                Button {
-                                    model.toggleCheckedSnapshot(snapshot)
-                                } label: {
-                                    Image(systemName: model.checkedSnapshotIDs.contains(snapshot.id) ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(model.checkedSnapshotIDs.contains(snapshot.id) ? .blue : .secondary)
-                                }
-                                .buttonStyle(.plain)
+                if model.snapshotRestoreSource == .snapshots {
+                    if model.filteredSnapshots.isEmpty {
+                        ContentUnavailableView(
+                            "没有匹配快照",
+                            systemImage: "archivebox",
+                            description: Text("切换筛选条件，或创建一个手动快照。")
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        List(selection: $model.selectedID) {
+                            ForEach(model.filteredSnapshots) { snapshot in
+                                HStack(spacing: 10) {
+                                    Button {
+                                        model.toggleCheckedSnapshot(snapshot)
+                                    } label: {
+                                        Image(systemName: model.checkedSnapshotIDs.contains(snapshot.id) ? "checkmark.circle.fill" : "circle")
+                                            .foregroundStyle(model.checkedSnapshotIDs.contains(snapshot.id) ? .blue : .secondary)
+                                    }
+                                    .buttonStyle(.plain)
 
-                                SnapshotRow(snapshot: snapshot)
-                                    .contentShape(Rectangle())
-                                    .simultaneousGesture(
-                                        TapGesture(count: 1).onEnded {
-                                            model.selectedID = snapshot.id
-                                        }
-                                    )
+                                    SnapshotRow(snapshot: snapshot)
+                                        .contentShape(Rectangle())
+                                        .simultaneousGesture(
+                                            TapGesture(count: 1).onEnded {
+                                                model.selectedID = snapshot.id
+                                            }
+                                        )
+                                }
+                                .tag(snapshot.id)
                             }
-                            .tag(snapshot.id)
                         }
+                        .listStyle(.inset)
                     }
-                    .listStyle(.inset)
+                } else {
+                    IncrementalBackupRestoreList()
                 }
             }
             .padding(24)
             .onAppear {
                 model.refreshSelectedSnapshotSessions()
+                if model.snapshotRestoreSource == .incrementalBackups {
+                    model.refreshIncrementalBackupCandidates()
+                }
             }
             .onChange(of: model.selectedID) { _, _ in
                 model.clearCheckedSnapshotSessions()
                 model.refreshSelectedSnapshotSessions()
+            }
+            .onChange(of: model.snapshotRestoreSource) { _, source in
+                if source == .incrementalBackups {
+                    model.refreshIncrementalBackupCandidates()
+                }
             }
             .onChange(of: model.snapshotFilter) { _, _ in
                 model.selectFirstVisibleSnapshotIfNeeded()
@@ -5209,19 +5237,295 @@ struct SnapshotPane: View {
             }
         } trailing: {
             VStack(alignment: .leading, spacing: 18) {
-                if let snapshot = model.selectedSnapshot {
-                    SnapshotDetail(snapshot: snapshot)
+                if model.snapshotRestoreSource == .snapshots {
+                    if let snapshot = model.selectedSnapshot {
+                        SnapshotDetail(snapshot: snapshot)
+                    } else {
+                        ContentUnavailableView(
+                            "没有选中快照",
+                            systemImage: "archivebox",
+                            description: Text("先创建一个快照，或从左侧选择已有快照。")
+                        )
+                    }
                 } else {
-                    ContentUnavailableView(
-                        "没有选中快照",
-                        systemImage: "archivebox",
-                        description: Text("先创建一个快照，或从左侧选择已有快照。")
-                    )
+                    IncrementalBackupRestoreDetail()
                 }
                 Spacer()
             }
             .padding(24)
         }
+    }
+}
+
+struct IncrementalBackupRestoreControls: View {
+    @EnvironmentObject private var model: VaultModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    searchAndToggles
+                    actionButtons
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    searchAndToggles
+                    actionButtons
+                }
+            }
+
+            if let summary = model.incrementalBackupCatalogSummary {
+                Text("备份目录：\(summary.backupRoot) · 缺失 \(summary.missingCount) · 已存在 \(summary.existingCount) · 异常 \(summary.errorCount)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+            } else {
+                Text("读取本地增量备份后，会只列出当前 Codex 中缺失的会话。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onChange(of: model.incrementalBackupSearch) { _, _ in
+            model.selectFirstVisibleIncrementalBackupIfNeeded()
+        }
+        .onChange(of: model.showExistingIncrementalBackups) { _, _ in
+            model.selectFirstVisibleIncrementalBackupIfNeeded()
+        }
+    }
+
+    private var searchAndToggles: some View {
+        HStack(spacing: 10) {
+            TextField("搜索标题、路径、ID", text: $model.incrementalBackupSearch)
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 220)
+            Toggle("显示已存在", isOn: $model.showExistingIncrementalBackups)
+                .toggleStyle(.checkbox)
+                .fixedSize()
+        }
+    }
+
+    private var actionButtons: some View {
+        HStack(spacing: 10) {
+            Button("刷新备份") { model.refreshIncrementalBackupCandidates() }
+                .disabled(model.isBusy)
+            Button("全选缺失") { model.checkAllVisibleIncrementalBackups() }
+                .disabled(model.filteredIncrementalBackupCandidates.filter(\.isRestorable).isEmpty)
+            if !model.checkedIncrementalBackupIDs.isEmpty {
+                Button("清空选择") { model.clearCheckedIncrementalBackups() }
+            }
+        }
+    }
+}
+
+struct IncrementalBackupRestoreList: View {
+    @EnvironmentObject private var model: VaultModel
+
+    var body: some View {
+        if model.filteredIncrementalBackupCandidates.isEmpty {
+            ContentUnavailableView(
+                "没有可显示的备份会话",
+                systemImage: "arrow.counterclockwise.circle",
+                description: Text(model.showExistingIncrementalBackups ? "本地增量备份为空，或搜索条件没有匹配。" : "当前没有缺失会话；打开“显示已存在”可排查全部备份记录。")
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(model.filteredIncrementalBackupCandidates) { candidate in
+                        IncrementalBackupRestoreRow(
+                            candidate: candidate,
+                            isSelected: model.selectedIncrementalBackupID == candidate.id,
+                            isChecked: model.checkedIncrementalBackupIDs.contains(candidate.id)
+                        )
+                        .onTapGesture {
+                            model.selectedIncrementalBackupID = candidate.id
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+}
+
+struct IncrementalBackupRestoreRow: View {
+    @EnvironmentObject private var model: VaultModel
+    let candidate: IncrementalRestoreCandidate
+    let isSelected: Bool
+    let isChecked: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.toggleCheckedIncrementalBackup(candidate)
+            } label: {
+                Image(systemName: isChecked ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(isChecked ? .blue : .secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!candidate.isRestorable)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Text(candidate.title)
+                        .font(.headline)
+                        .lineLimit(2)
+                    IncrementalBackupStatusBadge(status: candidate.status)
+                }
+                Text("\(candidate.sessionId) · \(ByteCountFormatter.string(fromByteCount: candidate.bytesBackedUp, countStyle: .file))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(candidate.backupPath)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Text((candidate.lastBackedUpAt ?? candidate.firstSeenAt).formatted(date: .numeric, time: .shortened))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize()
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(isSelected ? Color.blue.opacity(0.14) : Color.white.opacity(0.68))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(isSelected ? Color.blue.opacity(0.42) : Color.white.opacity(0.75), lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+    }
+}
+
+struct IncrementalBackupRestoreDetail: View {
+    @EnvironmentObject private var model: VaultModel
+
+    private var selected: IncrementalRestoreCandidate? {
+        model.incrementalBackupCandidates.first { $0.id == model.selectedIncrementalBackupID }
+    }
+
+    var body: some View {
+        if let candidate = selected {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(candidate.title)
+                                .font(.largeTitle.bold())
+                                .lineLimit(3)
+                            Text(candidate.sessionId)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Spacer()
+                        CountBadge(value: ByteCountFormatter.string(fromByteCount: candidate.bytesBackedUp, countStyle: .file))
+                    }
+
+                    PrimaryActionCard {
+                        Button(model.checkedRestorableIncrementalBackups.isEmpty ? "恢复这个缺失会话" : "恢复选中 \(model.checkedRestorableIncrementalBackups.count)") {
+                            model.restoreSelectedIncrementalBackupSessions()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.isBusy || (!candidate.isRestorable && model.checkedRestorableIncrementalBackups.isEmpty))
+                        Button("刷新备份") { model.refreshIncrementalBackupCandidates() }
+                            .disabled(model.isBusy)
+                        Spacer()
+                    } footer: {
+                        Text("只恢复当前 Codex 中缺失的会话；已存在会话不会覆盖。恢复完成后请重启 Codex。")
+                    }
+
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), alignment: .leading)], alignment: .leading, spacing: 12) {
+                        MetricCard(title: "状态", value: incrementalStatusLabel(candidate.status), systemImage: "checkmark.seal")
+                        MetricCard(title: "备份行数", value: "\(candidate.lineCount)", systemImage: "list.bullet.rectangle")
+                        MetricCard(title: "首次备份", value: candidate.firstSeenAt.formatted(date: .numeric, time: .shortened), systemImage: "calendar")
+                        MetricCard(title: "最近备份", value: (candidate.lastBackedUpAt ?? candidate.firstSeenAt).formatted(date: .numeric, time: .shortened), systemImage: "clock")
+                    }
+
+                    DetailCard(title: "路径", systemImage: "folder") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            pathLine(title: "备份文件", value: candidate.backupPath)
+                            pathLine(title: "原始路径", value: candidate.sourcePath)
+                            if !candidate.backupFilePath.isEmpty {
+                                pathLine(title: "本机备份", value: candidate.backupFilePath)
+                            }
+                        }
+                    }
+
+                    if let error = candidate.error, !error.isEmpty {
+                        DetailCard(title: "备份异常", systemImage: "exclamationmark.triangle") {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } else {
+            ContentUnavailableView(
+                "没有选中备份会话",
+                systemImage: "arrow.counterclockwise.circle",
+                description: Text("从左侧选择一个缺失会话，或刷新本地增量备份。")
+            )
+        }
+    }
+
+    private func pathLine(title: String, value: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .leading)
+            Text(value.isEmpty ? "-" : value)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .lineLimit(3)
+        }
+    }
+}
+
+struct IncrementalBackupStatusBadge: View {
+    let status: IncrementalRestoreStatus
+
+    var body: some View {
+        Text(incrementalStatusLabel(status))
+            .font(.caption.bold())
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(statusColor.opacity(0.16), in: Capsule())
+            .foregroundStyle(statusColor)
+    }
+
+    private var statusColor: Color {
+        switch status {
+        case .missing:
+            return .green
+        case .existing:
+            return .secondary
+        case .invalidBackup, .backupFileMissing:
+            return .red
+        }
+    }
+}
+
+private func incrementalStatusLabel(_ status: IncrementalRestoreStatus) -> String {
+    switch status {
+    case .missing:
+        return "可恢复"
+    case .existing:
+        return "已存在"
+    case .invalidBackup:
+        return "备份异常"
+    case .backupFileMissing:
+        return "文件缺失"
     }
 }
 
