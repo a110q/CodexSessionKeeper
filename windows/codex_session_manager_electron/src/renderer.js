@@ -14,8 +14,16 @@ const state = {
   snapshotSessions: [],
   selectedSnapshotSessionId: null,
   snapshotSessionSearch: '',
+  snapshotSource: 'snapshots',
   snapshotFilter: 'all',
   snapshotSessionsLoading: false,
+  backupRestoreCatalog: null,
+  backupRestoreCandidates: [],
+  backupRestoreSearch: '',
+  showExistingBackupRestore: false,
+  checkedBackupRestoreIds: new Set(),
+  selectedBackupRestoreId: null,
+  backupRestoreLoading: false,
   settings: { autoRestoreOnLaunch: false },
   autoRestorePromptedSnapshotId: null,
   sessionPreviewId: null,
@@ -44,6 +52,7 @@ const els = {
   deleteCheckedSessionsBtn: $('#deleteCheckedSessionsBtn'),
   sessionCount: $('#sessionCount'),
   snapshotCount: $('#snapshotCount'),
+  snapshotSource: $('#snapshotSource'),
   snapshotName: $('#snapshotName'),
   snapshotFilter: $('#snapshotFilter'),
   checkAllSnapshotsBtn: $('#checkAllSnapshotsBtn'),
@@ -282,6 +291,42 @@ function filteredSnapshots() {
   return state.snapshots;
 }
 
+function backupRestoreStatusLabel(status) {
+  if (status === 'missing') return '可恢复';
+  if (status === 'existing') return '已存在';
+  if (status === 'backupFileMissing') return '文件缺失';
+  return '备份异常';
+}
+
+function filteredBackupRestoreCandidates() {
+  const query = state.backupRestoreSearch.trim().toLowerCase();
+  return state.backupRestoreCandidates.filter((candidate) => {
+    if (!state.showExistingBackupRestore && candidate.status === 'existing') return false;
+    if (!query) return true;
+    return [
+      candidate.sessionId,
+      candidate.title,
+      candidate.sourcePath,
+      candidate.backupPath,
+      candidate.error || ''
+    ].join(' ').toLowerCase().includes(query);
+  });
+}
+
+function selectedBackupRestoreCandidate() {
+  return state.backupRestoreCandidates.find((candidate) => candidate.sessionId === state.selectedBackupRestoreId);
+}
+
+function checkedRestorableBackupRestoreCandidates() {
+  return state.backupRestoreCandidates.filter((candidate) => state.checkedBackupRestoreIds.has(candidate.sessionId) && candidate.isRestorable);
+}
+
+function selectFirstVisibleBackupRestoreIfNeeded() {
+  const candidates = filteredBackupRestoreCandidates();
+  if (state.selectedBackupRestoreId && candidates.some((candidate) => candidate.sessionId === state.selectedBackupRestoreId)) return;
+  state.selectedBackupRestoreId = candidates[0]?.sessionId || null;
+}
+
 function pruneCheckedItems() {
   const sessionIds = new Set(state.sessions.map((session) => session.id));
   state.checkedSessionIds = new Set([...state.checkedSessionIds].filter((id) => sessionIds.has(id)));
@@ -289,9 +334,17 @@ function pruneCheckedItems() {
   state.checkedSnapshotIds = new Set([...state.checkedSnapshotIds].filter((id) => snapshotIds.has(id)));
   const snapshotSessionIds = new Set(state.snapshotSessions.map((session) => session.id));
   state.checkedSnapshotSessionIds = new Set([...state.checkedSnapshotSessionIds].filter((id) => snapshotSessionIds.has(id)));
+  const backupRestoreIds = new Set(state.backupRestoreCandidates.map((candidate) => candidate.sessionId));
+  state.checkedBackupRestoreIds = new Set([...state.checkedBackupRestoreIds].filter((id) => backupRestoreIds.has(id)));
 }
 
 function renderBatchControls() {
+  const snapshotMode = state.snapshotSource === 'snapshots';
+  els.snapshotName.classList.toggle('hidden', !snapshotMode);
+  $('#createSnapshotBtn').classList.toggle('hidden', !snapshotMode);
+  els.snapshotFilter.classList.toggle('hidden', !snapshotMode);
+  els.checkAllSnapshotsBtn.classList.toggle('hidden', !snapshotMode);
+
   const checkedSessionCount = state.checkedSessionIds.size;
   els.checkVisibleSessionsBtn.disabled = filteredSessions().length === 0;
   els.clearCheckedSessionsBtn.classList.toggle('hidden', checkedSessionCount === 0);
@@ -300,8 +353,8 @@ function renderBatchControls() {
 
   const checkedSnapshotCount = state.checkedSnapshotIds.size;
   els.checkAllSnapshotsBtn.disabled = filteredSnapshots().length === 0;
-  els.clearCheckedSnapshotsBtn.classList.toggle('hidden', checkedSnapshotCount === 0);
-  els.deleteCheckedSnapshotsBtn.classList.toggle('hidden', checkedSnapshotCount === 0);
+  els.clearCheckedSnapshotsBtn.classList.toggle('hidden', !snapshotMode || checkedSnapshotCount === 0);
+  els.deleteCheckedSnapshotsBtn.classList.toggle('hidden', !snapshotMode || checkedSnapshotCount === 0);
   els.deleteCheckedSnapshotsBtn.textContent = `删除选中 ${checkedSnapshotCount}`;
 }
 
@@ -586,7 +639,107 @@ function renderSessionDetail(session) {
   }
 }
 
+function renderBackupRestoreList() {
+  const catalog = state.backupRestoreCatalog || {};
+  const candidates = filteredBackupRestoreCandidates();
+  els.snapshotCount.textContent = state.backupRestoreLoading
+    ? '读取中'
+    : `${catalog.missingCount || 0} / ${catalog.totalCount || 0}`;
+
+  if (state.backupRestoreLoading) {
+    els.snapshotList.innerHTML = '<div class="detail-empty"><h3>正在读取本地增量备份</h3><p>正在扫描 manifest 和备份文件。</p></div>';
+    renderBackupRestoreDetail(null);
+    renderBatchControls();
+    return;
+  }
+
+  if (candidates.length === 0) {
+    els.snapshotList.innerHTML = '<div class="detail-empty"><h3>没有可显示的备份会话</h3><p>当前没有缺失会话；打开“显示已存在”可排查全部备份记录。</p></div>';
+    renderBackupRestoreDetail(null);
+    renderBatchControls();
+    return;
+  }
+
+  selectFirstVisibleBackupRestoreIfNeeded();
+  els.snapshotList.innerHTML = candidates.map((candidate) => `
+    <article class="snapshot-row backup-restore-row ${candidate.sessionId === state.selectedBackupRestoreId ? 'selected' : ''}" data-backup-restore-id="${escapeHtml(candidate.sessionId)}">
+      <button class="row-check ${state.checkedBackupRestoreIds.has(candidate.sessionId) ? 'checked' : ''}" data-check-backup-restore="${escapeHtml(candidate.sessionId)}" ${candidate.isRestorable ? '' : 'disabled'}>✓</button>
+      <div class="row-content">
+        <div class="row-title">${escapeHtml(candidate.title || candidate.sessionId)} <span class="tag ${candidate.isRestorable ? 'manual' : 'archive'}">${backupRestoreStatusLabel(candidate.status)}</span></div>
+        <div class="row-meta">${escapeHtml(candidate.sessionId)} · ${formatBytes(candidate.bytesBackedUp)}</div>
+        <div class="row-time">${formatDate(candidate.lastBackedUpAt || candidate.firstSeenAt)}</div>
+      </div>
+    </article>
+  `).join('');
+
+  renderBackupRestoreDetail(selectedBackupRestoreCandidate());
+  renderBatchControls();
+}
+
+function renderBackupRestoreDetail(candidate) {
+  if (!candidate) {
+    els.snapshotDetail.className = 'detail-empty';
+    els.snapshotDetail.innerHTML = '<div class="empty-icon">↺</div><h3>没有选中备份会话</h3><p>选择一个缺失会话后可从本地增量备份恢复。</p>';
+    return;
+  }
+
+  const checked = checkedRestorableBackupRestoreCandidates();
+  const canRestore = checked.length || candidate.isRestorable;
+  els.snapshotDetail.className = '';
+  els.snapshotDetail.innerHTML = `
+    <div class="detail-card">
+      <div class="detail-title-row">
+        <div class="detail-title-copy">
+          <h2 class="detail-title" title="${escapeHtml(candidate.title || candidate.sessionId)}">${escapeHtml(candidate.title || candidate.sessionId)}</h2>
+          <p class="mono">${escapeHtml(candidate.sessionId)}</p>
+        </div>
+        <span class="count-pill">${escapeHtml(backupRestoreStatusLabel(candidate.status))}</span>
+      </div>
+    </div>
+
+    <div class="primary-action-card">
+      <div class="action-row wrap">
+        <button class="primary-button" data-backup-restore-action="restoreSelected" ${canRestore ? '' : 'disabled'}>${checked.length ? `恢复选中 ${checked.length}` : '恢复这个缺失会话'}</button>
+        <button class="ghost-button" data-backup-restore-action="refresh">刷新备份</button>
+        <label class="mini-switch"><span>显示已存在</span><input id="showExistingBackupRestore" type="checkbox" ${state.showExistingBackupRestore ? 'checked' : ''} /></label>
+      </div>
+      <p>只恢复当前 Codex 中缺失的会话，已存在会话不会覆盖。恢复完成后请重启 Codex。</p>
+    </div>
+
+    <div class="detail-card">
+      <div class="snapshot-session-tools">
+        <input id="backupRestoreSearch" class="search-input" placeholder="搜索备份会话" value="${escapeHtml(state.backupRestoreSearch)}" />
+        <button class="ghost-button" data-backup-restore-action="clearSearch">清空</button>
+        <button class="ghost-button" data-backup-restore-action="checkAllMissing">全选缺失</button>
+        <button class="ghost-button" data-backup-restore-action="clearChecked">清空选择</button>
+      </div>
+    </div>
+
+    <div class="metric-grid detail-card">
+      <div class="metric"><span>状态</span><strong>${escapeHtml(backupRestoreStatusLabel(candidate.status))}</strong></div>
+      <div class="metric"><span>行数</span><strong>${candidate.lineCount || 0}</strong></div>
+      <div class="metric"><span>大小</span><strong>${formatBytes(candidate.bytesBackedUp)}</strong></div>
+      <div class="metric"><span>最近备份</span><strong>${formatDate(candidate.lastBackedUpAt || candidate.firstSeenAt)}</strong></div>
+    </div>
+
+    <div class="detail-card">
+      <h3 style="margin-bottom: 12px;">备份信息</h3>
+      <div class="info-lines">
+        <div class="info-line"><span>备份文件</span><strong class="mono">${escapeHtml(candidate.backupPath || '-')}</strong></div>
+        <div class="info-line"><span>原始路径</span><strong class="mono">${escapeHtml(candidate.sourcePath || '-')}</strong></div>
+        <div class="info-line"><span>本机备份</span><strong class="mono">${escapeHtml(candidate.backupFilePath || '-')}</strong></div>
+        ${candidate.error ? `<div class="info-line"><span>错误</span><strong>${escapeHtml(candidate.error)}</strong></div>` : ''}
+      </div>
+    </div>
+  `;
+}
+
 function renderSnapshots() {
+  if (state.snapshotSource === 'backupRestore') {
+    renderBackupRestoreList();
+    return;
+  }
+
   const snapshots = filteredSnapshots();
   els.snapshotCount.textContent = `${snapshots.length} / ${state.snapshots.length}`;
   if (snapshots.length === 0) {
@@ -765,6 +918,61 @@ async function loadSelectedSnapshotSessions() {
   }
 }
 
+async function loadBackupRestoreCatalog() {
+  state.backupRestoreLoading = true;
+  renderSnapshots();
+  try {
+    const catalog = await window.codexManager.loadIncrementalBackupSessions();
+    state.backupRestoreCatalog = catalog;
+    state.backupRestoreCandidates = catalog.candidates || [];
+    state.checkedBackupRestoreIds = new Set(
+      [...state.checkedBackupRestoreIds].filter((id) => state.backupRestoreCandidates.some((item) => item.sessionId === id))
+    );
+    selectFirstVisibleBackupRestoreIfNeeded();
+  } catch (error) {
+    state.backupRestoreCatalog = null;
+    state.backupRestoreCandidates = [];
+    state.checkedBackupRestoreIds.clear();
+    state.selectedBackupRestoreId = null;
+    showToast(error.message || String(error), true);
+  } finally {
+    state.backupRestoreLoading = false;
+    renderSnapshots();
+  }
+}
+
+async function restoreBackupRestoreCandidates() {
+  const checked = checkedRestorableBackupRestoreCandidates();
+  const selected = selectedBackupRestoreCandidate();
+  const candidates = checked.length ? checked : (selected?.isRestorable ? [selected] : []);
+  if (!candidates.length) {
+    showToast('没有可恢复的缺失会话。', true);
+    return;
+  }
+
+  const preview = candidates.slice(0, 8).map((candidate) => candidate.title || candidate.sessionId).join('\n');
+  const suffix = candidates.length > 8 ? `\n等 ${candidates.length} 个会话` : '';
+  const protectionMode = await chooseRestoreProtectionMode(
+    '从本地备份恢复缺失会话？',
+    `将恢复 ${candidates.length} 个当前 Codex 中缺失的会话，不覆盖已存在会话。\n\n${preview}${suffix}`,
+    'lightweight'
+  );
+  if (!protectionMode) return;
+
+  const result = await withBusy(
+    '正在从本地备份恢复缺失会话...',
+    () => window.codexManager.restoreIncrementalBackupSessions(candidates.map((candidate) => candidate.sessionId), protectionMode)
+  );
+  if (busyWasCancelled(result)) return;
+  state.checkedBackupRestoreIds.clear();
+  showRestoreComplete(result.message || '备份恢复完成');
+  await refresh({ skipAutoRestore: true });
+  state.snapshotSource = 'backupRestore';
+  if (els.snapshotSource) els.snapshotSource.value = state.snapshotSource;
+  await loadBackupRestoreCatalog();
+  setSection('snapshots');
+}
+
 async function maybeRunLaunchAutoRestore(suggestion) {
   if (!suggestion || state.autoRestorePromptedSnapshotId === suggestion.snapshotId) return;
   state.autoRestorePromptedSnapshotId = suggestion.snapshotId;
@@ -790,7 +998,11 @@ async function refresh(options = {}) {
     state.settings = data.settings || state.settings;
     pruneCheckedItems();
     renderAll();
-    await loadSelectedSnapshotSessions();
+    if (state.snapshotSource === 'backupRestore') {
+      await loadBackupRestoreCatalog();
+    } else {
+      await loadSelectedSnapshotSessions();
+    }
     showToast(`已刷新：${state.sessions.length} 个会话，${state.snapshots.length} 个快照`);
     if (options.forceAutoRestore || !options.skipAutoRestore) await maybeRunLaunchAutoRestore(data.autoRestoreSuggestion);
   } catch (error) {
@@ -1089,9 +1301,28 @@ document.addEventListener('click', async (event) => {
     return;
   }
 
+  const backupRestoreCheck = event.target.closest('[data-check-backup-restore]');
+  if (backupRestoreCheck) {
+    const id = backupRestoreCheck.dataset.checkBackupRestore;
+    const candidate = state.backupRestoreCandidates.find((item) => item.sessionId === id);
+    if (!candidate?.isRestorable) return;
+    if (state.checkedBackupRestoreIds.has(id)) state.checkedBackupRestoreIds.delete(id);
+    else state.checkedBackupRestoreIds.add(id);
+    state.selectedBackupRestoreId = id;
+    renderSnapshots();
+    return;
+  }
+
   const sessionRow = event.target.closest('.session-row');
   if (sessionRow) {
     selectSession(sessionRow.dataset.id);
+  }
+
+  const backupRestoreRow = event.target.closest('[data-backup-restore-id]');
+  if (backupRestoreRow) {
+    state.selectedBackupRestoreId = backupRestoreRow.dataset.backupRestoreId;
+    renderSnapshots();
+    return;
   }
 
   const snapshotRow = event.target.closest('.snapshot-row');
@@ -1113,6 +1344,27 @@ document.addEventListener('click', async (event) => {
   if (snapshotAction) {
     runSnapshotAction(snapshotAction.dataset.snapshotAction);
   }
+
+  const backupRestoreAction = event.target.closest('[data-backup-restore-action]');
+  if (backupRestoreAction) {
+    const action = backupRestoreAction.dataset.backupRestoreAction;
+    if (action === 'refresh') await loadBackupRestoreCatalog();
+    if (action === 'restoreSelected') await restoreBackupRestoreCandidates();
+    if (action === 'clearSearch') {
+      state.backupRestoreSearch = '';
+      selectFirstVisibleBackupRestoreIfNeeded();
+      renderSnapshots();
+    }
+    if (action === 'checkAllMissing') {
+      filteredBackupRestoreCandidates().filter((candidate) => candidate.isRestorable).forEach((candidate) => state.checkedBackupRestoreIds.add(candidate.sessionId));
+      selectFirstVisibleBackupRestoreIfNeeded();
+      renderSnapshots();
+    }
+    if (action === 'clearChecked') {
+      state.checkedBackupRestoreIds.clear();
+      renderSnapshots();
+    }
+  }
 });
 
 els.sessionList.addEventListener('dblclick', (event) => {
@@ -1130,14 +1382,34 @@ els.sessionList.addEventListener('contextmenu', (event) => {
 });
 
 els.snapshotDetail.addEventListener('input', (event) => {
-  if (event.target.id !== 'snapshotSessionSearch') return;
-  state.snapshotSessionSearch = event.target.value;
-  selectFirstVisibleSnapshotSessionIfNeeded();
-  renderSnapshotDetail(selectedSnapshot());
-  const input = $('#snapshotSessionSearch');
-  if (input) {
-    input.focus();
-    input.setSelectionRange(input.value.length, input.value.length);
+  if (event.target.id === 'snapshotSessionSearch') {
+    state.snapshotSessionSearch = event.target.value;
+    selectFirstVisibleSnapshotSessionIfNeeded();
+    renderSnapshotDetail(selectedSnapshot());
+    const input = $('#snapshotSessionSearch');
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+    return;
+  }
+
+  if (event.target.id === 'backupRestoreSearch') {
+    state.backupRestoreSearch = event.target.value;
+    selectFirstVisibleBackupRestoreIfNeeded();
+    renderSnapshots();
+    const input = $('#backupRestoreSearch');
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+    return;
+  }
+
+  if (event.target.id === 'showExistingBackupRestore') {
+    state.showExistingBackupRestore = event.target.checked;
+    selectFirstVisibleBackupRestoreIfNeeded();
+    renderSnapshots();
   }
 });
 
@@ -1176,6 +1448,15 @@ els.openDirsMenu.addEventListener('click', async (event) => {
   hideOpenDirsMenu();
   if (button.dataset.dirAction === 'codex') await window.codexManager.openCodexRoot();
   if (button.dataset.dirAction === 'vault') await window.codexManager.openVaultRoot();
+});
+els.snapshotSource.addEventListener('change', async () => {
+  state.snapshotSource = els.snapshotSource.value;
+  if (state.snapshotSource === 'backupRestore') {
+    await loadBackupRestoreCatalog();
+  } else {
+    renderSnapshots();
+    await loadSelectedSnapshotSessions();
+  }
 });
 els.autoRestoreSwitch.addEventListener('change', async () => {
   try {

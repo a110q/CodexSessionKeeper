@@ -5,6 +5,10 @@ const os = require('os');
 const crypto = require('crypto');
 const { backupPaths } = require('./backup/paths');
 const { BackupAgent } = require('./backup/backup-agent');
+const {
+  buildIncrementalRecoveryPackage,
+  loadIncrementalBackupCatalog,
+} = require('./backup/incremental-recovery');
 
 let mainWindow;
 let sqlPromise;
@@ -1548,6 +1552,10 @@ async function getSessionById(sessionId) {
   return sessions.find((session) => session.id === sessionId);
 }
 
+async function currentSessionIds() {
+  return new Set((await loadSessions()).map((session) => session.id));
+}
+
 async function deleteSessionArtifacts(session) {
   if (session.rolloutPath && exists(session.rolloutPath)) fs.rmSync(session.rolloutPath, { force: true });
   for (const dir of ['sessions', 'archived_sessions']) {
@@ -1569,6 +1577,13 @@ async function deleteSessionArtifacts(session) {
 ipcMain.handle('load-state', async () => loadState());
 
 ipcMain.handle('load-backup-status', async () => readBackupStatus());
+
+ipcMain.handle('load-incremental-backup-sessions', async () => {
+  return loadIncrementalBackupCatalog({
+    paths: localBackupPaths,
+    currentSessionIds: await currentSessionIds(),
+  });
+});
 
 ipcMain.handle('set-auto-restore', async (_event, enabled) => {
   return { ok: true, settings: saveSettings({ autoRestoreOnLaunch: Boolean(enabled) }) };
@@ -1727,6 +1742,48 @@ ipcMain.handle('restore-snapshot-sessions', async (_event, snapshotId, sessionId
   }
   await repairStateDatabaseFileRolloutPaths(path.join(codexRoot, 'state_5.sqlite'), codexRoot, restoredIds);
   return { ok: true, message: `已从 ${snapshot.name} 批量恢复 ${restoredIds.size} 个会话。` };
+});
+
+ipcMain.handle('restore-incremental-backup-sessions', async (_event, sessionIds, protectionMode = 'lightweight') => {
+  const selectedIds = new Set(Array.isArray(sessionIds) ? sessionIds.map(String) : []);
+  if (!selectedIds.size) throw new Error('没有选择要从备份恢复的会话。');
+
+  const catalog = await loadIncrementalBackupCatalog({
+    paths: localBackupPaths,
+    currentSessionIds: await currentSessionIds(),
+  });
+  const restorableIds = catalog.candidates
+    .filter((candidate) => selectedIds.has(candidate.sessionId) && candidate.status === 'missing')
+    .map((candidate) => candidate.sessionId)
+    .sort();
+  if (!restorableIds.length) throw new Error('选中的备份会话都已存在或不可恢复。');
+
+  const mode = normalizeRestoreProtectionMode(protectionMode);
+  await createRestoreProtectionSnapshot(
+    mode === 'lightweight'
+      ? 'Pre-Incremental-Backup-Restore Lightweight Backup'
+      : 'Pre-Incremental-Backup-Restore Backup',
+    mode === 'lightweight'
+      ? 'pre-incremental-backup-restore-lightweight'
+      : 'pre-incremental-backup-restore',
+    mode,
+    await loadSessions(),
+    mode === 'lightweight' ? conversationBackupCandidates : backupCandidates
+  );
+
+  const recovery = await buildIncrementalRecoveryPackage({
+    paths: localBackupPaths,
+    sessionIds: restorableIds,
+  });
+  const sqliteMessage = await restoreConversationsOnly({
+    ...recovery,
+    includedPaths: ['session_index.jsonl', 'sessions'],
+  });
+  return {
+    ok: true,
+    restoredCount: restorableIds.length,
+    message: `已从本地增量备份恢复 ${restorableIds.length} 个缺失会话。${sqliteMessage} 请重启 Codex 后查看。`,
+  };
 });
 
 ipcMain.handle('delete-snapshot', async (_event, snapshotId) => {

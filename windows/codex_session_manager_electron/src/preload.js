@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('codexManager', {
   loadState: () => ipcRenderer.invoke('load-state'),
   loadBackupStatus: () => ipcRenderer.invoke('load-backup-status'),
+  loadIncrementalBackupSessions: () => ipcRenderer.invoke('load-incremental-backup-sessions'),
   setAutoRestore: (enabled) => ipcRenderer.invoke('set-auto-restore', enabled),
   createSnapshot: (name) => ipcRenderer.invoke('create-snapshot', name),
   loadSnapshotSessions: (snapshotId) => ipcRenderer.invoke('load-snapshot-sessions', snapshotId),
@@ -12,6 +13,7 @@ contextBridge.exposeInMainWorld('codexManager', {
   restoreSnapshotFull: (snapshotId, protectionMode) => ipcRenderer.invoke('restore-snapshot-full', snapshotId, protectionMode),
   restoreSnapshotSession: (snapshotId, sessionId, protectionMode) => ipcRenderer.invoke('restore-snapshot-session', snapshotId, sessionId, protectionMode),
   restoreSnapshotSessions: (snapshotId, sessionIds, protectionMode) => ipcRenderer.invoke('restore-snapshot-sessions', snapshotId, sessionIds, protectionMode),
+  restoreIncrementalBackupSessions: (sessionIds, protectionMode) => ipcRenderer.invoke('restore-incremental-backup-sessions', sessionIds, protectionMode),
   deleteSnapshot: (snapshotId) => ipcRenderer.invoke('delete-snapshot', snapshotId),
   deleteSnapshots: (snapshotIds) => ipcRenderer.invoke('delete-snapshots', snapshotIds),
   restoreSession: (sessionId, protectionMode) => ipcRenderer.invoke('restore-session', sessionId, protectionMode),

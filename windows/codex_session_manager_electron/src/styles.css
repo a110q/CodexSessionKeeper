@@ -669,6 +669,17 @@ p {
   border: 1px solid var(--tertiary);
 }
 
+.row-check:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.backup-restore-row .row-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .fresh-dot {
   width: 8px;
   height: 8px;

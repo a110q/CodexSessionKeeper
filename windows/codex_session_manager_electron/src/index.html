@@ -108,6 +108,10 @@
               <span id="snapshotCount" class="count-pill">0</span>
             </div>
             <div class="filter-card">
+              <select id="snapshotSource" class="search-input compact-select">
+                <option value="snapshots">快照</option>
+                <option value="backupRestore">备份恢复</option>
+              </select>
               <input id="snapshotName" class="search-input" placeholder="快照备注，可留空" />
               <button id="createSnapshotBtn" class="primary-button">创建快照</button>
               <select id="snapshotFilter" class="search-input compact-select">
