@@ -142,6 +142,7 @@ private struct VaultWorkerCommand: Codable, Sendable {
         case restoreSnapshot
         case restoreSnapshotSession
         case restoreSnapshotSessions
+        case restoreIncrementalBackupSessions
         case deleteSnapshots
         case deleteSessions
         case createAutoProtectionSnapshot
@@ -245,6 +246,13 @@ enum SnapshotFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum SnapshotRestoreSource: String, CaseIterable, Identifiable {
+    case snapshots = "快照"
+    case incrementalBackups = "备份恢复"
+
+    var id: String { rawValue }
+}
+
 enum VaultError: LocalizedError {
     case codexRootMissing(String)
     case snapshotMissing
@@ -293,6 +301,13 @@ final class VaultModel: ObservableObject {
     @Published var sessionSearch = ""
     @Published var showArchivedSessions = true
     @Published var snapshotFilter: SnapshotFilter = .all
+    @Published var snapshotRestoreSource: SnapshotRestoreSource = .snapshots
+    @Published var incrementalBackupCandidates: [IncrementalRestoreCandidate] = []
+    @Published var selectedIncrementalBackupID: IncrementalRestoreCandidate.ID?
+    @Published var checkedIncrementalBackupIDs: Set<IncrementalRestoreCandidate.ID> = []
+    @Published var incrementalBackupSearch = ""
+    @Published var showExistingIncrementalBackups = false
+    @Published var incrementalBackupCatalogSummary: IncrementalBackupCatalogResult?
     @Published var conversationViewerSession: CodexSession?
     @Published var conversationMessages: [ConversationMessage] = []
     @Published var isConversationViewerPresented = false
@@ -382,6 +397,25 @@ final class VaultModel: ObservableObject {
 
     var checkedSnapshotSessions: [CodexSession] {
         snapshotSessions.filter { checkedSnapshotSessionIDs.contains($0.id) }
+    }
+
+    var filteredIncrementalBackupCandidates: [IncrementalRestoreCandidate] {
+        let query = incrementalBackupSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return incrementalBackupCandidates.filter { candidate in
+            guard showExistingIncrementalBackups || candidate.status != .existing else { return false }
+            guard !query.isEmpty else { return true }
+            return [
+                candidate.sessionId,
+                candidate.title,
+                candidate.sourcePath,
+                candidate.backupPath,
+                candidate.error ?? ""
+            ].contains { $0.lowercased().contains(query) }
+        }
+    }
+
+    var checkedRestorableIncrementalBackups: [IncrementalRestoreCandidate] {
+        incrementalBackupCandidates.filter { checkedIncrementalBackupIDs.contains($0.id) && $0.isRestorable }
     }
 
     var localBackupStatusIsError: Bool {
@@ -672,6 +706,64 @@ final class VaultModel: ObservableObject {
         checkedSnapshotSessionIDs.removeAll()
     }
 
+    func refreshIncrementalBackupCandidates() {
+        do {
+            let paths = localBackupPaths ?? BackupPaths(
+                codexRoot: URL(fileURLWithPath: codexRoot, isDirectory: true),
+                backupRoot: URL(fileURLWithPath: vaultRoot, isDirectory: true)
+                    .appendingPathComponent("incremental-backups", isDirectory: true)
+            )
+            let currentIDs = Set((try loadSessions()).map(\.id))
+            let result = try IncrementalBackupCatalog(paths: paths).load(currentSessionIDs: currentIDs)
+            incrementalBackupCatalogSummary = result
+            incrementalBackupCandidates = result.candidates
+            checkedIncrementalBackupIDs = checkedIncrementalBackupIDs.intersection(Set(result.candidates.map(\.id)))
+            if let selectedIncrementalBackupID,
+               filteredIncrementalBackupCandidates.contains(where: { $0.id == selectedIncrementalBackupID }) {
+                return
+            }
+            selectedIncrementalBackupID = filteredIncrementalBackupCandidates.first?.id
+        } catch {
+            incrementalBackupCatalogSummary = nil
+            incrementalBackupCandidates = []
+            selectedIncrementalBackupID = nil
+            checkedIncrementalBackupIDs.removeAll()
+            lastError = "读取增量备份失败：\(error.localizedDescription)"
+        }
+    }
+
+    func toggleCheckedIncrementalBackup(_ candidate: IncrementalRestoreCandidate) {
+        guard candidate.isRestorable else { return }
+        if checkedIncrementalBackupIDs.contains(candidate.id) {
+            checkedIncrementalBackupIDs.remove(candidate.id)
+            if selectedIncrementalBackupID == candidate.id {
+                selectedIncrementalBackupID = checkedRestorableIncrementalBackups.first?.id
+                    ?? filteredIncrementalBackupCandidates.first?.id
+            }
+        } else {
+            checkedIncrementalBackupIDs.insert(candidate.id)
+            selectedIncrementalBackupID = candidate.id
+        }
+    }
+
+    func checkAllVisibleIncrementalBackups() {
+        let ids = filteredIncrementalBackupCandidates.filter(\.isRestorable).map(\.id)
+        checkedIncrementalBackupIDs.formUnion(ids)
+        selectedIncrementalBackupID = ids.first ?? selectedIncrementalBackupID
+    }
+
+    func clearCheckedIncrementalBackups() {
+        checkedIncrementalBackupIDs.removeAll()
+    }
+
+    func selectFirstVisibleIncrementalBackupIfNeeded() {
+        if let selectedIncrementalBackupID,
+           filteredIncrementalBackupCandidates.contains(where: { $0.id == selectedIncrementalBackupID }) {
+            return
+        }
+        selectedIncrementalBackupID = filteredIncrementalBackupCandidates.first?.id
+    }
+
     func restoreSnapshotSessionPrimaryAction() {
         if !checkedSnapshotSessionIDs.isEmpty {
             restoreCheckedSnapshotSessions()
@@ -880,6 +972,78 @@ final class VaultModel: ObservableObject {
                 self.inform(
                     title: "恢复完成",
                     message: "已从快照 “\(snapshot.name)” 批量恢复 \(targets.count) 个会话。\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。"
+                )
+            }
+        }
+    }
+
+    func restoreSelectedIncrementalBackupSessions() {
+        let targets: [IncrementalRestoreCandidate]
+        let checkedTargets = checkedRestorableIncrementalBackups
+        if checkedTargets.isEmpty,
+           let selected = incrementalBackupCandidates.first(where: { $0.id == selectedIncrementalBackupID && $0.isRestorable }) {
+            targets = [selected]
+        } else {
+            targets = checkedTargets
+        }
+
+        guard !targets.isEmpty else {
+            inform(
+                title: "没有可恢复的缺失会话",
+                message: "请先选择状态为“可恢复”的备份会话。已存在或备份异常的会话不会被恢复。"
+            )
+            return
+        }
+
+        let names = targets.prefix(8).map(\.title).joined(separator: "\n")
+        let suffix = targets.count > 8 ? "\n等 \(targets.count) 个会话" : ""
+        guard let protectionMode = chooseRestoreProtectionMode(
+            title: "从本地备份恢复缺失会话？",
+            message: """
+            将恢复 \(targets.count) 个当前 Codex 中缺失的会话：
+
+            \(names)\(suffix)
+
+            只恢复会话文件和本地索引，不覆盖当前账号、登录态、config.toml 或凭据。建议先退出 Codex 再恢复。
+            """,
+            defaultMode: .lightweight
+        ) else { return }
+
+        let commandSessions = targets.map { candidate in
+            CodexSession(
+                id: candidate.sessionId,
+                title: candidate.title,
+                rolloutPath: candidate.sourcePath,
+                cwd: "",
+                modelProvider: "unknown",
+                model: "unknown",
+                source: "incremental-backup",
+                createdAt: candidate.firstSeenAt,
+                updatedAt: candidate.lastBackedUpAt ?? candidate.firstSeenAt,
+                archived: false,
+                sizeBytes: candidate.bytesBackedUp,
+                existsOnDisk: false
+            )
+        }
+
+        let command = VaultWorkerCommand(
+            operation: .restoreIncrementalBackupSessions,
+            codexRoot: codexRoot,
+            vaultRoot: vaultRoot,
+            sessions: commandSessions,
+            protectionMode: protectionMode
+        )
+        Task {
+            await runWorker("正在从本地备份恢复缺失会话...", command: command) { response in
+                self.checkedIncrementalBackupIDs.removeAll()
+                self.refresh()
+                self.refreshIncrementalBackupCandidates()
+                self.selectedSection = .snapshots
+                self.snapshotRestoreSource = .incrementalBackups
+                self.status = response.message
+                self.inform(
+                    title: "备份恢复完成",
+                    message: "\(response.message)\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。"
                 )
             }
         }
@@ -3666,6 +3830,63 @@ final class VaultModel: ObservableObject {
             }
             try report(1.0, "批量恢复完成", "已恢复 \(command.sessions.count) 个会话。")
             return .ok(message: "已从 \(snapshot.name) 批量恢复 \(command.sessions.count) 个会话")
+
+        case .restoreIncrementalBackupSessions:
+            let requestedIDs = Set(command.sessions.map(\.id))
+            guard !requestedIDs.isEmpty else {
+                throw VaultError.commandFailed("没有选择要从备份恢复的会话。")
+            }
+
+            let incrementalBackupRoot = URL(fileURLWithPath: command.vaultRoot, isDirectory: true)
+                .appendingPathComponent("incremental-backups", isDirectory: true)
+            let paths = BackupPaths(
+                codexRoot: URL(fileURLWithPath: command.codexRoot, isDirectory: true),
+                backupRoot: incrementalBackupRoot
+            )
+            let currentIDs = Set((try? loadSessions().map(\.id)) ?? [])
+            let catalog = try IncrementalBackupCatalog(paths: paths).load(currentSessionIDs: currentIDs)
+            let restorableIDs = catalog.candidates
+                .filter { requestedIDs.contains($0.sessionId) && $0.status == .missing }
+                .map(\.sessionId)
+                .sorted()
+            guard !restorableIDs.isEmpty else {
+                throw VaultError.commandFailed("选中的备份会话都已存在或不可恢复。")
+            }
+
+            let protectionMode = selectedProtectionMode(default: .lightweight)
+            try reportProtectionStart(
+                fraction: 0.08,
+                mode: protectionMode,
+                title: protectionMode == .lightweight ? "正在创建备份恢复前轻量保护点..." : "正在创建备份恢复前完整保护点..."
+            )
+            switch protectionMode {
+            case .lightweight:
+                _ = try createSystemSnapshot(
+                    name: "Pre-Incremental-Backup-Restore Lightweight Backup",
+                    reason: "pre-incremental-backup-restore-lightweight",
+                    candidatePaths: autoProtectionCandidates
+                )
+            case .full:
+                _ = try createSystemSnapshot(
+                    name: "Pre-Incremental-Backup-Restore Backup",
+                    reason: "pre-incremental-backup-restore",
+                    candidatePaths: backupCandidates
+                )
+            }
+
+            try report(0.38, "正在生成增量备份恢复包...", "只打包当前仍缺失且被选中的会话。")
+            let package = try BackupRecoveryBuilder(paths: paths).buildRecoveryPackage(sessionIDs: restorableIDs)
+
+            try report(0.68, "正在恢复缺失会话...", "正在复制 recovered 会话文件并合并 session_index.jsonl。")
+            let root = URL(fileURLWithPath: command.codexRoot, isDirectory: true)
+            try restoreConversationsOnly(
+                from: package.dataURL,
+                to: root,
+                includedPaths: ["session_index.jsonl", "sessions"],
+                snapshotCodexRoot: command.codexRoot
+            )
+            try report(1.0, "备份恢复完成", "已恢复 \(restorableIDs.count) 个缺失会话。")
+            return .ok(message: "已从本地增量备份恢复 \(restorableIDs.count) 个缺失会话。请重启 Codex 后查看。")
 
         case .deleteSnapshots:
             let total = max(command.snapshots.count, 1)

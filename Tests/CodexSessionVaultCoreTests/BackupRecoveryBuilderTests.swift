@@ -180,6 +180,47 @@ func rejectsBackupPathSymlinkEscapingBackupRoot() throws {
         _ = try builder.buildRecoveryPackage(sessionIDs: ["symlink"])
     }
 }
+
+@Test
+func recoveryPackageOnlyContainsRequestedSessionFiles() throws {
+    let fixture = try BackupRecoveryFixture()
+    defer { fixture.cleanup() }
+    try fixture.writeBackup(
+        relativePath: "sessions/2026/07/08/a.jsonl",
+        contents: #"{"role":"user","content":"A"}"# + "\n"
+    )
+    try fixture.writeBackup(
+        relativePath: "sessions/2026/07/08/b.jsonl",
+        contents: #"{"role":"user","content":"B"}"# + "\n"
+    )
+    try fixture.saveManifest(records: [
+        fixture.makeRecord(
+            sessionID: "a",
+            backupPath: "sessions/2026/07/08/a.jsonl",
+            title: "A"
+        ),
+        fixture.makeRecord(
+            sessionID: "b",
+            backupPath: "sessions/2026/07/08/b.jsonl",
+            title: "B"
+        )
+    ])
+
+    let package = try BackupRecoveryBuilder(paths: fixture.paths, now: { fixture.now })
+        .buildRecoveryPackage(sessionIDs: ["b"])
+
+    let recoveredRoot = package.dataURL
+        .appendingPathComponent("sessions", isDirectory: true)
+        .appendingPathComponent("recovered", isDirectory: true)
+    #expect(FileManager.default.fileExists(
+        atPath: recoveredRoot.appendingPathComponent("b.jsonl", isDirectory: false).path
+    ))
+    #expect(!FileManager.default.fileExists(
+        atPath: recoveredRoot.appendingPathComponent("a.jsonl", isDirectory: false).path
+    ))
+    let entries = try readSessionIndex(at: package.sessionIndexURL)
+    #expect(entries.map(\.id) == ["b"])
+}
 }
 
 private struct RecoveryIndexEntry: Decodable {
