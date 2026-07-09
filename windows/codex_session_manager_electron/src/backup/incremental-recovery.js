@@ -95,6 +95,7 @@ async function loadIncrementalBackupCatalog({ paths, currentSessionIds }) {
       status,
       isRestorable: status === 'missing',
       error,
+      backupRecord: { ...record },
     });
   }
 
@@ -141,11 +142,14 @@ async function buildIncrementalRecoveryPackage({ paths, sessionIds, now = () => 
 
   const includedPaths = ['session_index.jsonl', 'sessions'];
   const indexLines = [];
+  const recoveredFiles = {};
   for (const record of records) {
     const backupFilePath = resolveBackupFile(paths, record);
     const filename = `${safePathComponent(record.sessionId)}.jsonl`;
     const recoveredRelativePath = path.join('sessions', 'recovered', filename);
-    await fsp.copyFile(backupFilePath, path.join(recoveredRoot, filename));
+    const recoveredPath = path.join(recoveredRoot, filename);
+    await fsp.copyFile(backupFilePath, recoveredPath);
+    recoveredFiles[record.sessionId] = recoveredPath;
     includedPaths.push(recoveredRelativePath.split(path.sep).join('/'));
     indexLines.push(JSON.stringify({
       id: record.sessionId,
@@ -182,7 +186,7 @@ async function buildIncrementalRecoveryPackage({ paths, sessionIds, now = () => 
   };
   await fsp.writeFile(path.join(packagePath, 'snapshot.json'), JSON.stringify(snapshot, null, 2), 'utf8');
 
-  return { path: packagePath, dataPath, ...snapshot };
+  return { path: packagePath, dataPath, recoveredFiles, ...snapshot };
 }
 
 module.exports = {

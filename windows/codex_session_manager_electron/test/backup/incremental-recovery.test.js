@@ -65,6 +65,21 @@ test('catalog classifies missing and existing backup sessions', async (t) => {
   assert.equal(result.candidates.find((item) => item.sessionId === 'existing').status, 'existing');
 });
 
+test('catalog candidates retain backup records for sqlite repair', async (t) => {
+  const { paths } = await makeFixture(t);
+  await fs.mkdir(path.join(paths.backupRoot, 'sessions', '2026', '07', '08'), { recursive: true });
+  await fs.writeFile(path.join(paths.backupRoot, 'sessions', '2026', '07', '08', 'missing.jsonl'), '{"role":"user"}\n');
+  await writeManifest(paths, {
+    missing: record('missing', path.join('sessions', '2026', '07', '08', 'missing.jsonl'), 'manifest title'),
+  });
+
+  const result = await loadIncrementalBackupCatalog({ paths, currentSessionIds: new Set() });
+
+  assert.equal(result.candidates[0].backupRecord.sessionId, 'missing');
+  assert.equal(result.candidates[0].backupRecord.title, 'manifest title');
+  assert.equal(result.candidates[0].backupRecord.backupPath, path.join('sessions', '2026', '07', '08', 'missing.jsonl'));
+});
+
 test('catalog rejects path traversal and package only copies selected sessions', async (t) => {
   const { paths } = await makeFixture(t);
   await fs.mkdir(path.join(paths.backupRoot, 'sessions', '2026', '07', '08'), { recursive: true });
@@ -102,6 +117,33 @@ test('catalog rejects path traversal and package only copies selected sessions',
   const indexText = await fs.readFile(path.join(recovery.dataPath, 'session_index.jsonl'), 'utf8');
   assert.match(indexText, /"id":"selected"/);
   assert.doesNotMatch(indexText, /"id":"other"/);
+});
+
+test('recovery package exposes recovered file paths by session id', async (t) => {
+  const { paths } = await makeFixture(t);
+  await fs.mkdir(path.join(paths.backupRoot, 'sessions', '2026', '07', '08'), { recursive: true });
+  await fs.writeFile(
+    path.join(paths.backupRoot, 'sessions', '2026', '07', '08', 'selected.jsonl'),
+    '{"role":"user","content":"selected"}\n'
+  );
+  await writeManifest(paths, {
+    selected: record('selected', path.join('sessions', '2026', '07', '08', 'selected.jsonl'), 'selected'),
+  });
+
+  const recovery = await buildIncrementalRecoveryPackage({
+    paths,
+    sessionIds: ['selected'],
+    now: () => new Date('2026-07-08T12:30:00.000Z'),
+  });
+
+  assert.equal(
+    recovery.recoveredFiles.selected,
+    path.join(recovery.dataPath, 'sessions', 'recovered', 'selected.jsonl')
+  );
+  assert.equal(
+    await fs.readFile(recovery.recoveredFiles.selected, 'utf8'),
+    '{"role":"user","content":"selected"}\n'
+  );
 });
 
 test('missing backup file is visible but not restorable', async (t) => {

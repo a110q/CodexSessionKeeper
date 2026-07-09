@@ -9,6 +9,10 @@ const {
   buildIncrementalRecoveryPackage,
   loadIncrementalBackupCatalog,
 } = require('./backup/incremental-recovery');
+const {
+  ensureRecoveredThreadsInStateDatabase,
+  extractRecoveredThreadMetadata,
+} = require('./backup/recovered-thread-index');
 
 let mainWindow;
 let sqlPromise;
@@ -1351,6 +1355,29 @@ async function restoreConversationsOnly(snapshot) {
   return 'SQLite 索引未合并：快照不包含 state_5.sqlite。';
 }
 
+async function recoveredThreadEntriesFromIncrementalRecovery(catalog, recovery, sessionIds) {
+  const candidatesById = new Map((catalog.candidates || []).map((candidate) => [candidate.sessionId, candidate]));
+  const entries = [];
+  for (const sessionId of sessionIds) {
+    const candidate = candidatesById.get(sessionId);
+    const record = candidate && candidate.backupRecord;
+    const recoveredPath = recovery.recoveredFiles && recovery.recoveredFiles[sessionId];
+    if (!record || !recoveredPath) continue;
+    entries.push(await extractRecoveredThreadMetadata(record, recoveredPath, codexRoot));
+  }
+  return entries;
+}
+
+async function repairRecoveredThreadIndexFromIncrementalRecovery(catalog, recovery, sessionIds) {
+  try {
+    const entries = await recoveredThreadEntriesFromIncrementalRecovery(catalog, recovery, sessionIds);
+    return await ensureRecoveredThreadsInStateDatabase(path.join(codexRoot, 'state_5.sqlite'), entries);
+  } catch (error) {
+    const message = `SQLite 索引未写入：${error.message || String(error)}`;
+    return { insertedCount: 0, skippedCount: 0, warning: message, message };
+  }
+}
+
 async function repairStateDatabaseFileRolloutPaths(databasePath, root, sessionIds) {
   if (!exists(databasePath)) return;
   let db;
@@ -1779,10 +1806,11 @@ ipcMain.handle('restore-incremental-backup-sessions', async (_event, sessionIds,
     ...recovery,
     includedPaths: ['session_index.jsonl', 'sessions'],
   });
+  const threadIndexResult = await repairRecoveredThreadIndexFromIncrementalRecovery(catalog, recovery, restorableIds);
   return {
     ok: true,
     restoredCount: restorableIds.length,
-    message: `已从本地增量备份恢复 ${restorableIds.length} 个缺失会话。${sqliteMessage} 请重启 Codex 后查看。`,
+    message: `已从本地增量备份恢复 ${restorableIds.length} 个缺失会话。${sqliteMessage} ${threadIndexResult.message} 请重启 Codex 后查看。`,
   };
 });
 
