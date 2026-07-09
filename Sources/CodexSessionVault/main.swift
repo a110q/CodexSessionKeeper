@@ -101,6 +101,16 @@ private struct SessionDatabaseRow: Decodable {
     let archived: Int
 }
 
+private struct IncrementalRecoveryIndexEntry: Decodable {
+    let id: String
+    let rolloutPath: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case rolloutPath = "rollout_path"
+    }
+}
+
 private struct RolloutFileMetadata {
     var cwd = ""
     var modelProvider = "unknown"
@@ -2032,6 +2042,76 @@ final class VaultModel: ObservableObject {
         try restoreExternalAttachments(sessionIDs: restorableSessionIDs, from: dataURL)
     }
 
+    private func repairRecoveredThreadIndex(
+        package: BackupRecoveryPackage,
+        catalog: IncrementalBackupCatalogResult,
+        sessionIDs: [String],
+        codexRoot: URL
+    ) -> RecoveredThreadIndexResult {
+        do {
+            let entries = try recoveredThreadIndexEntries(
+                package: package,
+                catalog: catalog,
+                sessionIDs: sessionIDs,
+                codexRoot: codexRoot
+            )
+            return try RecoveredThreadIndexWriter().ensureThreads(
+                entries: entries,
+                databaseURL: codexRoot.appendingPathComponent("state_5.sqlite", isDirectory: false)
+            )
+        } catch {
+            return RecoveredThreadIndexResult(
+                insertedCount: 0,
+                skippedCount: 0,
+                warning: "SQLite 索引未写入：\(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func recoveredThreadIndexEntries(
+        package: BackupRecoveryPackage,
+        catalog: IncrementalBackupCatalogResult,
+        sessionIDs: [String],
+        codexRoot: URL
+    ) throws -> [RecoveredThreadIndexEntry] {
+        let candidatesByID = Dictionary(uniqueKeysWithValues: catalog.candidates.map { ($0.sessionId, $0) })
+        let rolloutPathsByID = try recoveredRolloutPathsByID(from: package.sessionIndexURL)
+        return try sessionIDs.compactMap { sessionID in
+            guard let candidate = candidatesByID[sessionID],
+                  let rolloutPath = rolloutPathsByID[sessionID] else {
+                return nil
+            }
+            let record = BackupSessionRecord(
+                sessionId: candidate.sessionId,
+                sourcePath: candidate.sourcePath,
+                backupPath: candidate.backupPath,
+                title: candidate.title,
+                firstSeenAt: candidate.firstSeenAt,
+                lastBackedUpAt: candidate.lastBackedUpAt,
+                lineCount: candidate.lineCount,
+                bytesBackedUp: candidate.bytesBackedUp,
+                status: "active"
+            )
+            return try makeRecoveredThreadIndexEntry(
+                record: record,
+                recoveredURL: URL(fileURLWithPath: rolloutPath, isDirectory: false),
+                codexRoot: codexRoot
+            )
+        }
+    }
+
+    private func recoveredRolloutPathsByID(from sessionIndexURL: URL) throws -> [String: String] {
+        let data = try Data(contentsOf: sessionIndexURL)
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        let decoder = JSONDecoder()
+        return Dictionary(
+            uniqueKeysWithValues: try lines.map { line in
+                let entry = try decoder.decode(IncrementalRecoveryIndexEntry.self, from: Data(line))
+                return (entry.id, entry.rolloutPath)
+            }
+        )
+    }
+
     private func restoreSingleSession(snapshot: SnapshotMeta, session: CodexSession) throws {
         try checkOperationCancellation()
         let dataURL = snapshotDataURL(snapshot)
@@ -3885,8 +3965,14 @@ final class VaultModel: ObservableObject {
                 includedPaths: ["session_index.jsonl", "sessions"],
                 snapshotCodexRoot: command.codexRoot
             )
-            try report(1.0, "备份恢复完成", "已恢复 \(restorableIDs.count) 个缺失会话。")
-            return .ok(message: "已从本地增量备份恢复 \(restorableIDs.count) 个缺失会话。请重启 Codex 后查看。")
+            let indexResult = repairRecoveredThreadIndex(
+                package: package,
+                catalog: catalog,
+                sessionIDs: restorableIDs,
+                codexRoot: root
+            )
+            try report(1.0, "备份恢复完成", "已恢复 \(restorableIDs.count) 个缺失会话。\(indexResult.message)")
+            return .ok(message: "已从本地增量备份恢复 \(restorableIDs.count) 个缺失会话。\(indexResult.message) 请重启 Codex 后查看。")
 
         case .deleteSnapshots:
             let total = max(command.snapshots.count, 1)
