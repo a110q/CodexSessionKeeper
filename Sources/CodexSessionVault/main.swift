@@ -1918,12 +1918,24 @@ final class VaultModel: ObservableObject {
         return meta
     }
 
-    private func restore(snapshot: SnapshotMeta, mode: RestoreMode) throws {
-        try checkOperationCancellation()
+    private func validatedRestorePaths(for snapshot: SnapshotMeta) throws -> [ValidatedRestorePath] {
         let snapshotURL = snapshotRootURL.appendingPathComponent(snapshot.id, isDirectory: true)
         let dataURL = snapshotURL.appendingPathComponent(dataDir, isDirectory: true)
         guard fileManager.fileExists(atPath: snapshotURL.path) else { throw VaultError.snapshotMissing }
         guard fileManager.fileExists(atPath: dataURL.path) else { throw VaultError.invalidSnapshot }
+
+        return try RestorePathValidator.validate(
+            snapshot.includedPaths,
+            sourceRoot: dataURL,
+            destinationRoot: URL(fileURLWithPath: codexRoot, isDirectory: true)
+        )
+    }
+
+    private func restore(snapshot: SnapshotMeta, mode: RestoreMode) throws {
+        try checkOperationCancellation()
+        let snapshotURL = snapshotRootURL.appendingPathComponent(snapshot.id, isDirectory: true)
+        let dataURL = snapshotURL.appendingPathComponent(dataDir, isDirectory: true)
+        let validatedPaths = try validatedRestorePaths(for: snapshot)
 
         let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1942,7 +1954,7 @@ final class VaultModel: ObservableObject {
             try restoreFull(
                 from: dataURL,
                 to: root,
-                includedPaths: snapshot.includedPaths,
+                validatedPaths: validatedPaths,
                 snapshotCodexRoot: snapshot.codexRoot
             )
         }
@@ -1951,17 +1963,18 @@ final class VaultModel: ObservableObject {
     private func restoreFull(
         from dataURL: URL,
         to root: URL,
-        includedPaths: [String],
+        validatedPaths: [ValidatedRestorePath],
         snapshotCodexRoot: String
     ) throws {
         try checkOperationCancellation()
-        let included = Set(includedPaths)
+        let included = Set(validatedPaths.map(\.relativePath))
 
-        for relPath in includedPaths {
+        for restorePath in validatedPaths {
             try checkOperationCancellation()
+            let relPath = restorePath.relativePath
             guard relPath != "external_attachments" else { continue }
-            let src = dataURL.appendingPathComponent(relPath)
-            let dst = root.appendingPathComponent(relPath)
+            let src = restorePath.sourceURL
+            let dst = restorePath.destinationURL
             guard fileManager.fileExists(atPath: src.path) else { continue }
             try copyReplacing(src: src, dst: dst)
         }
@@ -3826,6 +3839,7 @@ final class VaultModel: ObservableObject {
                   let mode = command.restoreMode else {
                 throw VaultError.invalidSnapshot
             }
+            _ = try validatedRestorePaths(for: snapshot)
             let protectionMode = selectedProtectionMode(default: mode == .full ? .full : .lightweight)
             let protectionSessions: [CodexSession]
             if mode == .full && protectionMode == .lightweight {

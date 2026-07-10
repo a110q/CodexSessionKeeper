@@ -10,6 +10,10 @@ codex_session_manager.exe
 
 文件夹和 exe 文件名使用英文，是为了避免 Windows 10、压缩软件或传输工具在解压时把中文路径显示成乱码。应用窗口标题和界面仍然是中文 `codex_会话管理`。
 
+## SQLite 支持
+
+便携包内置经过固定 SHA3-256 校验的官方 `sqlite3.exe`。恢复、删除和增量找回会通过 SQLite 原生事务更新 `state_5.sqlite`，用户不需要安装 SQLite，也不应单独替换包内文件。
+
 ## 已同步的交互
 
 - 单击会话：选中会话并刷新右侧详情。
@@ -31,4 +35,4 @@ codex_session_manager.exe
 %USERPROFILE%\.codex-session-vault\snapshots
 ```
 
-恢复和删除前会自动创建保护快照。建议恢复或删除前先退出 Codex，避免正在写入的会话文件被覆盖。恢复完成后如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。
+恢复和删除前会自动创建保护快照。SQLite 索引写入会等待 Codex 的数据库锁；其他 JSONL 和配置文件仍建议在退出 Codex 后恢复。恢复完成后如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。

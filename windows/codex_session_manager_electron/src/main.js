@@ -13,6 +13,14 @@ const {
   ensureRecoveredThreadsInStateDatabase,
   extractRecoveredThreadMetadata,
 } = require('./backup/recovered-thread-index');
+const {
+  deleteSingleSessionStateDb: deleteLiveSessionStateDb,
+  mergeSingleSessionStateDb: mergeLiveSingleSessionStateDb,
+  mergeStateDatabase: mergeLiveStateDatabase,
+  repairStateDatabaseRolloutPaths: repairLiveStateDatabaseRolloutPaths,
+  replaceStateDatabase: replaceLiveStateDatabase,
+} = require('./backup/live-state-database');
+const { validateRestorePaths } = require('./backup/restore-paths');
 
 let mainWindow;
 let sqlPromise;
@@ -291,11 +299,6 @@ function quoteLiteral(value) {
 
 function tableExists(db, table) {
   return execRows(db, `SELECT name FROM sqlite_master WHERE type='table' AND name=${quoteLiteral(table)};`).length > 0;
-}
-
-function tableColumns(db, table) {
-  if (!tableExists(db, table)) return [];
-  return execRows(db, `PRAGMA table_info(${quoteIdent(table)});`).map((row) => row.name);
 }
 
 function makeSession(row, existsOnDiskOverride = null, sizeBytesOverride = null, rolloutPathOverride = null) {
@@ -814,7 +817,7 @@ async function sanitizeSnapshotData(dataPath, snapshotCodexRoot) {
     db = await openDatabase(databasePath);
     pruneStateDatabase(db, restorableSessionIds);
     repairSnapshotStateDatabaseRolloutPaths(db, dataPath, snapshotCodexRoot, restorableSessionIds);
-    writeDatabase(databasePath, db);
+    writeSnapshotDatabase(databasePath, db);
   } catch (error) {
     if (exists(databasePath)) fs.rmSync(databasePath, { force: true });
     removeStateDatabaseSidecars(dataPath);
@@ -1198,29 +1201,13 @@ function filterLineFile(targetPath, uniqueKey, allowedSessionIds) {
   fs.writeFileSync(targetPath, `${output.join('\n')}${output.length ? '\n' : ''}`, 'utf8');
 }
 
-function writeDatabase(databasePath, db) {
+function writeSnapshotDatabase(databasePath, db) {
   ensureDir(path.dirname(databasePath));
   fs.writeFileSync(databasePath, Buffer.from(db.export()));
 }
 
-function purgeAccountBindings(db) {
-  for (const table of ['device_key_bindings', 'remote_control_enrollments']) {
-    if (tableExists(db, table)) db.run(`DELETE FROM ${quoteIdent(table)};`);
-  }
-}
-
 function sessionIdList(allowedSessionIds) {
   return [...allowedSessionIds].map(quoteLiteral).join(', ');
-}
-
-function stateDatabaseWhereClause(table, allowedSessionIds) {
-  if (!allowedSessionIds) return '';
-  if (allowedSessionIds.size === 0) return ' WHERE 0';
-  const ids = sessionIdList(allowedSessionIds);
-  if (table === 'threads') return ` WHERE id IN (${ids})`;
-  if (table === 'thread_spawn_edges') return ` WHERE parent_thread_id IN (${ids}) OR child_thread_id IN (${ids})`;
-  if (table === 'agent_job_items') return ` WHERE assigned_thread_id IN (${ids})`;
-  return ` WHERE thread_id IN (${ids})`;
 }
 
 function stateDatabasePruneWhereClause(table, ids) {
@@ -1254,73 +1241,17 @@ function updateThreadRolloutPath(db, sessionId, rolloutPath, archived = null) {
   statement.free();
 }
 
-function repairStateDatabaseRolloutPaths(db, root, sessionIds) {
-  for (const sessionId of sessionIds) {
-    const rolloutPath = findRolloutFile(root, sessionId);
-    if (rolloutPath) {
-      const relative = safeRelativePath(root, rolloutPath);
-      const archived = relative ? relative.split(path.sep)[0] === 'archived_sessions' : null;
-      updateThreadRolloutPath(db, sessionId, rolloutPath, archived);
-    }
-  }
-}
-
 async function mergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds = null) {
-  if (!exists(sourceDbPath)) return 'SQLite 索引未合并：快照数据库缺失。';
-  if (allowedSessionIds && allowedSessionIds.size === 0) return 'SQLite 索引未合并：快照中没有可恢复的会话文件。';
-
-  if (!exists(destinationDbPath)) {
-    copyReplacing(sourceDbPath, destinationDbPath);
-    let db;
-    try {
-      db = await openDatabase(destinationDbPath);
-      purgeAccountBindings(db);
-      if (allowedSessionIds) pruneStateDatabase(db, allowedSessionIds);
-      writeDatabase(destinationDbPath, db);
-      return 'SQLite 索引已恢复，并清理账号绑定表。';
-    } finally {
-      if (db) db.close();
-    }
-  }
-
-  let sourceDb;
-  let destinationDb;
   try {
-    sourceDb = await openDatabase(sourceDbPath);
-    destinationDb = await openDatabase(destinationDbPath);
-    destinationDb.run('BEGIN TRANSACTION;');
-    for (const table of conversationStateTables) {
-      const sourceColumns = tableColumns(sourceDb, table);
-      const destinationColumns = tableColumns(destinationDb, table);
-      const commonColumns = destinationColumns.filter((column) => sourceColumns.includes(column));
-      if (!commonColumns.length) continue;
-      const whereClause = stateDatabaseWhereClause(table, allowedSessionIds);
-      const rows = execRows(sourceDb, `SELECT ${commonColumns.map(quoteIdent).join(', ')} FROM ${quoteIdent(table)}${whereClause};`);
-      if (!rows.length) continue;
-      const statement = destinationDb.prepare(
-        `INSERT OR REPLACE INTO ${quoteIdent(table)} (${commonColumns.map(quoteIdent).join(', ')}) VALUES (${commonColumns.map(() => '?').join(', ')});`
-      );
-      for (const row of rows) statement.run(commonColumns.map((column) => row[column]));
-      statement.free();
-    }
-    destinationDb.run('COMMIT;');
-    writeDatabase(destinationDbPath, destinationDb);
-    return 'SQLite 索引已合并。';
+    return await mergeLiveStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds);
   } catch (error) {
-    try {
-      if (destinationDb) destinationDb.run('ROLLBACK;');
-    } catch {
-      // ignore rollback failures
-    }
     throw new Error(`SQLite 索引合并失败：${error.message}`);
-  } finally {
-    if (sourceDb) sourceDb.close();
-    if (destinationDb) destinationDb.close();
   }
 }
 
 async function restoreConversationsOnly(snapshot) {
   if (!snapshot || !exists(snapshot.dataPath)) throw new Error('快照结构不完整，无法恢复。');
+  validateSnapshotRestorePaths(snapshot);
   ensureDir(codexRoot);
 
   const included = new Set(snapshot.includedPaths || []);
@@ -1380,44 +1311,50 @@ async function repairRecoveredThreadIndexFromIncrementalRecovery(catalog, recove
 
 async function repairStateDatabaseFileRolloutPaths(databasePath, root, sessionIds) {
   if (!exists(databasePath)) return;
-  let db;
-  try {
-    db = await openDatabase(databasePath);
-    repairStateDatabaseRolloutPaths(db, root, sessionIds);
-    writeDatabase(databasePath, db);
-  } finally {
-    if (db) db.close();
+  const updates = [];
+  for (const sessionId of sessionIds) {
+    const rolloutPath = findRolloutFile(root, sessionId);
+    if (!rolloutPath) continue;
+    const relative = safeRelativePath(root, rolloutPath);
+    updates.push({
+      sessionId,
+      rolloutPath,
+      archived: relative ? relative.split(path.sep)[0] === 'archived_sessions' : null,
+    });
   }
+  await repairLiveStateDatabaseRolloutPaths(databasePath, updates);
+}
+
+function validateSnapshotRestorePaths(snapshot) {
+  if (!snapshot || !exists(snapshot.dataPath)) throw new Error('快照结构不完整，无法恢复。');
+  return validateRestorePaths({
+    includedPaths: snapshot.includedPaths || [],
+    sourceRoot: snapshot.dataPath,
+    destinationRoot: codexRoot,
+  });
 }
 
 async function restoreFull(snapshot) {
-  if (!snapshot || !exists(snapshot.dataPath)) throw new Error('快照结构不完整，无法恢复。');
+  const validatedPaths = validateSnapshotRestorePaths(snapshot);
   ensureDir(codexRoot);
-  const included = new Set(snapshot.includedPaths || []);
+  const included = new Set(validatedPaths.map((restorePath) => restorePath.relativePath));
   const restorableSessionIds = included.has('state_5.sqlite')
     ? new Set((await loadSessionsInSnapshot(snapshot)).filter((session) => session.existsOnDisk).map((session) => session.id))
     : null;
 
-  for (const relativePath of snapshot.includedPaths || []) {
-    const sourcePath = path.join(snapshot.dataPath, relativePath);
-    if (!exists(sourcePath)) continue;
-    copyReplacing(sourcePath, path.join(codexRoot, relativePath));
+  for (const restorePath of validatedPaths) {
+    if (stateDatabaseSnapshotPaths.has(restorePath.relativePath)) continue;
+    if (!exists(restorePath.sourcePath)) continue;
+    copyReplacing(restorePath.sourcePath, restorePath.destinationPath);
   }
 
   if (!restorableSessionIds) return;
 
+  const sourceDatabasePath = path.join(snapshot.dataPath, 'state_5.sqlite');
   const databasePath = path.join(codexRoot, 'state_5.sqlite');
-  if (exists(databasePath)) {
-    let db;
-    try {
-      db = await openDatabase(databasePath);
-      pruneStateDatabase(db, restorableSessionIds);
-      repairStateDatabaseRolloutPaths(db, codexRoot, restorableSessionIds);
-      writeDatabase(databasePath, db);
-    } finally {
-      if (db) db.close();
-    }
-  }
+  if (!exists(sourceDatabasePath)) throw new Error('快照结构不完整：state_5.sqlite 缺失。');
+  await replaceLiveStateDatabase(sourceDatabasePath, databasePath, restorableSessionIds);
+  await repairStateDatabaseFileRolloutPaths(databasePath, codexRoot, restorableSessionIds);
 
   for (const relativePath of conversationLineMergePaths) {
     if (!included.has(relativePath)) continue;
@@ -1430,78 +1367,18 @@ async function restoreFull(snapshot) {
 }
 
 async function mergeSingleSessionStateDb(snapshotDbPath, destinationDbPath, sessionId) {
-  if (!exists(snapshotDbPath) || !exists(destinationDbPath)) return 'SQLite 索引未合并：数据库文件缺失。';
-  let sourceDb;
-  let destinationDb;
   try {
-    sourceDb = await openDatabase(snapshotDbPath);
-    destinationDb = await openDatabase(destinationDbPath);
-    const rules = [
-      { table: 'threads', where: `id = ${quoteLiteral(sessionId)}` },
-      { table: 'thread_goals', where: `thread_id = ${quoteLiteral(sessionId)}` },
-      { table: 'thread_dynamic_tools', where: `thread_id = ${quoteLiteral(sessionId)}` },
-      { table: 'stage1_outputs', where: `thread_id = ${quoteLiteral(sessionId)}` },
-      { table: 'thread_spawn_edges', where: `parent_thread_id = ${quoteLiteral(sessionId)} OR child_thread_id = ${quoteLiteral(sessionId)}` },
-      { table: 'agent_job_items', where: `assigned_thread_id = ${quoteLiteral(sessionId)}` }
-    ];
-    destinationDb.run('BEGIN TRANSACTION;');
-    for (const rule of rules) {
-      const sourceColumns = tableColumns(sourceDb, rule.table);
-      const destinationColumns = tableColumns(destinationDb, rule.table);
-      const commonColumns = destinationColumns.filter((column) => sourceColumns.includes(column));
-      if (!commonColumns.length) continue;
-      const rows = execRows(sourceDb, `SELECT ${commonColumns.map(quoteIdent).join(', ')} FROM ${quoteIdent(rule.table)} WHERE ${rule.where};`);
-      if (!rows.length) continue;
-      const sql = `INSERT OR REPLACE INTO ${quoteIdent(rule.table)} (${commonColumns.map(quoteIdent).join(', ')}) VALUES (${commonColumns.map(() => '?').join(', ')});`;
-      const statement = destinationDb.prepare(sql);
-      for (const row of rows) statement.run(commonColumns.map((column) => row[column]));
-      statement.free();
-    }
-    destinationDb.run('COMMIT;');
-    fs.writeFileSync(destinationDbPath, Buffer.from(destinationDb.export()));
-    return 'SQLite 索引已合并。';
+    return await mergeLiveSingleSessionStateDb(snapshotDbPath, destinationDbPath, sessionId);
   } catch (error) {
-    try {
-      if (destinationDb) destinationDb.run('ROLLBACK;');
-    } catch {
-      // ignore rollback failures
-    }
     return `SQLite 索引合并失败：${error.message}`;
-  } finally {
-    if (sourceDb) sourceDb.close();
-    if (destinationDb) destinationDb.close();
   }
 }
 
 async function deleteSingleSessionStateDb(destinationDbPath, sessionId) {
-  if (!exists(destinationDbPath)) return 'SQLite 索引未删除：数据库文件缺失。';
-  let db;
   try {
-    db = await openDatabase(destinationDbPath);
-    const statements = [
-      { table: 'thread_dynamic_tools', sql: `DELETE FROM thread_dynamic_tools WHERE thread_id = ${quoteLiteral(sessionId)};` },
-      { table: 'thread_goals', sql: `DELETE FROM thread_goals WHERE thread_id = ${quoteLiteral(sessionId)};` },
-      { table: 'thread_spawn_edges', sql: `DELETE FROM thread_spawn_edges WHERE parent_thread_id = ${quoteLiteral(sessionId)} OR child_thread_id = ${quoteLiteral(sessionId)};` },
-      { table: 'stage1_outputs', sql: `DELETE FROM stage1_outputs WHERE thread_id = ${quoteLiteral(sessionId)};` },
-      { table: 'agent_job_items', sql: `DELETE FROM agent_job_items WHERE assigned_thread_id = ${quoteLiteral(sessionId)};` },
-      { table: 'threads', sql: `DELETE FROM threads WHERE id = ${quoteLiteral(sessionId)};` }
-    ];
-    db.run('BEGIN TRANSACTION;');
-    for (const statement of statements) {
-      if (tableExists(db, statement.table)) db.run(statement.sql);
-    }
-    db.run('COMMIT;');
-    fs.writeFileSync(destinationDbPath, Buffer.from(db.export()));
-    return 'SQLite 索引已删除。';
+    return await deleteLiveSessionStateDb(destinationDbPath, sessionId);
   } catch (error) {
-    try {
-      if (db) db.run('ROLLBACK;');
-    } catch {
-      // ignore rollback failures
-    }
     return `SQLite 索引删除失败：${error.message}`;
-  } finally {
-    if (db) db.close();
   }
 }
 
@@ -1664,6 +1541,7 @@ ipcMain.handle('choose-restore-protection-mode', async (event, options = {}) => 
 ipcMain.handle('restore-snapshot-conversations', async (_event, snapshotId, protectionMode = 'lightweight') => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
+  validateSnapshotRestorePaths(snapshot);
   const protectionSessions = (await loadSessionsInSnapshot(snapshot)).filter((session) => session.existsOnDisk);
   await createRestoreProtectionSnapshot(
     normalizeRestoreProtectionMode(protectionMode) === 'lightweight' ? 'Pre-Restore Lightweight Backup' : 'Pre-Restore Backup',
@@ -1682,6 +1560,7 @@ ipcMain.handle('restore-snapshot-conversations', async (_event, snapshotId, prot
 ipcMain.handle('restore-snapshot-full', async (_event, snapshotId, protectionMode = 'full') => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
+  validateSnapshotRestorePaths(snapshot);
   const mode = normalizeRestoreProtectionMode(protectionMode, 'full');
   const protectionSessions = mode === 'lightweight'
     ? (await loadSessions()).filter((session) => session.existsOnDisk)
