@@ -238,14 +238,7 @@ private struct VaultWorkerProgress: Codable, Sendable {
 }
 
 private struct ExternalAttachmentManifest: Codable, Sendable {
-    var records: [ExternalAttachmentRecord]
-}
-
-private struct ExternalAttachmentRecord: Codable, Sendable {
-    let sessionID: String
-    let originalPath: String
-    let storedRelativePath: String
-    let sizeBytes: Int64
+    var records: [ExternalAttachmentRestoreRecord]
 }
 
 enum SnapshotFilter: String, CaseIterable, Identifiable {
@@ -363,8 +356,19 @@ final class VaultModel: ObservableObject {
         URL(fileURLWithPath: vaultRoot).appendingPathComponent("snapshots", isDirectory: true)
     }
 
-    private func snapshotDataURL(_ snapshot: SnapshotMeta) -> URL {
-        snapshotRootURL.appendingPathComponent(snapshot.id, isDirectory: true).appendingPathComponent(dataDir, isDirectory: true)
+    private func snapshotDirectoryURL(_ snapshot: SnapshotMeta) throws -> URL {
+        try SnapshotPathValidator.resolve(snapshot.id, under: snapshotRootURL)
+    }
+
+    private func snapshotDataURL(_ snapshot: SnapshotMeta) throws -> URL {
+        try snapshotDirectoryURL(snapshot).appendingPathComponent(dataDir, isDirectory: true)
+    }
+
+    private func attachmentRecoveryRoot(snapshotID: String) throws -> URL {
+        let snapshotURL = try SnapshotPathValidator.resolve(snapshotID, under: snapshotRootURL)
+        return URL(fileURLWithPath: codexRoot, isDirectory: true)
+            .appendingPathComponent("recovered_attachments", isDirectory: true)
+            .appendingPathComponent(snapshotURL.lastPathComponent, isDirectory: true)
     }
 
     init(codexRoot explicitCodexRoot: String? = nil, vaultRoot explicitVaultRoot: String? = nil, refreshOnInit: Bool = true) {
@@ -842,12 +846,12 @@ final class VaultModel: ObservableObject {
                 snapshot: latestSnapshot,
                 restoreMode: .conversationsOnly
             )
-            await runWorker("正在自动找回会话...", command: command) { _ in
+            await runWorker("正在自动找回会话...", command: command) { response in
                 self.refresh()
                 self.selectedID = latestSnapshot.id
                 self.selectedSection = .sessions
-                self.status = "已自动找回会话：从 \(latestSnapshot.name) 合并恢复，保留当前账号和模型供应商配置"
-                self.inform(title: "恢复完成", message: "已自动找回会话：从 \(latestSnapshot.name) 合并恢复。\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。")
+                self.status = response.message
+                self.inform(title: "恢复完成", message: "\(response.message)\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。")
             }
         } else if currentVisibleCount > snapshotCount {
             let command = VaultWorkerCommand(
@@ -926,14 +930,14 @@ final class VaultModel: ObservableObject {
             protectionMode: protectionMode
         )
         Task {
-            await runWorker("正在恢复单个会话...", command: command) { _ in
+            await runWorker("正在恢复单个会话...", command: command) { response in
                 self.refresh()
                 self.selectedSection = .sessions
                 self.selectedSessionID = session.id
-                self.status = "已恢复单个会话：\(session.displayTitle)"
+                self.status = response.message
                 self.inform(
                     title: "恢复完成",
-                    message: "已恢复会话：\(session.displayTitle)\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。"
+                    message: "\(response.message)\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。"
                 )
             }
         }
@@ -973,15 +977,15 @@ final class VaultModel: ObservableObject {
             protectionMode: protectionMode
         )
         Task {
-            await runWorker("正在批量恢复会话...", command: command) { _ in
+            await runWorker("正在批量恢复会话...", command: command) { response in
                 self.checkedSnapshotSessionIDs.removeAll()
                 self.refresh()
                 self.selectedSection = .sessions
                 self.selectedSessionID = targets.first?.id
-                self.status = "已从 \(snapshot.name) 批量恢复 \(targets.count) 个会话"
+                self.status = response.message
                 self.inform(
                     title: "恢复完成",
-                    message: "已从快照 “\(snapshot.name)” 批量恢复 \(targets.count) 个会话。\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。"
+                    message: "\(response.message)\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。"
                 )
             }
         }
@@ -1090,14 +1094,14 @@ final class VaultModel: ObservableObject {
             protectionMode: protectionMode
         )
         Task {
-            await runWorker("正在从最近快照恢复单个会话...", command: command) { _ in
+            await runWorker("正在从最近快照恢复单个会话...", command: command) { response in
                 self.refresh()
                 self.selectedSection = .sessions
                 self.selectedSessionID = match.session.id
-                self.status = "已从 \(match.snapshot.name) 恢复：\(match.session.displayTitle)"
+                self.status = response.message
                 self.inform(
                     title: "恢复完成",
-                    message: "已从快照 “\(match.snapshot.name)” 恢复会话：\(match.session.displayTitle)\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。"
+                    message: "\(response.message)\n\n如果 Codex 客户端已经打开，请重启 Codex 后再查看恢复结果。"
                 )
             }
         }
@@ -1173,12 +1177,12 @@ final class VaultModel: ObservableObject {
             protectionMode: protectionMode
         )
         Task {
-            await runWorker("正在恢复快照...", command: command) { _ in
+            await runWorker("正在恢复快照...", command: command) { response in
                 self.refresh()
-                self.status = "\(snapshot.name)：\(mode.successMessage)"
+                self.status = response.message
                 self.inform(
                     title: "恢复完成",
-                    message: "\(snapshot.name)：\(mode.successMessage)"
+                    message: response.message
                 )
             }
         }
@@ -1317,7 +1321,12 @@ final class VaultModel: ObservableObject {
 
     func openSelectedSnapshot() {
         guard let snapshot = selectedSnapshot else { return }
-        NSWorkspace.shared.open(snapshotRootURL.appendingPathComponent(snapshot.id, isDirectory: true))
+        do {
+            NSWorkspace.shared.open(try snapshotDirectoryURL(snapshot))
+        } catch {
+            lastError = error.localizedDescription
+            status = "打开快照失败"
+        }
     }
 
     private func runBusy(_ busyStatus: String, operation: @escaping () throws -> Void) async {
@@ -1455,7 +1464,13 @@ final class VaultModel: ObservableObject {
             guard values.isDirectory == true else { continue }
             let metaURL = dir.appendingPathComponent(metadataFile)
             guard let data = try? Data(contentsOf: metaURL),
-                  let meta = try? JSONDecoder.snapshot.decode(SnapshotMeta.self, from: data) else {
+                  let meta = try? JSONDecoder.snapshot.decode(SnapshotMeta.self, from: data),
+                  meta.id == dir.lastPathComponent,
+                  (try? SnapshotPathValidator.resolve(
+                    meta.id,
+                    under: snapshotRootURL,
+                    matching: dir
+                  )) != nil else {
                 continue
             }
             result.append(meta)
@@ -1476,7 +1491,7 @@ final class VaultModel: ObservableObject {
     }
 
     private func loadSessions(in snapshot: SnapshotMeta) throws -> [CodexSession] {
-        let dataURL = snapshotDataURL(snapshot)
+        let dataURL = try snapshotDataURL(snapshot)
         let database = dataURL.appendingPathComponent("state_5.sqlite")
         guard fileManager.fileExists(atPath: database.path) else {
             return try loadSessionsFromFiles(root: dataURL)
@@ -1919,7 +1934,7 @@ final class VaultModel: ObservableObject {
     }
 
     private func validatedRestorePaths(for snapshot: SnapshotMeta) throws -> [ValidatedRestorePath] {
-        let snapshotURL = snapshotRootURL.appendingPathComponent(snapshot.id, isDirectory: true)
+        let snapshotURL = try snapshotDirectoryURL(snapshot)
         let dataURL = snapshotURL.appendingPathComponent(dataDir, isDirectory: true)
         guard fileManager.fileExists(atPath: snapshotURL.path) else { throw VaultError.snapshotMissing }
         guard fileManager.fileExists(atPath: dataURL.path) else { throw VaultError.invalidSnapshot }
@@ -1933,8 +1948,7 @@ final class VaultModel: ObservableObject {
 
     private func restore(snapshot: SnapshotMeta, mode: RestoreMode) throws {
         try checkOperationCancellation()
-        let snapshotURL = snapshotRootURL.appendingPathComponent(snapshot.id, isDirectory: true)
-        let dataURL = snapshotURL.appendingPathComponent(dataDir, isDirectory: true)
+        let dataURL = try snapshotDataURL(snapshot)
         let validatedPaths = try validatedRestorePaths(for: snapshot)
 
         let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
@@ -1947,7 +1961,8 @@ final class VaultModel: ObservableObject {
                 from: dataURL,
                 to: root,
                 includedPaths: snapshot.includedPaths,
-                snapshotCodexRoot: snapshot.codexRoot
+                snapshotCodexRoot: snapshot.codexRoot,
+                attachmentSnapshotID: snapshot.id
             )
         case .full:
             try checkOperationCancellation()
@@ -1955,7 +1970,8 @@ final class VaultModel: ObservableObject {
                 from: dataURL,
                 to: root,
                 validatedPaths: validatedPaths,
-                snapshotCodexRoot: snapshot.codexRoot
+                snapshotCodexRoot: snapshot.codexRoot,
+                attachmentSnapshotID: snapshot.id
             )
         }
     }
@@ -1964,7 +1980,8 @@ final class VaultModel: ObservableObject {
         from dataURL: URL,
         to root: URL,
         validatedPaths: [ValidatedRestorePath],
-        snapshotCodexRoot: String
+        snapshotCodexRoot: String,
+        attachmentSnapshotID: String
     ) throws {
         try checkOperationCancellation()
         let included = Set(validatedPaths.map(\.relativePath))
@@ -2003,14 +2020,19 @@ final class VaultModel: ObservableObject {
             )
         }
         try checkOperationCancellation()
-        try restoreExternalAttachments(sessionIDs: restorableSessionIDs, from: dataURL)
+        try restoreExternalAttachments(
+            sessionIDs: restorableSessionIDs,
+            from: dataURL,
+            snapshotID: attachmentSnapshotID
+        )
     }
 
     private func restoreConversationsOnly(
         from dataURL: URL,
         to root: URL,
         includedPaths: [String],
-        snapshotCodexRoot: String
+        snapshotCodexRoot: String,
+        attachmentSnapshotID: String? = nil
     ) throws {
         try checkOperationCancellation()
         let included = Set(includedPaths)
@@ -2052,7 +2074,13 @@ final class VaultModel: ObservableObject {
             }
         }
         try checkOperationCancellation()
-        try restoreExternalAttachments(sessionIDs: restorableSessionIDs, from: dataURL)
+        if let attachmentSnapshotID {
+            try restoreExternalAttachments(
+                sessionIDs: restorableSessionIDs,
+                from: dataURL,
+                snapshotID: attachmentSnapshotID
+            )
+        }
     }
 
     private func repairRecoveredThreadIndex(
@@ -2127,7 +2155,7 @@ final class VaultModel: ObservableObject {
 
     private func restoreSingleSession(snapshot: SnapshotMeta, session: CodexSession) throws {
         try checkOperationCancellation()
-        let dataURL = snapshotDataURL(snapshot)
+        let dataURL = try snapshotDataURL(snapshot)
         guard fileManager.fileExists(atPath: dataURL.path) else { throw VaultError.invalidSnapshot }
 
         let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
@@ -2167,7 +2195,11 @@ final class VaultModel: ObservableObject {
             try updateThreadRolloutPath(database: dstDB, sessionID: session.id, rolloutPath: dst.path)
         }
         try checkOperationCancellation()
-        try restoreExternalAttachments(sessionIDs: [session.id], from: dataURL)
+        try restoreExternalAttachments(
+            sessionIDs: [session.id],
+            from: dataURL,
+            snapshotID: snapshot.id
+        )
     }
 
     private func snapshotRelativePath(for absolutePath: String, snapshotCodexRoot: String) -> String? {
@@ -3237,7 +3269,7 @@ final class VaultModel: ObservableObject {
     private func copyExternalAttachments(sessionIDs: Set<String>, from dataURL: URL) throws -> Bool {
         guard !sessionIDs.isEmpty else { return false }
         try checkOperationCancellation()
-        var records: [ExternalAttachmentRecord] = []
+        var records: [ExternalAttachmentRestoreRecord] = []
         var seen = Set<String>()
 
         for sessionID in sessionIDs {
@@ -3259,7 +3291,7 @@ final class VaultModel: ObservableObject {
                 let dst = dataURL.appendingPathComponent(storedRelativePath)
                 try copyReplacing(src: src, dst: dst)
                 records.append(
-                    ExternalAttachmentRecord(
+                    ExternalAttachmentRestoreRecord(
                         sessionID: sessionID,
                         originalPath: path,
                         storedRelativePath: storedRelativePath,
@@ -3277,27 +3309,67 @@ final class VaultModel: ObservableObject {
         return true
     }
 
-    private func restoreExternalAttachments(sessionIDs: Set<String>?, from dataURL: URL) throws {
+    private func validatedExternalAttachmentRestorePaths(
+        sessionIDs: Set<String>?,
+        from dataURL: URL,
+        snapshotID: String
+    ) throws -> [ValidatedExternalAttachmentRestore] {
         try checkOperationCancellation()
         let manifestURL = dataURL.appendingPathComponent("external_attachments/manifest.json")
-        guard fileManager.fileExists(atPath: manifestURL.path) else { return }
+        guard fileManager.fileExists(atPath: manifestURL.path) else { return [] }
         let manifest = try JSONDecoder.snapshot.decode(
             ExternalAttachmentManifest.self,
             from: Data(contentsOf: manifestURL)
         )
 
-        for record in manifest.records {
+        return try ExternalAttachmentRestoreValidator.validate(
+            records: manifest.records,
+            sourceRoot: dataURL,
+            destinationRoot: attachmentRecoveryRoot(snapshotID: snapshotID),
+            selectedSessionIDs: sessionIDs
+        )
+    }
+
+    private func preflightExternalAttachmentRestore(
+        for snapshot: SnapshotMeta,
+        sessionIDs: Set<String>?
+    ) throws {
+        let dataURL = try snapshotDataURL(snapshot)
+        guard fileManager.fileExists(atPath: dataURL.path) else {
+            throw VaultError.invalidSnapshot
+        }
+        _ = try validatedExternalAttachmentRestorePaths(
+            sessionIDs: sessionIDs,
+            from: dataURL,
+            snapshotID: snapshot.id
+        )
+    }
+
+    private func restoreExternalAttachments(
+        sessionIDs: Set<String>?,
+        from dataURL: URL,
+        snapshotID: String
+    ) throws {
+        let paths = try validatedExternalAttachmentRestorePaths(
+            sessionIDs: sessionIDs,
+            from: dataURL,
+            snapshotID: snapshotID
+        )
+        for path in paths {
             try checkOperationCancellation()
-            if let sessionIDs, !sessionIDs.contains(record.sessionID) {
+            guard fileManager.fileExists(atPath: path.sourceURL.path),
+                  !fileManager.fileExists(atPath: path.destinationURL.path) else {
                 continue
             }
-            let src = dataURL.appendingPathComponent(record.storedRelativePath)
-            let dst = URL(fileURLWithPath: record.originalPath)
-            guard fileManager.fileExists(atPath: src.path),
-                  !fileManager.fileExists(atPath: dst.path) else {
+            try fileManager.createDirectory(
+                at: path.destinationURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            do {
+                try fileManager.copyItem(at: path.sourceURL, to: path.destinationURL)
+            } catch let error as CocoaError where error.code == .fileWriteFileExists {
                 continue
             }
-            try copyReplacing(src: src, dst: dst)
         }
     }
 
@@ -3536,9 +3608,9 @@ final class VaultModel: ObservableObject {
     private func pruneSnapshots(_ targets: [SnapshotMeta], keeping limit: Int) throws {
         guard limit >= 0 else { return }
         let sorted = targets.sorted { $0.createdAt > $1.createdAt }
-        for snapshot in sorted.dropFirst(limit) {
+        let snapshotURLs = try sorted.dropFirst(limit).map(snapshotDirectoryURL)
+        for url in snapshotURLs {
             try checkOperationCancellation()
-            let url = snapshotRootURL.appendingPathComponent(snapshot.id, isDirectory: true)
             if fileManager.fileExists(atPath: url.path) {
                 try fileManager.removeItem(at: url)
             }
@@ -3777,6 +3849,11 @@ final class VaultModel: ObservableObject {
             command.protectionMode ?? defaultMode
         }
 
+        func attachmentRestoreNote(for snapshot: SnapshotMeta) throws -> String {
+            let root = try attachmentRecoveryRoot(snapshotID: snapshot.id)
+            return "外部附件（如有）已安全恢复到 \(root.path)，未写回原绝对路径。"
+        }
+
         func reportProtectionStart(
             fraction: Double,
             mode: RestoreProtectionMode,
@@ -3840,6 +3917,7 @@ final class VaultModel: ObservableObject {
                 throw VaultError.invalidSnapshot
             }
             _ = try validatedRestorePaths(for: snapshot)
+            try preflightExternalAttachmentRestore(for: snapshot, sessionIDs: nil)
             let protectionMode = selectedProtectionMode(default: mode == .full ? .full : .lightweight)
             let protectionSessions: [CodexSession]
             if mode == .full && protectionMode == .lightweight {
@@ -3866,14 +3944,16 @@ final class VaultModel: ObservableObject {
             try report(0.45, "正在恢复快照...", "正在复制快照内容并合并 Codex 索引。")
             try checkCancellation()
             try restore(snapshot: snapshot, mode: mode)
-            try report(1.0, "恢复完成", mode.successMessage)
-            return .ok(message: "\(snapshot.name)：\(mode.successMessage)")
+            let attachmentNote = try attachmentRestoreNote(for: snapshot)
+            try report(1.0, "恢复完成", "\(mode.successMessage) \(attachmentNote)")
+            return .ok(message: "\(snapshot.name)：\(mode.successMessage) \(attachmentNote)")
 
         case .restoreSnapshotSession:
             guard let snapshot = command.snapshot,
                   let session = command.sessions.first else {
                 throw VaultError.invalidSnapshot
             }
+            try preflightExternalAttachmentRestore(for: snapshot, sessionIDs: [session.id])
             let protectionMode = selectedProtectionMode(default: .lightweight)
             try reportProtectionStart(
                 fraction: 0.12,
@@ -3890,14 +3970,19 @@ final class VaultModel: ObservableObject {
             try report(0.55, "正在恢复会话：\(session.displayTitle)", "正在复制会话文件、附件并合并历史索引。")
             try checkCancellation()
             try restoreSingleSession(snapshot: snapshot, session: session)
-            try report(1.0, "恢复完成：\(session.displayTitle)", "会话文件、历史索引和线程记录已合并。")
-            return .ok(message: "已恢复单个会话：\(session.displayTitle)")
+            let attachmentNote = try attachmentRestoreNote(for: snapshot)
+            try report(1.0, "恢复完成：\(session.displayTitle)", "会话文件、历史索引和线程记录已合并。\(attachmentNote)")
+            return .ok(message: "已恢复单个会话：\(session.displayTitle)。\(attachmentNote)")
 
         case .restoreSnapshotSessions:
             guard let snapshot = command.snapshot,
                   !command.sessions.isEmpty else {
                 throw VaultError.invalidSnapshot
             }
+            try preflightExternalAttachmentRestore(
+                for: snapshot,
+                sessionIDs: Set(command.sessions.map(\.id))
+            )
             let protectionMode = selectedProtectionMode(default: .lightweight)
             try reportProtectionStart(
                 fraction: 0.08,
@@ -3922,8 +4007,9 @@ final class VaultModel: ObservableObject {
                 )
                 try restoreSingleSession(snapshot: snapshot, session: session)
             }
-            try report(1.0, "批量恢复完成", "已恢复 \(command.sessions.count) 个会话。")
-            return .ok(message: "已从 \(snapshot.name) 批量恢复 \(command.sessions.count) 个会话")
+            let attachmentNote = try attachmentRestoreNote(for: snapshot)
+            try report(1.0, "批量恢复完成", "已恢复 \(command.sessions.count) 个会话。\(attachmentNote)")
+            return .ok(message: "已从 \(snapshot.name) 批量恢复 \(command.sessions.count) 个会话。\(attachmentNote)")
 
         case .restoreIncrementalBackupSessions:
             let requestedIDs = Set(command.sessions.map(\.id))
@@ -3989,15 +4075,16 @@ final class VaultModel: ObservableObject {
             return .ok(message: "已从本地增量备份恢复 \(restorableIDs.count) 个缺失会话。\(indexResult.message) 请重启 Codex 后查看。")
 
         case .deleteSnapshots:
+            let snapshotURLs = try command.snapshots.map(snapshotDirectoryURL)
             let total = max(command.snapshots.count, 1)
-            for (index, snapshot) in command.snapshots.enumerated() {
+            for (index, pair) in zip(command.snapshots, snapshotURLs).enumerated() {
+                let (snapshot, url) = pair
                 try checkCancellation()
                 try report(
                     0.05 + (0.90 * Double(index) / Double(total)),
                     "正在删除快照 \(index + 1)/\(total)...",
                     snapshot.name
                 )
-                let url = snapshotRootURL.appendingPathComponent(snapshot.id, isDirectory: true)
                 if fileManager.fileExists(atPath: url.path) {
                     try fileManager.removeItem(at: url)
                 }
@@ -4043,6 +4130,8 @@ final class VaultModel: ObservableObject {
             guard let snapshot = command.snapshot else {
                 throw VaultError.invalidSnapshot
             }
+            _ = try validatedRestorePaths(for: snapshot)
+            try preflightExternalAttachmentRestore(for: snapshot, sessionIDs: nil)
             try report(0.08, "正在创建自动找回前备份...", "正在保护当前 Codex 会话状态。")
             _ = try createSystemSnapshot(
                 name: "Pre-Auto-Restore Backup",
@@ -4052,8 +4141,9 @@ final class VaultModel: ObservableObject {
             try report(0.50, "正在自动找回会话...", "正在合并快照里的会话文件和索引。")
             try checkCancellation()
             try restore(snapshot: snapshot, mode: .conversationsOnly)
-            try report(1.0, "自动找回完成", "已从 \(snapshot.name) 合并恢复。")
-            return .ok(message: "已自动找回会话：从 \(snapshot.name) 合并恢复，保留当前账号和模型供应商配置")
+            let attachmentNote = try attachmentRestoreNote(for: snapshot)
+            try report(1.0, "自动找回完成", "已从 \(snapshot.name) 合并恢复。\(attachmentNote)")
+            return .ok(message: "已自动找回会话：从 \(snapshot.name) 合并恢复，保留当前账号和模型供应商配置。\(attachmentNote)")
         }
     }
 }
