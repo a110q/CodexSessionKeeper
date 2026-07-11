@@ -205,12 +205,18 @@ public final class RecoveredThreadIndexWriter {
         process.arguments = arguments + [databaseURL.path, sql]
         let outputPipe = Pipe()
         let errorPipe = Pipe()
+        let outputReader = outputPipe.fileHandleForReading
+        let errorReader = errorPipe.fileHandleForReading
+        defer {
+            try? outputReader.close()
+            try? errorReader.close()
+        }
         process.standardOutput = outputPipe
         process.standardError = errorPipe
         try process.run()
         process.waitUntilExit()
-        let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let error = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let output = String(data: outputReader.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let error = String(data: errorReader.readDataToEndOfFile(), encoding: .utf8) ?? ""
         if process.terminationStatus != 0 {
             throw RecoveredThreadIndexError.sqliteFailed(error.isEmpty ? output : error)
         }

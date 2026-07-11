@@ -170,9 +170,13 @@ public final class BackupCursorStore {
         let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
+        let inputWriter = inputPipe.fileHandleForWriting
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
+        defer {
+            try? inputWriter.close()
+        }
 
         let outputCollector = PipeDataCollector()
         let errorCollector = PipeDataCollector()
@@ -184,8 +188,8 @@ public final class BackupCursorStore {
             throw BackupCursorStoreError.launchFailed(sqlitePath: sqlitePath, underlying: error)
         }
 
-        inputPipe.fileHandleForWriting.write(Data(input.utf8))
-        try? inputPipe.fileHandleForWriting.close()
+        inputWriter.write(Data(input.utf8))
+        try? inputWriter.close()
         Self.drain(outputPipe, into: outputCollector, group: readGroup)
         Self.drain(errorPipe, into: errorCollector, group: readGroup)
 
@@ -207,8 +211,10 @@ public final class BackupCursorStore {
 
     private static func drain(_ pipe: Pipe, into collector: PipeDataCollector, group: DispatchGroup) {
         group.enter()
+        let reader = pipe.fileHandleForReading
         DispatchQueue.global(qos: .utility).async {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let data = reader.readDataToEndOfFile()
+            try? reader.close()
             collector.append(data)
             group.leave()
         }

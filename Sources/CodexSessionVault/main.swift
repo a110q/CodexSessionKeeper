@@ -4253,6 +4253,12 @@ private enum VaultWorkerProcess {
 
             let stdoutPipe = Pipe()
             let stderrPipe = Pipe()
+            let stdoutReader = stdoutPipe.fileHandleForReading
+            let stderrReader = stderrPipe.fileHandleForReading
+            defer {
+                try? stdoutReader.close()
+                try? stderrReader.close()
+            }
             process.standardOutput = stdoutPipe
             process.standardError = stderrPipe
 
@@ -4283,8 +4289,8 @@ private enum VaultWorkerProcess {
                 }
             }
 
-            let stderr = String(decoding: stderrPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            _ = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderr = String(decoding: stderrReader.readDataToEndOfFile(), as: UTF8.self)
+            _ = stdoutReader.readDataToEndOfFile()
 
             if let cancellationPath = command.cancellationPath,
                FileManager.default.fileExists(atPath: cancellationPath) {
