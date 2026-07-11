@@ -75,6 +75,7 @@ public final class BackupRecoveryBuilder {
             let displayTitle = displayTitle(for: source.record)
             let recoveredRelativePath = "sessions/recovered/\(filename)"
             let recoveredURL = recoveredSessionsURL.appendingPathComponent(filename, isDirectory: false)
+            try RestoreFilesystemValidator.validateSource(source.fileURL, under: paths.backupRoot)
             let contents = try Data(contentsOf: source.fileURL)
             try contents.write(to: recoveredURL, options: [.atomic])
 
@@ -175,6 +176,7 @@ public final class BackupRecoveryBuilder {
                 backupPath: record.backupPath
             )
         }
+        try RestoreFilesystemValidator.validateSource(fileURL, under: paths.backupRoot, allowMissing: true)
 
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), !isDirectory.boolValue else {

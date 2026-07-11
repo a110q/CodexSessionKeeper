@@ -1992,11 +1992,17 @@ final class VaultModel: ObservableObject {
         guard fileManager.fileExists(atPath: snapshotURL.path) else { throw VaultError.snapshotMissing }
         guard fileManager.fileExists(atPath: dataURL.path) else { throw VaultError.invalidSnapshot }
 
-        return try RestorePathValidator.validate(
+        let restorePaths = try RestorePathValidator.validate(
             snapshot.includedPaths,
             sourceRoot: dataURL,
             destinationRoot: URL(fileURLWithPath: codexRoot, isDirectory: true)
         )
+        try RestoreFilesystemValidator.validate(
+            restorePaths,
+            sourceRoot: dataURL,
+            destinationRoot: URL(fileURLWithPath: codexRoot, isDirectory: true)
+        )
+        return restorePaths
     }
 
     private func restore(snapshot: SnapshotMeta, mode: RestoreMode) throws {
@@ -2046,7 +2052,7 @@ final class VaultModel: ObservableObject {
             let src = restorePath.sourceURL
             let dst = restorePath.destinationURL
             guard fileManager.fileExists(atPath: src.path) else { continue }
-            try copyReplacing(src: src, dst: dst)
+            try copyReplacing(src: src, dst: dst, sourceRoot: dataURL, destinationRoot: root)
         }
 
         guard included.contains("state_5.sqlite") else { return }
@@ -2055,6 +2061,7 @@ final class VaultModel: ObservableObject {
         let restorableSessionIDs = try restorableSessionIDs(from: dataURL, snapshotCodexRoot: snapshotCodexRoot)
         let database = root.appendingPathComponent("state_5.sqlite")
         if fileManager.fileExists(atPath: database.path) {
+            try RestoreFilesystemValidator.validateDestination(database, under: root)
             try checkOperationCancellation()
             try pruneStateDatabase(database: database, sqlite: "/usr/bin/sqlite3", allowedSessionIDs: restorableSessionIDs)
             try checkOperationCancellation()
@@ -2098,7 +2105,7 @@ final class VaultModel: ObservableObject {
             let src = dataURL.appendingPathComponent(relPath)
             let dst = root.appendingPathComponent(relPath)
             guard fileManager.fileExists(atPath: src.path) else { continue }
-            try mergeDirectory(src: src, dst: dst)
+            try mergeDirectory(src: src, dst: dst, sourceRoot: dataURL, destinationRoot: root)
         }
 
         for relPath in conversationLineMergePaths where included.contains(relPath) {
@@ -2106,6 +2113,8 @@ final class VaultModel: ObservableObject {
             let src = dataURL.appendingPathComponent(relPath)
             let dst = root.appendingPathComponent(relPath)
             guard fileManager.fileExists(atPath: src.path) else { continue }
+            try RestoreFilesystemValidator.validateSource(src, under: dataURL)
+            try RestoreFilesystemValidator.validateDestination(dst, under: root)
             try mergeLineFile(
                 src: src,
                 dst: dst,
@@ -2119,6 +2128,8 @@ final class VaultModel: ObservableObject {
             let src = dataURL.appendingPathComponent("state_5.sqlite")
             let dst = root.appendingPathComponent("state_5.sqlite")
             if fileManager.fileExists(atPath: src.path) {
+                try RestoreFilesystemValidator.validateSource(src, under: dataURL)
+                try RestoreFilesystemValidator.validateDestination(dst, under: root)
                 try mergeStateDatabase(src: src, dst: dst, allowedSessionIDs: restorableSessionIDs)
                 try checkOperationCancellation()
                 if let restorableSessionIDs {
@@ -2149,9 +2160,11 @@ final class VaultModel: ObservableObject {
                 sessionIDs: sessionIDs,
                 codexRoot: codexRoot
             )
+            let databaseURL = codexRoot.appendingPathComponent("state_5.sqlite", isDirectory: false)
+            try RestoreFilesystemValidator.validateDestination(databaseURL, under: codexRoot)
             return try RecoveredThreadIndexWriter().ensureThreads(
                 entries: entries,
-                databaseURL: codexRoot.appendingPathComponent("state_5.sqlite", isDirectory: false)
+                databaseURL: databaseURL
             )
         } catch {
             return RecoveredThreadIndexResult(
@@ -2226,13 +2239,15 @@ final class VaultModel: ObservableObject {
 
         let dst = root.appendingPathComponent(rolloutRelPath)
         try checkOperationCancellation()
-        try copyReplacing(src: sourceFileURL, dst: dst)
+        try copyReplacing(src: sourceFileURL, dst: dst, sourceRoot: dataURL, destinationRoot: root)
 
         for relPath in conversationLineMergePaths {
             try checkOperationCancellation()
             let src = dataURL.appendingPathComponent(relPath)
             let dst = root.appendingPathComponent(relPath)
             guard fileManager.fileExists(atPath: src.path) else { continue }
+            try RestoreFilesystemValidator.validateSource(src, under: dataURL)
+            try RestoreFilesystemValidator.validateDestination(dst, under: root)
             try mergeJSONLLines(matchingSessionID: session.id, from: src, into: dst)
         }
 
@@ -2242,6 +2257,8 @@ final class VaultModel: ObservableObject {
         let srcDB = dataURL.appendingPathComponent("state_5.sqlite")
         let dstDB = root.appendingPathComponent("state_5.sqlite")
         if fileManager.fileExists(atPath: srcDB.path), fileManager.fileExists(atPath: dstDB.path) {
+            try RestoreFilesystemValidator.validateSource(srcDB, under: dataURL)
+            try RestoreFilesystemValidator.validateDestination(dstDB, under: root)
             try checkOperationCancellation()
             try mergeSingleSessionStateDatabase(src: srcDB, dst: dstDB, sessionID: session.id)
             try checkOperationCancellation()
@@ -2603,22 +2620,45 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    private func copyReplacing(src: URL, dst: URL) throws {
+    private func copyReplacing(
+        src: URL,
+        dst: URL,
+        sourceRoot: URL? = nil,
+        destinationRoot: URL? = nil
+    ) throws {
         try checkOperationCancellation()
+        if let sourceRoot, let destinationRoot {
+            try RestoreFilesystemValidator.validateSource(src, under: sourceRoot, recursive: true)
+            try RestoreFilesystemValidator.validateDestination(dst, under: destinationRoot, recursive: true)
+        }
         try fileManager.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
         if fileManager.fileExists(atPath: dst.path) {
             try fileManager.removeItem(at: dst)
         }
         var isDirectory: ObjCBool = false
         if fileManager.fileExists(atPath: src.path, isDirectory: &isDirectory), isDirectory.boolValue {
-            try copyDirectoryContents(src: src, dst: dst)
+            try copyDirectoryContents(
+                src: src,
+                dst: dst,
+                sourceRoot: sourceRoot,
+                destinationRoot: destinationRoot
+            )
         } else {
+            if let sourceRoot, let destinationRoot {
+                try RestoreFilesystemValidator.validateSource(src, under: sourceRoot)
+                try RestoreFilesystemValidator.validateDestination(dst, under: destinationRoot)
+            }
             try fileManager.copyItem(at: src, to: dst)
         }
         try checkOperationCancellation()
     }
 
-    private func copyDirectoryContents(src: URL, dst: URL) throws {
+    private func copyDirectoryContents(
+        src: URL,
+        dst: URL,
+        sourceRoot: URL? = nil,
+        destinationRoot: URL? = nil
+    ) throws {
         try fileManager.createDirectory(at: dst, withIntermediateDirectories: true)
         guard let enumerator = fileManager.enumerator(
             at: src,
@@ -2632,6 +2672,10 @@ final class VaultModel: ObservableObject {
             try checkOperationCancellation()
             let relPath = String(itemURL.path.dropFirst(src.path.count + 1))
             let targetURL = dst.appendingPathComponent(relPath)
+            if let sourceRoot, let destinationRoot {
+                try RestoreFilesystemValidator.validateSource(itemURL, under: sourceRoot)
+                try RestoreFilesystemValidator.validateDestination(targetURL, under: destinationRoot)
+            }
             let values = try itemURL.resourceValues(forKeys: [.isDirectoryKey])
             if values.isDirectory == true {
                 try fileManager.createDirectory(at: targetURL, withIntermediateDirectories: true)
@@ -2645,10 +2689,24 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    private func mergeDirectory(src: URL, dst: URL) throws {
+    private func mergeDirectory(
+        src: URL,
+        dst: URL,
+        sourceRoot: URL? = nil,
+        destinationRoot: URL? = nil
+    ) throws {
         try checkOperationCancellation()
+        if let sourceRoot, let destinationRoot {
+            try RestoreFilesystemValidator.validateSource(src, under: sourceRoot, recursive: true)
+            try RestoreFilesystemValidator.validateDestination(dst, under: destinationRoot, recursive: true)
+        }
         if !fileManager.fileExists(atPath: dst.path) {
-            try copyReplacing(src: src, dst: dst)
+            try copyReplacing(
+                src: src,
+                dst: dst,
+                sourceRoot: sourceRoot,
+                destinationRoot: destinationRoot
+            )
             return
         }
 
@@ -2664,11 +2722,20 @@ final class VaultModel: ObservableObject {
             try checkOperationCancellation()
             let relPath = String(itemURL.path.dropFirst(src.path.count + 1))
             let targetURL = dst.appendingPathComponent(relPath)
+            if let sourceRoot, let destinationRoot {
+                try RestoreFilesystemValidator.validateSource(itemURL, under: sourceRoot)
+                try RestoreFilesystemValidator.validateDestination(targetURL, under: destinationRoot)
+            }
             let values = try itemURL.resourceValues(forKeys: [.isDirectoryKey])
             if values.isDirectory == true {
                 try fileManager.createDirectory(at: targetURL, withIntermediateDirectories: true)
             } else {
-                try copyReplacing(src: itemURL, dst: targetURL)
+                try copyReplacing(
+                    src: itemURL,
+                    dst: targetURL,
+                    sourceRoot: sourceRoot,
+                    destinationRoot: destinationRoot
+                )
             }
         }
     }
@@ -2785,6 +2852,8 @@ final class VaultModel: ObservableObject {
     private func restoreShellSnapshots(sessionID: String, from dataURL: URL, to root: URL) throws {
         let srcDir = dataURL.appendingPathComponent("shell_snapshots", isDirectory: true)
         let dstDir = root.appendingPathComponent("shell_snapshots", isDirectory: true)
+        try RestoreFilesystemValidator.validateSource(srcDir, under: dataURL, recursive: true, allowMissing: true)
+        try RestoreFilesystemValidator.validateDestination(dstDir, under: root, recursive: true)
         guard let enumerator = fileManager.enumerator(at: srcDir, includingPropertiesForKeys: [.isDirectoryKey]) else {
             return
         }
@@ -2794,7 +2863,7 @@ final class VaultModel: ObservableObject {
             let values = try srcURL.resourceValues(forKeys: [.isDirectoryKey])
             guard values.isDirectory != true, srcURL.lastPathComponent.contains(sessionID) else { continue }
             let dstURL = dstDir.appendingPathComponent(srcURL.lastPathComponent)
-            try copyReplacing(src: srcURL, dst: dstURL)
+            try copyReplacing(src: srcURL, dst: dstURL, sourceRoot: dataURL, destinationRoot: root)
         }
     }
 
@@ -3369,18 +3438,37 @@ final class VaultModel: ObservableObject {
     ) throws -> [ValidatedExternalAttachmentRestore] {
         try checkOperationCancellation()
         let manifestURL = dataURL.appendingPathComponent("external_attachments/manifest.json")
+        try RestoreFilesystemValidator.validateSource(
+            manifestURL,
+            under: dataURL,
+            allowMissing: true
+        )
         guard fileManager.fileExists(atPath: manifestURL.path) else { return [] }
+        try RestoreFilesystemValidator.validateSource(manifestURL, under: dataURL)
         let manifest = try JSONDecoder.snapshot.decode(
             ExternalAttachmentManifest.self,
             from: Data(contentsOf: manifestURL)
         )
 
-        return try ExternalAttachmentRestoreValidator.validate(
+        let destinationRoot = try attachmentRecoveryRoot(snapshotID: snapshotID)
+        let paths = try ExternalAttachmentRestoreValidator.validate(
             records: manifest.records,
             sourceRoot: dataURL,
-            destinationRoot: attachmentRecoveryRoot(snapshotID: snapshotID),
+            destinationRoot: destinationRoot,
             selectedSessionIDs: sessionIDs
         )
+        for path in paths {
+            try RestoreFilesystemValidator.validateSource(
+                path.sourceURL,
+                under: dataURL,
+                allowMissing: true
+            )
+            try RestoreFilesystemValidator.validateDestination(
+                path.destinationURL,
+                under: destinationRoot
+            )
+        }
+        return paths
     }
 
     private func preflightExternalAttachmentRestore(
@@ -3408,17 +3496,27 @@ final class VaultModel: ObservableObject {
             from: dataURL,
             snapshotID: snapshotID
         )
+        let destinationRoot = try attachmentRecoveryRoot(snapshotID: snapshotID)
         for path in paths {
             try checkOperationCancellation()
             guard fileManager.fileExists(atPath: path.sourceURL.path),
                   !fileManager.fileExists(atPath: path.destinationURL.path) else {
                 continue
             }
-            try fileManager.createDirectory(
-                at: path.destinationURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
             do {
+                try RestoreFilesystemValidator.validateSource(path.sourceURL, under: dataURL)
+                try RestoreFilesystemValidator.validateDestination(
+                    path.destinationURL,
+                    under: destinationRoot
+                )
+                try fileManager.createDirectory(
+                    at: path.destinationURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try RestoreFilesystemValidator.validateDestination(
+                    path.destinationURL,
+                    under: destinationRoot
+                )
                 try fileManager.copyItem(at: path.sourceURL, to: path.destinationURL)
             } catch let error as CocoaError where error.code == .fileWriteFileExists {
                 continue
@@ -4006,6 +4104,7 @@ final class VaultModel: ObservableObject {
                   let session = command.sessions.first else {
                 throw VaultError.invalidSnapshot
             }
+            _ = try validatedRestorePaths(for: snapshot)
             try preflightExternalAttachmentRestore(for: snapshot, sessionIDs: [session.id])
             let protectionMode = selectedProtectionMode(default: .lightweight)
             try reportProtectionStart(
@@ -4032,6 +4131,7 @@ final class VaultModel: ObservableObject {
                   !command.sessions.isEmpty else {
                 throw VaultError.invalidSnapshot
             }
+            _ = try validatedRestorePaths(for: snapshot)
             try preflightExternalAttachmentRestore(
                 for: snapshot,
                 sessionIDs: Set(command.sessions.map(\.id))
@@ -4085,6 +4185,20 @@ final class VaultModel: ObservableObject {
             guard !restorableIDs.isEmpty else {
                 throw VaultError.commandFailed("选中的备份会话都已存在或不可恢复。")
             }
+            let destinationRoot = URL(fileURLWithPath: command.codexRoot, isDirectory: true)
+            try RestoreFilesystemValidator.validateDestination(
+                destinationRoot.appendingPathComponent("sessions", isDirectory: true),
+                under: destinationRoot,
+                recursive: true
+            )
+            try RestoreFilesystemValidator.validateDestination(
+                destinationRoot.appendingPathComponent("session_index.jsonl"),
+                under: destinationRoot
+            )
+            try RestoreFilesystemValidator.validateDestination(
+                destinationRoot.appendingPathComponent("state_5.sqlite"),
+                under: destinationRoot
+            )
 
             let protectionMode = selectedProtectionMode(default: .lightweight)
             try reportProtectionStart(

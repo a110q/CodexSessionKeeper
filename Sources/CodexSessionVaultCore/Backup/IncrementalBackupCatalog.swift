@@ -183,6 +183,7 @@ public final class IncrementalBackupCatalog {
                 backupPath: record.backupPath
             )
         }
+        try RestoreFilesystemValidator.validateSource(fileURL, under: paths.backupRoot, allowMissing: true)
 
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
