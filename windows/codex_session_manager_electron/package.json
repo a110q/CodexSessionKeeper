@@ -15,6 +15,6 @@
   },
   "devDependencies": {
     "@electron/packager": "^18.3.6",
-    "electron": "^30.5.1"
+    "electron": "^43.1.0"
   }
 }
