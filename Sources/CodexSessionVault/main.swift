@@ -338,7 +338,7 @@ final class VaultModel: ObservableObject {
     @Published private(set) var localBackupStatusDetail = "等待启动"
 
     private static let autoRestoreDefaultsKey = "autoRestoreOnLaunch"
-    private static let localBackupStatusRefreshInterval: UInt64 = 3_000_000_000
+    private static let localBackupStatusRefreshInterval: UInt64 = 15_000_000_000
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
@@ -517,8 +517,11 @@ final class VaultModel: ObservableObject {
 
         localBackupPaths = paths
         localBackupAgent = agent
-        localBackupStatusLabel = "备份：启动中"
-        localBackupStatusDetail = "准备扫描"
+        publishLocalBackupStatus(
+            status: nil,
+            label: "备份：启动中",
+            detail: "准备扫描"
+        )
 
         agent.startPolling(intervalSeconds: 10)
         refreshLocalBackupStatus()
@@ -541,29 +544,56 @@ final class VaultModel: ObservableObject {
 
     private func refreshLocalBackupStatus() {
         guard let paths = localBackupPaths else {
-            localBackupStatus = nil
-            localBackupStatusLabel = "备份：未启动"
-            localBackupStatusDetail = "等待启动"
+            publishLocalBackupStatus(
+                status: nil,
+                label: "备份：未启动",
+                detail: "等待启动"
+            )
             return
         }
 
         guard fileManager.fileExists(atPath: paths.statusURL.path) else {
-            localBackupStatus = nil
-            localBackupStatusLabel = "备份：启动中"
-            localBackupStatusDetail = "等待状态"
+            publishLocalBackupStatus(
+                status: nil,
+                label: "备份：启动中",
+                detail: "等待状态"
+            )
             return
         }
 
         do {
             let status = try loadLocalBackupStatus(from: paths.statusURL)
-            localBackupStatus = status
-            localBackupStatusLabel = Self.localBackupStatusLabel(for: status.status)
-            localBackupStatusDetail = Self.localBackupStatusDetail(for: status)
+            publishLocalBackupStatus(
+                status: status,
+                label: Self.localBackupStatusLabel(for: status.status),
+                detail: Self.localBackupStatusDetail(for: status)
+            )
         } catch {
-            localBackupStatus = nil
-            localBackupStatusLabel = "备份：错误"
-            localBackupStatusDetail = Self.shortBackupDetail(error.localizedDescription)
+            publishLocalBackupStatus(
+                status: nil,
+                label: "备份：错误",
+                detail: Self.shortBackupDetail(error.localizedDescription)
+            )
         }
+    }
+
+    private func publishLocalBackupStatus(
+        status nextStatus: BackupStatus?,
+        label nextLabel: String,
+        detail nextDetail: String
+    ) {
+        let currentIsError = localBackupStatus?.status == .error || localBackupStatusLabel.contains("错误")
+        let nextIsError = nextStatus?.status == .error || nextLabel.contains("错误")
+        guard localBackupStatusLabel != nextLabel
+            || localBackupStatusDetail != nextDetail
+            || currentIsError != nextIsError
+        else {
+            return
+        }
+
+        localBackupStatus = nextStatus
+        localBackupStatusLabel = nextLabel
+        localBackupStatusDetail = nextDetail
     }
 
     private func loadLocalBackupStatus(from url: URL) throws -> BackupStatus {
