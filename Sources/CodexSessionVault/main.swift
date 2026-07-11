@@ -295,14 +295,27 @@ final class VaultModel: ObservableObject {
     @Published var snapshotSessions: [CodexSession] = []
     @Published var selectedSnapshotSessionID: CodexSession.ID?
     @Published var snapshotSessionSearch = ""
-    @Published var sessions: [CodexSession] = []
+    @Published var sessions: [CodexSession] = [] {
+        didSet {
+            recomputeVisibleSessions()
+        }
+    }
+    @Published private(set) var visibleSessions: [CodexSession] = []
     @Published var selectedSessionID: CodexSession.ID?
     @Published var checkedSessionIDs: Set<CodexSession.ID> = []
     @Published var checkedSnapshotIDs: Set<SnapshotMeta.ID> = []
     @Published var checkedSnapshotSessionIDs: Set<CodexSession.ID> = []
     @Published var sessionSearchInput = ""
-    @Published var sessionSearch = ""
-    @Published var showArchivedSessions = true
+    @Published var sessionSearch = "" {
+        didSet {
+            recomputeVisibleSessions()
+        }
+    }
+    @Published var showArchivedSessions = true {
+        didSet {
+            recomputeVisibleSessions()
+        }
+    }
     @Published var snapshotFilter: SnapshotFilter = .all
     @Published var snapshotRestoreSource: SnapshotRestoreSource = .snapshots
     @Published var incrementalBackupCandidates: [IncrementalRestoreCandidate] = []
@@ -464,20 +477,30 @@ final class VaultModel: ObservableObject {
     }
 
     var filteredSessions: [CodexSession] {
+        visibleSessions
+    }
+
+    private func recomputeVisibleSessions() {
         let query = sessionSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return sessions.filter { session in
-            guard showArchivedSessions || !session.archived else { return false }
-            guard !query.isEmpty else { return true }
-            return [
-                session.id,
-                session.title,
-                session.cwd,
-                session.modelProvider,
-                session.model,
-                session.source,
-                session.rolloutPath
-            ].contains { $0.lowercased().contains(query) }
+        let nextSessions = sessions.filter { session in
+            sessionMatchesVisibleFilter(session, query: query)
         }
+        guard nextSessions != visibleSessions else { return }
+        visibleSessions = nextSessions
+    }
+
+    private func sessionMatchesVisibleFilter(_ session: CodexSession, query: String) -> Bool {
+        guard showArchivedSessions || !session.archived else { return false }
+        guard !query.isEmpty else { return true }
+        return [
+            session.id,
+            session.title,
+            session.cwd,
+            session.modelProvider,
+            session.model,
+            session.source,
+            session.rolloutPath
+        ].contains { $0.lowercased().contains(query) }
     }
 
     func refresh() {
@@ -488,9 +511,9 @@ final class VaultModel: ObservableObject {
             sessions = try loadSessions()
             snapshots = try loadSnapshots()
             if selectedSessionID == nil {
-                selectedSessionID = filteredSessions.first?.id ?? sessions.first?.id
+                selectedSessionID = visibleSessions.first?.id ?? sessions.first?.id
             } else if !sessions.contains(where: { $0.id == selectedSessionID }) {
-                selectedSessionID = filteredSessions.first?.id ?? sessions.first?.id
+                selectedSessionID = visibleSessions.first?.id ?? sessions.first?.id
             }
             selectFirstVisibleSnapshotIfNeeded()
             checkedSessionIDs = checkedSessionIDs.intersection(Set(sessions.map(\.id)))
@@ -649,10 +672,10 @@ final class VaultModel: ObservableObject {
     }
 
     func selectFirstVisibleSessionIfNeeded() {
-        if let selectedSessionID, filteredSessions.contains(where: { $0.id == selectedSessionID }) {
+        if let selectedSessionID, visibleSessions.contains(where: { $0.id == selectedSessionID }) {
             return
         }
-        selectedSessionID = filteredSessions.first?.id
+        selectedSessionID = visibleSessions.first?.id
     }
 
     func toggleCheckedSession(_ session: CodexSession) {
@@ -664,7 +687,7 @@ final class VaultModel: ObservableObject {
     }
 
     func checkAllVisibleSessions() {
-        checkedSessionIDs.formUnion(filteredSessions.map(\.id))
+        checkedSessionIDs.formUnion(visibleSessions.map(\.id))
     }
 
     func clearCheckedSessions() {
@@ -4868,7 +4891,7 @@ struct SessionsPane: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    CountBadge(value: "\(model.filteredSessions.count) / \(model.sessions.count)")
+                    CountBadge(value: "\(model.visibleSessions.count) / \(model.sessions.count)")
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
@@ -4898,7 +4921,7 @@ struct SessionsPane: View {
                             Button("清空选择") { model.clearCheckedSessions() }
                         }
                         Button("全选可见") { model.checkAllVisibleSessions() }
-                            .disabled(model.filteredSessions.isEmpty)
+                            .disabled(model.visibleSessions.isEmpty)
                         if !model.checkedSessionIDs.isEmpty {
                             Button("删除选中 \(model.checkedSessionIDs.count)", role: .destructive) {
                                 model.deleteCheckedSessions()
@@ -4926,7 +4949,7 @@ struct SessionsPane: View {
                         .stroke(.white.opacity(0.9), lineWidth: 1)
                 )
 
-                if model.filteredSessions.isEmpty {
+                if model.visibleSessions.isEmpty {
                     ContentUnavailableView(
                         "没有匹配会话",
                         systemImage: "magnifyingglass",
@@ -4935,7 +4958,7 @@ struct SessionsPane: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     List(selection: $model.selectedSessionID) {
-                        ForEach(model.filteredSessions) { session in
+                        ForEach(model.visibleSessions) { session in
                             HStack(spacing: 10) {
                                 Button {
                                     model.toggleCheckedSession(session)
