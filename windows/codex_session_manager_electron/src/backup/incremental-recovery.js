@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const { assertSafeSourcePath } = require('./restore-filesystem');
 
 function safePathComponent(value) {
   const safe = String(value || '')
@@ -31,7 +32,7 @@ function backupPathParts(backupPath) {
   return String(backupPath || '').split(/[\\/]+/);
 }
 
-function resolveBackupFile(paths, record) {
+function resolveBackupFile(paths, record, { requireExisting = false } = {}) {
   const backupPath = String(record.backupPath || '');
   if (!backupPath) throw new Error(`Backup path for session ${record.sessionId} is empty`);
   if (path.isAbsolute(backupPath)) {
@@ -53,7 +54,16 @@ function resolveBackupFile(paths, record) {
     throw new Error(`Backup path for session ${record.sessionId} escapes backup root: ${backupPath}`);
   }
 
-  return filePath;
+  const resolvedFile = assertSafeSourcePath(filePath, paths.backupRoot, { allowMissing: !requireExisting });
+  if (existsSync(filePath)) {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || path.extname(filePath).toLowerCase() !== '.jsonl') {
+      throw new Error(`Backup path for session ${record.sessionId} is not a regular JSONL file: ${backupPath}`);
+    }
+  } else if (requireExisting) {
+    throw new Error(`Backup file is missing for session ${record.sessionId}: ${filePath}`);
+  }
+  return resolvedFile;
 }
 
 async function readManifest(paths) {
@@ -134,6 +144,10 @@ async function buildIncrementalRecoveryPackage({ paths, sessionIds, now = () => 
 
   if (!records.length) throw new Error('No requested sessions were found in the backup manifest.');
 
+  const backupSources = records.map((record) => ({
+    record,
+    backupFilePath: resolveBackupFile(paths, record, { requireExisting: true }),
+  }));
   const createdAt = now();
   const packagePath = await uniquePackagePath(paths, createdAt);
   const dataPath = path.join(packagePath, 'data');
@@ -143,8 +157,11 @@ async function buildIncrementalRecoveryPackage({ paths, sessionIds, now = () => 
   const includedPaths = ['session_index.jsonl', 'sessions'];
   const indexLines = [];
   const recoveredFiles = {};
-  for (const record of records) {
-    const backupFilePath = resolveBackupFile(paths, record);
+  for (const { record, backupFilePath: validatedBackupFilePath } of backupSources) {
+    const backupFilePath = resolveBackupFile(paths, record, { requireExisting: true });
+    if (backupFilePath !== validatedBackupFilePath) {
+      throw new Error(`Backup path for session ${record.sessionId} changed during recovery packaging.`);
+    }
     const filename = `${safePathComponent(record.sessionId)}.jsonl`;
     const recoveredRelativePath = path.join('sessions', 'recovered', filename);
     const recoveredPath = path.join(recoveredRoot, filename);

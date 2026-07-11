@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const fsSync = require('node:fs');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -158,4 +159,49 @@ test('missing backup file is visible but not restorable', async (t) => {
   assert.equal(candidate.status, 'backupFileMissing');
   assert.equal(candidate.isRestorable, false);
   assert.match(candidate.error, /Backup file is missing/);
+});
+
+test('catalog and package reject backup files reached through symlinks', async (t) => {
+  const { root, paths } = await makeFixture(t);
+  const outsideRoot = path.join(root, 'outside');
+  const linkPath = path.join(paths.backupRoot, 'sessions', 'linked-outside');
+  await fs.mkdir(outsideRoot, { recursive: true });
+  await fs.mkdir(path.dirname(linkPath), { recursive: true });
+  await fs.writeFile(path.join(outsideRoot, 'secret.jsonl'), 'outside-secret\n');
+  await fs.symlink(outsideRoot, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+  await writeManifest(paths, {
+    escaped: record('escaped', path.join('sessions', 'linked-outside', 'secret.jsonl')),
+  });
+
+  const catalog = await loadIncrementalBackupCatalog({ paths, currentSessionIds: new Set() });
+  assert.equal(catalog.candidates[0].status, 'invalidBackup');
+  assert.equal(catalog.candidates[0].isRestorable, false);
+  await assert.rejects(
+    buildIncrementalRecoveryPackage({ paths, sessionIds: ['escaped'] }),
+    (error) => error.code === 'INVALID_SNAPSHOT_PATH'
+  );
+});
+
+test('package revalidates a backup source changed after cataloging', async (t) => {
+  const { root, paths } = await makeFixture(t);
+  const sessionsRoot = path.join(paths.backupRoot, 'sessions');
+  const outsideRoot = path.join(root, 'outside');
+  await fs.mkdir(sessionsRoot, { recursive: true });
+  await fs.mkdir(outsideRoot, { recursive: true });
+  await fs.writeFile(path.join(sessionsRoot, 'selected.jsonl'), 'safe\n');
+  await fs.writeFile(path.join(outsideRoot, 'selected.jsonl'), 'outside\n');
+  await writeManifest(paths, {
+    selected: record('selected', path.join('sessions', 'selected.jsonl')),
+  });
+
+  const catalog = await loadIncrementalBackupCatalog({ paths, currentSessionIds: new Set() });
+  assert.equal(catalog.candidates[0].isRestorable, true);
+  await fs.rm(sessionsRoot, { recursive: true, force: true });
+  await fs.symlink(outsideRoot, sessionsRoot, process.platform === 'win32' ? 'junction' : 'dir');
+
+  await assert.rejects(
+    buildIncrementalRecoveryPackage({ paths, sessionIds: ['selected'] }),
+    (error) => error.code === 'INVALID_SNAPSHOT_PATH'
+  );
+  assert.equal(fsSync.existsSync(path.join(paths.backupRoot, 'recovery-packages')), false);
 });

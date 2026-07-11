@@ -9,6 +9,7 @@ const { BackupAgent } = require('./backup/backup-agent');
 const {
   buildIncrementalRecoveryPackage,
   loadIncrementalBackupCatalog,
+  resolveBackupFile,
 } = require('./backup/incremental-recovery');
 const {
   ensureRecoveredThreadsInStateDatabase,
@@ -22,6 +23,13 @@ const {
   replaceStateDatabase: replaceLiveStateDatabase,
 } = require('./backup/live-state-database');
 const { validateRestorePaths } = require('./backup/restore-paths');
+const {
+  assertSafeDestinationPath,
+  assertSafeSourcePath,
+  copyRestoreEntry,
+  mergeRestoreDirectory,
+  validateRestoreFilesystem,
+} = require('./backup/restore-filesystem');
 const {
   createTrustedIpcRegistrar,
   installNavigationGuards,
@@ -1114,11 +1122,16 @@ function removeLinesContaining(targetPath, needle) {
 function restoreShellSnapshots(sessionId, dataPath) {
   const sourceDir = path.join(dataPath, 'shell_snapshots');
   if (!exists(sourceDir)) return;
+  assertSafeSourcePath(sourceDir, dataPath, { recursive: true });
   const files = walkFiles(sourceDir, (filePath) => path.basename(filePath).includes(sessionId));
   for (const filePath of files) {
     const destination = path.join(codexRoot, 'shell_snapshots', path.basename(filePath));
-    ensureDir(path.dirname(destination));
-    fs.copyFileSync(filePath, destination);
+    copyRestoreEntry({
+      sourcePath: filePath,
+      destinationPath: destination,
+      sourceRoot: dataPath,
+      destinationRoot: codexRoot,
+    });
   }
 }
 
@@ -1276,11 +1289,20 @@ async function restoreConversationsOnly(snapshot) {
 
   for (const relativePath of conversationDirectoryPaths) {
     if (!included.has(relativePath)) continue;
-    mergeDirectory(path.join(snapshot.dataPath, relativePath), path.join(codexRoot, relativePath));
+    const sourcePath = path.join(snapshot.dataPath, relativePath);
+    if (!exists(sourcePath)) continue;
+    mergeRestoreDirectory({
+      sourcePath,
+      destinationPath: path.join(codexRoot, relativePath),
+      sourceRoot: snapshot.dataPath,
+      destinationRoot: codexRoot,
+    });
   }
 
   for (const relativePath of conversationLineMergePaths) {
     if (!included.has(relativePath)) continue;
+    assertSafeSourcePath(path.join(snapshot.dataPath, relativePath), snapshot.dataPath, { allowMissing: true });
+    assertSafeDestinationPath(path.join(codexRoot, relativePath), codexRoot);
     mergeLineFile(
       path.join(snapshot.dataPath, relativePath),
       path.join(codexRoot, relativePath),
@@ -1290,12 +1312,21 @@ async function restoreConversationsOnly(snapshot) {
   }
 
   if (included.has('state_5.sqlite')) {
-    const message = await mergeStateDatabase(
+    const sourceDatabasePath = assertSafeSourcePath(
       path.join(snapshot.dataPath, 'state_5.sqlite'),
+      snapshot.dataPath,
+      { allowMissing: true }
+    );
+    const destinationDatabasePath = assertSafeDestinationPath(
       path.join(codexRoot, 'state_5.sqlite'),
+      codexRoot
+    );
+    const message = await mergeStateDatabase(
+      sourceDatabasePath,
+      destinationDatabasePath,
       restorableSessionIds
     );
-    if (restorableSessionIds) await repairStateDatabaseFileRolloutPaths(path.join(codexRoot, 'state_5.sqlite'), codexRoot, restorableSessionIds);
+    if (restorableSessionIds) await repairStateDatabaseFileRolloutPaths(destinationDatabasePath, codexRoot, restorableSessionIds);
     return message;
   }
   return 'SQLite 索引未合并：快照不包含 state_5.sqlite。';
@@ -1317,7 +1348,8 @@ async function recoveredThreadEntriesFromIncrementalRecovery(catalog, recovery, 
 async function repairRecoveredThreadIndexFromIncrementalRecovery(catalog, recovery, sessionIds) {
   try {
     const entries = await recoveredThreadEntriesFromIncrementalRecovery(catalog, recovery, sessionIds);
-    return await ensureRecoveredThreadsInStateDatabase(path.join(codexRoot, 'state_5.sqlite'), entries);
+    const databasePath = assertSafeDestinationPath(path.join(codexRoot, 'state_5.sqlite'), codexRoot);
+    return await ensureRecoveredThreadsInStateDatabase(databasePath, entries);
   } catch (error) {
     const message = `SQLite 索引未写入：${error.message || String(error)}`;
     return { insertedCount: 0, skippedCount: 0, warning: message, message };
@@ -1326,6 +1358,7 @@ async function repairRecoveredThreadIndexFromIncrementalRecovery(catalog, recove
 
 async function repairStateDatabaseFileRolloutPaths(databasePath, root, sessionIds) {
   if (!exists(databasePath)) return;
+  const safeDatabasePath = assertSafeDestinationPath(databasePath, root);
   const updates = [];
   for (const sessionId of sessionIds) {
     const rolloutPath = findRolloutFile(root, sessionId);
@@ -1337,13 +1370,18 @@ async function repairStateDatabaseFileRolloutPaths(databasePath, root, sessionId
       archived: relative ? relative.split(path.sep)[0] === 'archived_sessions' : null,
     });
   }
-  await repairLiveStateDatabaseRolloutPaths(databasePath, updates);
+  await repairLiveStateDatabaseRolloutPaths(safeDatabasePath, updates);
 }
 
 function validateSnapshotRestorePaths(snapshot) {
   if (!snapshot || !exists(snapshot.dataPath)) throw new Error('快照结构不完整，无法恢复。');
-  return validateRestorePaths({
+  const restorePaths = validateRestorePaths({
     includedPaths: snapshot.includedPaths || [],
+    sourceRoot: snapshot.dataPath,
+    destinationRoot: codexRoot,
+  });
+  return validateRestoreFilesystem({
+    restorePaths,
     sourceRoot: snapshot.dataPath,
     destinationRoot: codexRoot,
   });
@@ -1360,7 +1398,12 @@ async function restoreFull(snapshot) {
   for (const restorePath of validatedPaths) {
     if (stateDatabaseSnapshotPaths.has(restorePath.relativePath)) continue;
     if (!exists(restorePath.sourcePath)) continue;
-    copyReplacing(restorePath.sourcePath, restorePath.destinationPath);
+    copyRestoreEntry({
+      sourcePath: restorePath.sourcePath,
+      destinationPath: restorePath.destinationPath,
+      sourceRoot: snapshot.dataPath,
+      destinationRoot: codexRoot,
+    });
   }
 
   if (!restorableSessionIds) return;
@@ -1368,11 +1411,14 @@ async function restoreFull(snapshot) {
   const sourceDatabasePath = path.join(snapshot.dataPath, 'state_5.sqlite');
   const databasePath = path.join(codexRoot, 'state_5.sqlite');
   if (!exists(sourceDatabasePath)) throw new Error('快照结构不完整：state_5.sqlite 缺失。');
-  await replaceLiveStateDatabase(sourceDatabasePath, databasePath, restorableSessionIds);
-  await repairStateDatabaseFileRolloutPaths(databasePath, codexRoot, restorableSessionIds);
+  const safeSourceDatabasePath = assertSafeSourcePath(sourceDatabasePath, snapshot.dataPath);
+  const safeDatabasePath = assertSafeDestinationPath(databasePath, codexRoot);
+  await replaceLiveStateDatabase(safeSourceDatabasePath, safeDatabasePath, restorableSessionIds);
+  await repairStateDatabaseFileRolloutPaths(safeDatabasePath, codexRoot, restorableSessionIds);
 
   for (const relativePath of conversationLineMergePaths) {
     if (!included.has(relativePath)) continue;
+    assertSafeDestinationPath(path.join(codexRoot, relativePath), codexRoot);
     filterLineFile(
       path.join(codexRoot, relativePath),
       relativePath === 'session_index.jsonl' ? 'id' : null,
@@ -1601,6 +1647,7 @@ handleTrustedIpc('restore-snapshot-session', async (_event, snapshotId, sessionI
   if (!session.existsOnDisk) {
     throw new Error('这个快照只有会话索引，没有真实会话文件，无法恢复到 Codex 客户端。请选择包含会话文件的快照。');
   }
+  validateSnapshotRestorePaths(snapshot);
   await createRestoreProtectionSnapshot(
     'Pre-Single-Session Restore Backup',
     'pre-single-session-restore',
@@ -1614,18 +1661,31 @@ handleTrustedIpc('restore-snapshot-session', async (_event, snapshotId, sessionI
     throw new Error('这个快照里的会话文件路径无法映射到当前 Codex 数据目录。');
   }
   const relativePath = relativeFromDataRoot(snapshot.dataPath, snapshotFilePath);
-  copyReplacing(snapshotFilePath, path.join(codexRoot, relativePath));
+  copyRestoreEntry({
+    sourcePath: snapshotFilePath,
+    destinationPath: path.join(codexRoot, relativePath),
+    sourceRoot: snapshot.dataPath,
+    destinationRoot: codexRoot,
+  });
 
   for (const lineFile of conversationLineMergePaths) {
+    assertSafeSourcePath(path.join(snapshot.dataPath, lineFile), snapshot.dataPath, { allowMissing: true });
+    assertSafeDestinationPath(path.join(codexRoot, lineFile), codexRoot);
     mergeLinesContaining(path.join(snapshot.dataPath, lineFile), path.join(codexRoot, lineFile), sessionId);
   }
   restoreShellSnapshots(sessionId, snapshot.dataPath);
-  const sqliteMessage = await mergeSingleSessionStateDb(
+  const snapshotDatabasePath = assertSafeSourcePath(
     path.join(snapshot.dataPath, 'state_5.sqlite'),
-    path.join(codexRoot, 'state_5.sqlite'),
+    snapshot.dataPath,
+    { allowMissing: true }
+  );
+  const destinationDatabasePath = assertSafeDestinationPath(path.join(codexRoot, 'state_5.sqlite'), codexRoot);
+  const sqliteMessage = await mergeSingleSessionStateDb(
+    snapshotDatabasePath,
+    destinationDatabasePath,
     sessionId
   );
-  await repairStateDatabaseFileRolloutPaths(path.join(codexRoot, 'state_5.sqlite'), codexRoot, new Set([sessionId]));
+  await repairStateDatabaseFileRolloutPaths(destinationDatabasePath, codexRoot, new Set([sessionId]));
   return { ok: true, message: `已恢复单个会话：${session.title || session.id}。${sqliteMessage}` };
 });
 
@@ -1636,6 +1696,7 @@ handleTrustedIpc('restore-snapshot-sessions', async (_event, snapshotId, session
   if (!idSet.size) throw new Error('没有选择要恢复的会话。');
   const sessions = (await loadSessionsInSnapshot(snapshot)).filter((item) => idSet.has(item.id) && item.existsOnDisk);
   if (!sessions.length) throw new Error('没有可恢复的会话文件。');
+  validateSnapshotRestorePaths(snapshot);
 
   await createRestoreProtectionSnapshot(
     'Pre-Batch-Session Restore Backup',
@@ -1645,23 +1706,36 @@ handleTrustedIpc('restore-snapshot-sessions', async (_event, snapshotId, session
     conversationBackupCandidates
   );
   const restoredIds = new Set();
+  const snapshotDatabasePath = assertSafeSourcePath(
+    path.join(snapshot.dataPath, 'state_5.sqlite'),
+    snapshot.dataPath,
+    { allowMissing: true }
+  );
+  const destinationDatabasePath = assertSafeDestinationPath(path.join(codexRoot, 'state_5.sqlite'), codexRoot);
   for (const session of sessions) {
     const snapshotFilePath = snapshotFilePathForSession(snapshot, session);
     if (!snapshotFilePath || !exists(snapshotFilePath)) continue;
     const relativePath = relativeFromDataRoot(snapshot.dataPath, snapshotFilePath);
-    copyReplacing(snapshotFilePath, path.join(codexRoot, relativePath));
+    copyRestoreEntry({
+      sourcePath: snapshotFilePath,
+      destinationPath: path.join(codexRoot, relativePath),
+      sourceRoot: snapshot.dataPath,
+      destinationRoot: codexRoot,
+    });
     for (const lineFile of conversationLineMergePaths) {
+      assertSafeSourcePath(path.join(snapshot.dataPath, lineFile), snapshot.dataPath, { allowMissing: true });
+      assertSafeDestinationPath(path.join(codexRoot, lineFile), codexRoot);
       mergeLinesContaining(path.join(snapshot.dataPath, lineFile), path.join(codexRoot, lineFile), session.id);
     }
     restoreShellSnapshots(session.id, snapshot.dataPath);
     await mergeSingleSessionStateDb(
-      path.join(snapshot.dataPath, 'state_5.sqlite'),
-      path.join(codexRoot, 'state_5.sqlite'),
+      snapshotDatabasePath,
+      destinationDatabasePath,
       session.id
     );
     restoredIds.add(session.id);
   }
-  await repairStateDatabaseFileRolloutPaths(path.join(codexRoot, 'state_5.sqlite'), codexRoot, restoredIds);
+  await repairStateDatabaseFileRolloutPaths(destinationDatabasePath, codexRoot, restoredIds);
   return { ok: true, message: `已从 ${snapshot.name} 批量恢复 ${restoredIds.size} 个会话。` };
 });
 
@@ -1678,6 +1752,12 @@ handleTrustedIpc('restore-incremental-backup-sessions', async (_event, sessionId
     .map((candidate) => candidate.sessionId)
     .sort();
   if (!restorableIds.length) throw new Error('选中的备份会话都已存在或不可恢复。');
+  for (const candidate of catalog.candidates.filter((item) => restorableIds.includes(item.sessionId))) {
+    resolveBackupFile(localBackupPaths, candidate.backupRecord, { requireExisting: true });
+  }
+  assertSafeDestinationPath(path.join(codexRoot, 'sessions'), codexRoot, { recursive: true });
+  assertSafeDestinationPath(path.join(codexRoot, 'session_index.jsonl'), codexRoot);
+  assertSafeDestinationPath(path.join(codexRoot, 'state_5.sqlite'), codexRoot);
 
   const mode = normalizeRestoreProtectionMode(protectionMode);
   await createRestoreProtectionSnapshot(
@@ -1732,6 +1812,7 @@ handleTrustedIpc('restore-session', async (_event, sessionId, protectionMode = '
   if (!session) throw new Error('没有找到当前会话。');
   const match = findLatestSnapshotRollout(sessionId);
   if (!match) throw new Error('快照库里没有包含这条会话的记录。');
+  validateSnapshotRestorePaths(match.snapshot);
   await createRestoreProtectionSnapshot(
     'Pre-Single-Session Restore Backup',
     'pre-single-session-restore',
@@ -1742,18 +1823,30 @@ handleTrustedIpc('restore-session', async (_event, sessionId, protectionMode = '
 
   const relative = relativeFromDataRoot(match.snapshot.dataPath, match.rolloutPath);
   const destination = path.join(codexRoot, relative);
-  ensureDir(path.dirname(destination));
-  fs.copyFileSync(match.rolloutPath, destination);
+  copyRestoreEntry({
+    sourcePath: match.rolloutPath,
+    destinationPath: destination,
+    sourceRoot: match.snapshot.dataPath,
+    destinationRoot: codexRoot,
+  });
   for (const lineFile of ['history.jsonl', 'history.jsonl.bak', 'session_index.jsonl']) {
+    assertSafeSourcePath(path.join(match.snapshot.dataPath, lineFile), match.snapshot.dataPath, { allowMissing: true });
+    assertSafeDestinationPath(path.join(codexRoot, lineFile), codexRoot);
     mergeLinesContaining(path.join(match.snapshot.dataPath, lineFile), path.join(codexRoot, lineFile), sessionId);
   }
   restoreShellSnapshots(sessionId, match.snapshot.dataPath);
-  const sqliteMessage = await mergeSingleSessionStateDb(
+  const snapshotDatabasePath = assertSafeSourcePath(
     path.join(match.snapshot.dataPath, 'state_5.sqlite'),
-    path.join(codexRoot, 'state_5.sqlite'),
+    match.snapshot.dataPath,
+    { allowMissing: true }
+  );
+  const destinationDatabasePath = assertSafeDestinationPath(path.join(codexRoot, 'state_5.sqlite'), codexRoot);
+  const sqliteMessage = await mergeSingleSessionStateDb(
+    snapshotDatabasePath,
+    destinationDatabasePath,
     sessionId
   );
-  await repairStateDatabaseFileRolloutPaths(path.join(codexRoot, 'state_5.sqlite'), codexRoot, new Set([sessionId]));
+  await repairStateDatabaseFileRolloutPaths(destinationDatabasePath, codexRoot, new Set([sessionId]));
   return { ok: true, message: `已从 ${match.snapshot.name} 恢复：${session.title}。${sqliteMessage}` };
 });
 
