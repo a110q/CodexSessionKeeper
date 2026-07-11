@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { pathToFileURL } = require('node:url');
 const { backupPaths } = require('./backup/paths');
 const { BackupAgent } = require('./backup/backup-agent');
 const {
@@ -21,6 +22,11 @@ const {
   replaceStateDatabase: replaceLiveStateDatabase,
 } = require('./backup/live-state-database');
 const { validateRestorePaths } = require('./backup/restore-paths');
+const {
+  createTrustedIpcRegistrar,
+  installNavigationGuards,
+  resolveTrustedSessionFile,
+} = require('./security');
 
 let mainWindow;
 let sqlPromise;
@@ -32,6 +38,13 @@ const snapshotRoot = path.join(vaultRoot, 'snapshots');
 const settingsPath = path.join(vaultRoot, 'settings.json');
 const localBackupPaths = backupPaths(os.homedir());
 const localBackupAgent = new BackupAgent({ paths: localBackupPaths });
+const applicationPagePath = path.join(__dirname, 'index.html');
+const applicationPageURL = pathToFileURL(applicationPagePath).href;
+const handleTrustedIpc = createTrustedIpcRegistrar({
+  ipcMain,
+  getMainWindow: () => mainWindow,
+  expectedURL: applicationPageURL,
+});
 
 const backupCandidates = [
   'config.toml',
@@ -104,11 +117,13 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true
     }
   });
 
-  mainWindow.loadFile(path.join(__dirname, 'index.html'));
+  installNavigationGuards(mainWindow.webContents, applicationPageURL);
+  mainWindow.loadFile(applicationPagePath);
 }
 
 app.whenReady().then(createWindow);
@@ -1478,22 +1493,22 @@ async function deleteSessionArtifacts(session) {
   return deleteSingleSessionStateDb(path.join(codexRoot, 'state_5.sqlite'), session.id);
 }
 
-ipcMain.handle('load-state', async () => loadState());
+handleTrustedIpc('load-state', async () => loadState());
 
-ipcMain.handle('load-backup-status', async () => readBackupStatus());
+handleTrustedIpc('load-backup-status', async () => readBackupStatus());
 
-ipcMain.handle('load-incremental-backup-sessions', async () => {
+handleTrustedIpc('load-incremental-backup-sessions', async () => {
   return loadIncrementalBackupCatalog({
     paths: localBackupPaths,
     currentSessionIds: await currentSessionIds(),
   });
 });
 
-ipcMain.handle('set-auto-restore', async (_event, enabled) => {
+handleTrustedIpc('set-auto-restore', async (_event, enabled) => {
   return { ok: true, settings: saveSettings({ autoRestoreOnLaunch: Boolean(enabled) }) };
 });
 
-ipcMain.handle('create-snapshot', async (_event, name) => {
+handleTrustedIpc('create-snapshot', async (_event, name) => {
   const meta = await createSnapshot(name, 'manual', backupCandidates);
   const warning = (meta.warnings || []).filter(Boolean).join('\n');
   return {
@@ -1502,20 +1517,20 @@ ipcMain.handle('create-snapshot', async (_event, name) => {
   };
 });
 
-ipcMain.handle('load-snapshot-sessions', async (_event, snapshotId) => {
+handleTrustedIpc('load-snapshot-sessions', async (_event, snapshotId) => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
   return loadSessionsInSnapshot(snapshot);
 });
 
-ipcMain.handle('open-snapshot', async (_event, snapshotId) => {
+handleTrustedIpc('open-snapshot', async (_event, snapshotId) => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
   if (exists(snapshot.path)) await shell.openPath(snapshot.path);
   return { ok: true };
 });
 
-ipcMain.handle('choose-restore-protection-mode', async (event, options = {}) => {
+handleTrustedIpc('choose-restore-protection-mode', async (event, options = {}) => {
   const defaultMode = normalizeRestoreProtectionMode(options.defaultMode, 'lightweight');
   const lightButton = '轻量保护点，推荐';
   const fullButton = '完整保护点';
@@ -1538,7 +1553,7 @@ ipcMain.handle('choose-restore-protection-mode', async (event, options = {}) => 
   return defaultMode === 'full' ? 'lightweight' : 'full';
 });
 
-ipcMain.handle('restore-snapshot-conversations', async (_event, snapshotId, protectionMode = 'lightweight') => {
+handleTrustedIpc('restore-snapshot-conversations', async (_event, snapshotId, protectionMode = 'lightweight') => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
   validateSnapshotRestorePaths(snapshot);
@@ -1557,7 +1572,7 @@ ipcMain.handle('restore-snapshot-conversations', async (_event, snapshotId, prot
   };
 });
 
-ipcMain.handle('restore-snapshot-full', async (_event, snapshotId, protectionMode = 'full') => {
+handleTrustedIpc('restore-snapshot-full', async (_event, snapshotId, protectionMode = 'full') => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
   validateSnapshotRestorePaths(snapshot);
@@ -1577,7 +1592,7 @@ ipcMain.handle('restore-snapshot-full', async (_event, snapshotId, protectionMod
   return { ok: true, message: `已完整恢复快照：${snapshot.name}。请重启 Codex。` };
 });
 
-ipcMain.handle('restore-snapshot-session', async (_event, snapshotId, sessionId, protectionMode = 'lightweight') => {
+handleTrustedIpc('restore-snapshot-session', async (_event, snapshotId, sessionId, protectionMode = 'lightweight') => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
   const sessions = await loadSessionsInSnapshot(snapshot);
@@ -1614,7 +1629,7 @@ ipcMain.handle('restore-snapshot-session', async (_event, snapshotId, sessionId,
   return { ok: true, message: `已恢复单个会话：${session.title || session.id}。${sqliteMessage}` };
 });
 
-ipcMain.handle('restore-snapshot-sessions', async (_event, snapshotId, sessionIds, protectionMode = 'lightweight') => {
+handleTrustedIpc('restore-snapshot-sessions', async (_event, snapshotId, sessionIds, protectionMode = 'lightweight') => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
   const idSet = new Set(Array.isArray(sessionIds) ? sessionIds.map(String) : []);
@@ -1650,7 +1665,7 @@ ipcMain.handle('restore-snapshot-sessions', async (_event, snapshotId, sessionId
   return { ok: true, message: `已从 ${snapshot.name} 批量恢复 ${restoredIds.size} 个会话。` };
 });
 
-ipcMain.handle('restore-incremental-backup-sessions', async (_event, sessionIds, protectionMode = 'lightweight') => {
+handleTrustedIpc('restore-incremental-backup-sessions', async (_event, sessionIds, protectionMode = 'lightweight') => {
   const selectedIds = new Set(Array.isArray(sessionIds) ? sessionIds.map(String) : []);
   if (!selectedIds.size) throw new Error('没有选择要从备份恢复的会话。');
 
@@ -1693,14 +1708,14 @@ ipcMain.handle('restore-incremental-backup-sessions', async (_event, sessionIds,
   };
 });
 
-ipcMain.handle('delete-snapshot', async (_event, snapshotId) => {
+handleTrustedIpc('delete-snapshot', async (_event, snapshotId) => {
   const snapshot = getSnapshotById(snapshotId);
   if (!snapshot) throw new Error('没有找到快照。');
   fs.rmSync(snapshot.path, { recursive: true, force: true });
   return { ok: true, message: `快照已删除：${snapshot.name}` };
 });
 
-ipcMain.handle('delete-snapshots', async (_event, snapshotIds) => {
+handleTrustedIpc('delete-snapshots', async (_event, snapshotIds) => {
   const ids = Array.isArray(snapshotIds) ? snapshotIds : [];
   if (!ids.length) throw new Error('没有选择要删除的快照。');
   const idSet = new Set(ids);
@@ -1712,7 +1727,7 @@ ipcMain.handle('delete-snapshots', async (_event, snapshotIds) => {
   return { ok: true, message: `已删除 ${snapshots.length} 个快照` };
 });
 
-ipcMain.handle('restore-session', async (_event, sessionId, protectionMode = 'lightweight') => {
+handleTrustedIpc('restore-session', async (_event, sessionId, protectionMode = 'lightweight') => {
   const session = await getSessionById(sessionId);
   if (!session) throw new Error('没有找到当前会话。');
   const match = findLatestSnapshotRollout(sessionId);
@@ -1742,7 +1757,7 @@ ipcMain.handle('restore-session', async (_event, sessionId, protectionMode = 'li
   return { ok: true, message: `已从 ${match.snapshot.name} 恢复：${session.title}。${sqliteMessage}` };
 });
 
-ipcMain.handle('delete-session', async (_event, sessionId) => {
+handleTrustedIpc('delete-session', async (_event, sessionId) => {
   const session = await getSessionById(sessionId);
   if (!session) throw new Error('没有找到当前会话。');
   await createSessionProtectionSnapshot('Pre-Delete Session Backup', 'pre-delete-session', [session]);
@@ -1750,7 +1765,7 @@ ipcMain.handle('delete-session', async (_event, sessionId) => {
   return { ok: true, message: `会话已删除：${session.title}。${sqliteMessage}` };
 });
 
-ipcMain.handle('delete-sessions', async (_event, sessionIds) => {
+handleTrustedIpc('delete-sessions', async (_event, sessionIds) => {
   const ids = Array.isArray(sessionIds) ? sessionIds : [];
   if (!ids.length) throw new Error('没有选择要删除的会话。');
   const idSet = new Set(ids);
@@ -1765,24 +1780,33 @@ ipcMain.handle('delete-sessions', async (_event, sessionIds) => {
   return { ok: true, message: `已删除 ${sessions.length} 个会话。${sqliteSummary}` };
 });
 
-ipcMain.handle('load-conversation', async (_event, sessionId) => {
+handleTrustedIpc('load-conversation', async (_event, sessionId) => {
   const session = await getSessionById(sessionId);
   return loadConversationMessages(session);
 });
 
-ipcMain.handle('open-path', async (_event, targetPath) => {
-  if (targetPath && exists(targetPath)) await shell.openPath(targetPath);
+handleTrustedIpc('open-session-file', async (_event, sessionId) => {
+  const session = await getSessionById(sessionId);
+  if (!session) throw new Error('没有找到当前会话。');
+  const sessionFile = resolveTrustedSessionFile(session.rolloutPath, codexRoot);
+  const error = await shell.openPath(sessionFile);
+  if (error) throw new Error(`打开会话文件失败：${error}`);
+  return { ok: true };
 });
 
-ipcMain.handle('reveal-path', async (_event, targetPath) => {
-  if (targetPath && exists(targetPath)) shell.showItemInFolder(targetPath);
+handleTrustedIpc('reveal-session-file', async (_event, sessionId) => {
+  const session = await getSessionById(sessionId);
+  if (!session) throw new Error('没有找到当前会话。');
+  const sessionFile = resolveTrustedSessionFile(session.rolloutPath, codexRoot);
+  shell.showItemInFolder(sessionFile);
+  return { ok: true };
 });
 
-ipcMain.handle('open-codex-root', async () => {
+handleTrustedIpc('open-codex-root', async () => {
   if (exists(codexRoot)) await shell.openPath(codexRoot);
 });
 
-ipcMain.handle('open-vault-root', async () => {
+handleTrustedIpc('open-vault-root', async () => {
   ensureDir(vaultRoot);
   await shell.openPath(vaultRoot);
 });

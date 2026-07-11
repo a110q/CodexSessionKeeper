@@ -1101,8 +1101,8 @@ async function runSessionAction(action, session) {
   if (!session) return;
   try {
     if (action === 'view') await openConversation(session);
-    if (action === 'open') await window.codexManager.openPath(session.rolloutPath);
-    if (action === 'reveal') await window.codexManager.revealPath(session.rolloutPath);
+    if (action === 'open') await window.codexManager.openSessionFile(session.id);
+    if (action === 'reveal') await window.codexManager.revealSessionFile(session.id);
     if (action === 'restore') {
       const protectionMode = await chooseRestoreProtectionMode(
         '从最近快照恢复这个会话？',
@@ -1521,11 +1521,11 @@ els.modal.addEventListener('click', (event) => {
 });
 els.conversationOpenFile.addEventListener('click', async () => {
   const session = state.sessions.find((item) => item.id === state.conversationSessionId);
-  if (session) await window.codexManager.openPath(session.rolloutPath);
+  if (session) await window.codexManager.openSessionFile(session.id);
 });
 els.conversationRevealFile.addEventListener('click', async () => {
   const session = state.sessions.find((item) => item.id === state.conversationSessionId);
-  if (session) await window.codexManager.revealPath(session.rolloutPath);
+  if (session) await window.codexManager.revealSessionFile(session.id);
 });
 
 window.addEventListener('beforeunload', stopBackupStatusPolling);

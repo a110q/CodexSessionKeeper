@@ -20,8 +20,8 @@ contextBridge.exposeInMainWorld('codexManager', {
   deleteSession: (sessionId) => ipcRenderer.invoke('delete-session', sessionId),
   deleteSessions: (sessionIds) => ipcRenderer.invoke('delete-sessions', sessionIds),
   loadConversation: (sessionId) => ipcRenderer.invoke('load-conversation', sessionId),
-  openPath: (targetPath) => ipcRenderer.invoke('open-path', targetPath),
-  revealPath: (targetPath) => ipcRenderer.invoke('reveal-path', targetPath),
+  openSessionFile: (sessionId) => ipcRenderer.invoke('open-session-file', sessionId),
+  revealSessionFile: (sessionId) => ipcRenderer.invoke('reveal-session-file', sessionId),
   openCodexRoot: () => ipcRenderer.invoke('open-codex-root'),
   openVaultRoot: () => ipcRenderer.invoke('open-vault-root')
 });
