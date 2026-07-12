@@ -55,7 +55,7 @@ public struct BackupManifest: Codable, Equatable, Sendable {
     public var sessions: [String: BackupSessionRecord]
 
     public init(
-        version: Int = 1,
+        version: Int = 2,
         codexRoot: String,
         backupRoot: String,
         createdAt: Date,

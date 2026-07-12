@@ -40,39 +40,10 @@ enum NASJSONFile {
         fileManager: FileManager,
         createParentDirectories: Bool = true
     ) throws {
-        let parent = destination.deletingLastPathComponent()
-        if createParentDirectories {
-            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
-        } else {
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: parent.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                throw CocoaError(.fileNoSuchFile)
-            }
-        }
-        let temporary = parent.appendingPathComponent(".\(destination.lastPathComponent).tmp-\(UUID().uuidString)")
-        guard fileManager.createFile(atPath: temporary.path, contents: nil) else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-
-        do {
-            let handle = try FileHandle(forWritingTo: temporary)
-            do {
-                try handle.write(contentsOf: data)
-                try handle.synchronize()
-                try handle.close()
-            } catch {
-                try? handle.close()
-                throw error
-            }
-
-            if fileManager.fileExists(atPath: destination.path) {
-                _ = try fileManager.replaceItemAt(destination, withItemAt: temporary)
-            } else {
-                try fileManager.moveItem(at: temporary, to: destination)
-            }
-        } catch {
-            try? fileManager.removeItem(at: temporary)
-            throw error
-        }
+        try DurableAtomicWriter(fileManager: fileManager).write(
+            data,
+            to: destination,
+            createParentDirectories: createParentDirectories
+        )
     }
 }

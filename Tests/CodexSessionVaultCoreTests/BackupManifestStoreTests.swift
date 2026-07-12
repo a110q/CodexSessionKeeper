@@ -17,7 +17,7 @@ func manifestStoreCreatesDefaultManifestWhenFileIsMissing() throws {
     )
 
     #expect(manifest == BackupManifest(
-        version: 1,
+        version: 2,
         codexRoot: "/Users/alice/.codex",
         backupRoot: "/Users/alice/.codex-session-vault/incremental-backups",
         createdAt: now,
@@ -87,6 +87,31 @@ func manifestStoreCreatesParentDirectoryOnSave() throws {
     #expect(parentExists)
     #expect(isDirectory.boolValue)
     #expect(FileManager.default.fileExists(atPath: manifestURL.path))
+}
+
+@Test
+func manifestStoreRemoteModeDoesNotCreateMissingBackupRoot() throws {
+    let tempDirectory = makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: tempDirectory) }
+    let missingRoot = tempDirectory.appendingPathComponent("missing-nas-root", isDirectory: true)
+    let manifestURL = missingRoot.appendingPathComponent("manifest.json")
+    let store = BackupManifestStore(
+        manifestURL: manifestURL,
+        createParentDirectories: false
+    )
+    let now = Date(timeIntervalSince1970: 1_783_824_000)
+
+    do {
+        try store.save(BackupManifest(
+            codexRoot: "/Users/alice/.codex",
+            backupRoot: missingRoot.path,
+            createdAt: now,
+            updatedAt: now
+        ))
+        Issue.record("Expected missing NAS root to be rejected")
+    } catch {}
+
+    #expect(FileManager.default.fileExists(atPath: missingRoot.path) == false)
 }
 
 private func makeTemporaryDirectory() -> URL {
