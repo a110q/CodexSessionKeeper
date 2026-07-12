@@ -251,12 +251,12 @@ function readBackupStatus() {
   const runtime = nasRuntime.snapshot();
   const configuration = runtime.configuration;
   if (!configuration?.deviceId) {
-    return { status: runtime.state === 'unconfigured' ? 'waiting' : runtime.state, mode: 'polling', lastError: runtime.lastError };
+    return { status: runtime.state === 'unconfigured' ? 'waiting' : runtime.state, mode: 'polling', lastError: runtime.lastError, progress: runtime.progress };
   }
   const localStatusPath = path.join(vaultRoot, 'nas-state', configuration.deviceId, 'status.json');
   try {
     if (!exists(localStatusPath)) {
-      return { status: runtime.state, mode: 'polling', lastError: runtime.lastError };
+      return { status: runtime.state, mode: 'polling', lastError: runtime.lastError, progress: runtime.progress };
     }
     const localStatus = JSON.parse(readText(localStatusPath));
     const runtimeOwnsStatus = ['validating', 'disconnected', 'seeding', 'pending'].includes(runtime.state);
@@ -264,6 +264,7 @@ function readBackupStatus() {
       ...localStatus,
       status: runtimeOwnsStatus ? runtime.state : localStatus.status,
       lastError: runtime.lastError || localStatus.lastError || null,
+      progress: runtime.progress,
     };
   } catch (error) {
     return { status: 'error', mode: 'polling', lastError: error.message || String(error) };
@@ -1599,6 +1600,42 @@ async function resolveRecoveryDevicePaths(deviceId) {
   return pathsForNasTarget(target);
 }
 
+function publicRecoveryCatalog(catalog) {
+  return {
+    updatedAt: catalog.updatedAt,
+    totalCount: catalog.totalCount,
+    missingCount: catalog.missingCount,
+    existingCount: catalog.existingCount,
+    errorCount: catalog.errorCount,
+    candidates: (catalog.candidates || []).map((candidate) => ({
+      sessionId: candidate.sessionId,
+      title: candidate.title,
+      firstSeenAt: candidate.firstSeenAt,
+      lastBackedUpAt: candidate.lastBackedUpAt,
+      lineCount: candidate.lineCount,
+      bytesBackedUp: candidate.bytesBackedUp,
+      status: candidate.status,
+      isRestorable: candidate.isRestorable,
+      error: candidate.status === 'invalidBackup'
+        ? '备份记录路径不安全，已禁止恢复。'
+        : candidate.status === 'backupFileMissing'
+          ? '备份文件缺失，暂时无法恢复。'
+          : null,
+    })),
+  };
+}
+
+function lastBackupAtForDevice(device) {
+  const statusPath = path.join(device.backupRoot, 'status.json');
+  try {
+    const stats = fs.lstatSync(statusPath);
+    if (!stats.isFile() || stats.isSymbolicLink()) return null;
+    return JSON.parse(fs.readFileSync(statusPath, 'utf8')).lastBackupAt || null;
+  } catch {
+    return null;
+  }
+}
+
 async function deleteSessionArtifacts(session) {
   if (session.rolloutPath && exists(session.rolloutPath)) fs.rmSync(session.rolloutPath, { force: true });
   for (const dir of ['sessions', 'archived_sessions']) {
@@ -1655,15 +1692,17 @@ handleTrustedIpc('list-nas-backup-devices', async () => {
     deviceId: device.deviceId,
     deviceName: device.deviceName,
     isCurrent: device.deviceId === configuration.deviceId,
+    lastBackupAt: lastBackupAtForDevice(device),
   }));
 });
 
 handleTrustedIpc('load-incremental-backup-sessions', async (_event, deviceId) => {
   const selectedPaths = await resolveRecoveryDevicePaths(deviceId);
-  return loadIncrementalBackupCatalog({
+  const catalog = await loadIncrementalBackupCatalog({
     paths: selectedPaths,
     currentSessionIds: await currentSessionIds(),
   });
+  return publicRecoveryCatalog(catalog);
 });
 
 handleTrustedIpc('set-auto-restore', async (_event, enabled) => {

@@ -236,6 +236,10 @@ p {
   color: var(--danger);
 }
 
+.backup-status-text.working {
+  color: var(--blue);
+}
+
 .backup-status-text.waiting {
   color: var(--secondary);
 }
@@ -246,6 +250,20 @@ p {
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.backup-status-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.text-button {
+  padding: 0;
+  color: var(--blue);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 750;
 }
 
 .side-nav {
@@ -1083,6 +1101,127 @@ p {
   display: grid;
   place-items: center;
   background: rgba(0, 0, 0, 0.28);
+}
+
+.nas-setup-modal {
+  z-index: 95;
+  background: rgba(14, 24, 36, 0.48);
+  backdrop-filter: blur(10px);
+}
+
+.nas-setup-panel {
+  width: min(610px, calc(100vw - 48px));
+  display: grid;
+  gap: 18px;
+  padding: 30px;
+  border: 1px solid var(--separator);
+  border-radius: 22px;
+  background: var(--panel-bg-solid);
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.30);
+}
+
+.nas-setup-kicker {
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 850;
+  letter-spacing: 0.12em;
+}
+
+.nas-setup-panel h2 {
+  margin-top: -10px;
+  font-size: 26px;
+}
+
+.nas-setup-intro,
+.nas-setup-footnote,
+.nas-endpoint-card p {
+  color: var(--secondary);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.nas-endpoint-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 15px;
+  border: 1px solid var(--separator);
+  border-radius: 14px;
+  background: var(--card-bg);
+}
+
+.nas-endpoint-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 11px;
+  color: #fff;
+  background: linear-gradient(145deg, var(--blue), #37b8ff);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.nas-detection-badge {
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: var(--secondary);
+  background: var(--separator-soft);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.nas-detection-badge.connected {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.nas-setup-error {
+  padding: 11px 12px;
+  border-radius: 10px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.nas-setup-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.nas-setup-fields label {
+  display: grid;
+  gap: 7px;
+  color: var(--secondary);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.nas-target-preview {
+  display: grid;
+  gap: 6px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  background: var(--blue-soft);
+}
+
+.nas-target-preview span {
+  color: var(--secondary);
+  font-size: 11px;
+}
+
+.nas-target-preview strong {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.nas-setup-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
 .modal-panel {

@@ -27,9 +27,13 @@
       </div>
 
       <div class="backup-status-card">
-        <strong>本地增量备份</strong>
+        <strong>公司 NAS 会话备份</strong>
         <span id="backupStatusText" class="backup-status-text waiting">等待状态</span>
         <small id="backupStatusDetail">正在读取备份状态...</small>
+        <div class="backup-status-actions">
+          <button id="nasStatusRetryBtn" class="text-button hidden">重新检测</button>
+          <button id="nasReconfigureBtn" class="text-button hidden">重新配置</button>
+        </div>
       </div>
 
       <nav class="side-nav">
@@ -110,8 +114,9 @@
             <div class="filter-card">
               <select id="snapshotSource" class="search-input compact-select">
                 <option value="snapshots">快照</option>
-                <option value="backupRestore">备份恢复</option>
+                <option value="backupRestore">NAS 备份恢复</option>
               </select>
+              <select id="nasRecoveryDevice" class="search-input compact-select hidden" aria-label="NAS 备份设备"></select>
               <input id="snapshotName" class="search-input" placeholder="快照备注，可留空" />
               <button id="createSnapshotBtn" class="primary-button">创建快照</button>
               <select id="snapshotFilter" class="search-input compact-select">
@@ -161,6 +166,51 @@
         <button id="conversationRevealFile" class="ghost-button">在文件夹中显示</button>
         <span>双击会话行可再次打开此窗口</span>
       </footer>
+    </div>
+  </div>
+
+  <div id="nasSetupModal" class="modal nas-setup-modal hidden" role="dialog" aria-modal="true" aria-labelledby="nasSetupTitle">
+    <div class="nas-setup-panel">
+      <div class="nas-setup-kicker">公司会话保护</div>
+      <h2 id="nasSetupTitle">配置公司 NAS 会话备份</h2>
+      <p class="nas-setup-intro">软件会根据部门和姓名识别固定目录，不需要在资源管理器中选择路径。</p>
+
+      <div class="nas-endpoint-card">
+        <span class="nas-endpoint-icon">NAS</span>
+        <div>
+          <strong>192.168.10.99 · 文件中转站</strong>
+          <p>固定备份根目录：codex会话备份</p>
+        </div>
+        <span id="nasDetectionBadge" class="nas-detection-badge">等待检测</span>
+      </div>
+
+      <div id="nasSetupError" class="nas-setup-error hidden"></div>
+      <div class="nas-setup-fields">
+        <label>
+          <span>部门</span>
+          <select id="nasDepartment" class="search-input" disabled>
+            <option value="">请先检测公司 NAS</option>
+          </select>
+        </label>
+        <label>
+          <span>姓名</span>
+          <select id="nasEmployee" class="search-input" disabled>
+            <option value="">请先选择部门</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="nas-target-preview">
+        <span>识别后的备份位置</span>
+        <strong id="nasTargetPreview">请选择部门和姓名</strong>
+      </div>
+
+      <div class="nas-setup-actions">
+        <button id="nasCancelReconfigureBtn" class="ghost-button hidden">取消重新配置</button>
+        <button id="nasRetryBtn" class="ghost-button">检测公司 NAS</button>
+        <button id="nasConfirmBtn" class="primary-button" disabled>验证并开始备份</button>
+      </div>
+      <p class="nas-setup-footnote">配置成功后会立即进行首次备份。NAS 暂时断开时不会改写为其他目录。</p>
     </div>
   </div>
 
