@@ -1,5 +1,6 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { replaceFileDurably } = require('./durable-write');
 
 let sqlModulePromise;
 
@@ -187,19 +188,7 @@ class CursorStore {
     this.ensureOpen();
 
     await fs.mkdir(path.dirname(this.paths.cursorDatabasePath), { recursive: true });
-    const tempPath = `${this.paths.cursorDatabasePath}.tmp-${process.pid}-${Date.now()}`;
-
-    try {
-      await fs.writeFile(tempPath, Buffer.from(this.db.export()));
-      await fs.rename(tempPath, this.paths.cursorDatabasePath);
-    } catch (error) {
-      try {
-        await fs.rm(tempPath, { force: true });
-      } catch {
-        // Best effort cleanup after a failed temp write.
-      }
-      throw error;
-    }
+    await replaceFileDurably(this.paths.cursorDatabasePath, Buffer.from(this.db.export()));
   }
 
   async close() {

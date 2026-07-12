@@ -1,18 +1,27 @@
-const fs = require('node:fs');
+'use strict';
+
+const crypto = require('node:crypto');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 
 const { CursorStore } = require('./cursor-store');
-const { AGENT_VERSION } = require('./models');
+const { replaceFileDurably, writeFileDurably } = require('./durable-write');
+const { AGENT_VERSION, MANIFEST_VERSION } = require('./models');
 const { loadOrCreateManifest, saveManifest } = require('./manifest-store');
 const { readNewCompleteLines } = require('./session-tailer');
 const { sessionIdFromPath, titleFromJsonLine } = require('./session-identity');
 
 const ACTIVE_STATUS = 'active';
-const NEWLINE_BYTE = 0x0A;
 
 class BackupAgent {
-  constructor({ paths, now = () => new Date(), tailer } = {}) {
+  constructor({
+    paths,
+    now = () => new Date(),
+    tailer,
+    validateTarget = defaultValidateTarget,
+    fileCommitter = createFileCommitter(),
+    onProgress = null,
+  } = {}) {
     if (!paths) {
       throw new Error('BackupAgent requires paths.');
     }
@@ -20,6 +29,9 @@ class BackupAgent {
     this.paths = paths;
     this.now = now;
     this.tailer = tailer || { readNewCompleteLines };
+    this.validateTarget = validateTarget;
+    this.fileCommitter = fileCommitter;
+    this.onProgress = onProgress;
     this.pollingTimer = null;
     this.pollingStartedAt = null;
     this.scanPromise = null;
@@ -32,26 +44,21 @@ class BackupAgent {
     }
 
     this.pollingStartedAt = this.now();
-    const tick = () => {
-      this.performOneShotScan().catch((error) => {
-        this.writeErrorStatus(error).catch(() => {});
-      });
-    };
-
+    const tick = () => this.performOneShotScan().catch(() => {});
     this.pollingTimer = setInterval(tick, intervalMs);
-    if (typeof this.pollingTimer.unref === 'function') {
-      this.pollingTimer.unref();
-    }
+    this.pollingTimer.unref?.();
     tick();
   }
 
   stopPolling() {
-    if (!this.pollingTimer) {
-      return;
+    if (this.pollingTimer) {
+      clearInterval(this.pollingTimer);
+      this.pollingTimer = null;
     }
+  }
 
-    clearInterval(this.pollingTimer);
-    this.pollingTimer = null;
+  stop() {
+    this.stopPolling();
   }
 
   async performOneShotScan() {
@@ -72,15 +79,23 @@ class BackupAgent {
     let result;
     do {
       this.scanQueued = false;
-      result = await this.performOneShotScanLocked();
+      try {
+        result = await this.performOneShotScanLocked();
+      } catch (error) {
+        await this.writeLocalErrorStatus(error).catch(() => {});
+        throw error;
+      }
     } while (this.scanQueued);
-
     return result;
   }
 
   async performOneShotScanLocked() {
     const scanDate = this.now();
-    await this.ensureBackupDirectories();
+
+    // Trust and availability must be established before any NAS mutation.
+    await this.validateTarget(this.paths);
+    await this.ensureStateDirectories();
+    await this.ensureRemoteDirectories();
 
     const manifestExisted = await fileExists(this.paths.manifestPath);
     const cursorStore = new CursorStore({ paths: this.paths });
@@ -89,19 +104,24 @@ class BackupAgent {
     try {
       const manifest = loadOrCreateManifest(this.paths, scanDate);
       let manifestChanged = !manifestExisted;
-
-      if (manifest.codexRoot !== this.paths.codexRoot) {
-        manifest.codexRoot = this.paths.codexRoot;
-        manifestChanged = true;
+      for (const [key, value] of [
+        ['version', MANIFEST_VERSION],
+        ['codexRoot', this.paths.codexRoot],
+        ['backupRoot', this.paths.backupRoot],
+      ]) {
+        if (manifest[key] !== value) {
+          manifest[key] = value;
+          manifestChanged = true;
+        }
       }
-      if (manifest.backupRoot !== this.paths.backupRoot) {
-        manifest.backupRoot = this.paths.backupRoot;
-        manifestChanged = true;
-      }
 
+      const sources = await this.discoverSessionFiles();
+      const phase = manifestExisted ? 'scanning' : 'seeding';
       const processedSessionIds = new Set();
+      const updatedCursors = [];
       const scanErrors = [];
-      for (const sourcePath of await this.discoverSessionFiles()) {
+      let completedFiles = 0;
+      for (const sourcePath of sources) {
         const sessionId = sessionIdFromPath(sourcePath);
         if (!sessionId || processedSessionIds.has(sessionId)) {
           continue;
@@ -115,30 +135,47 @@ class BackupAgent {
           sessionId,
           sourcePath,
         });
-        manifestChanged = manifestChanged || result.manifestChanged;
+        manifestChanged ||= result.manifestChanged;
+        if (result.cursor) {
+          updatedCursors.push(result.cursor);
+        }
         if (result.lastError) {
           scanErrors.push(result.lastError);
         }
+        completedFiles += 1;
+        this.onProgress?.({
+          totalFiles: sources.length,
+          completedFiles,
+          pendingFiles: Math.max(0, sources.length - completedFiles),
+          phase,
+        });
       }
 
       if (manifestChanged) {
         manifest.updatedAt = scanDate.toISOString();
-        saveManifest(this.paths, manifest);
+        await saveManifest(this.paths, manifest);
+      }
+      for (const { store, cursor } of updatedCursors) {
+        await store.upsert(cursor);
       }
 
       const lastError = scanErrors[0] || null;
       await this.writeStatus(manifest, lastError ? 'error' : 'running', lastError, scanDate);
+      await replaceFileDurably(this.paths.pendingSourcesPath, jsonPayload({ pending: [] }));
       return manifest;
     } finally {
       await cursorStore.close();
     }
   }
 
-  async ensureBackupDirectories() {
-    await fsp.mkdir(this.paths.backupRoot, { recursive: true });
-    await fsp.mkdir(this.paths.sessionsRoot, { recursive: true });
-    await fsp.mkdir(path.dirname(this.paths.statusPath), { recursive: true });
-    await fsp.mkdir(path.dirname(this.paths.logPath), { recursive: true });
+  async ensureStateDirectories() {
+    await fsp.mkdir(this.paths.stateRoot, { recursive: true });
+    await fsp.mkdir(this.paths.logsRoot, { recursive: true });
+  }
+
+  async ensureRemoteDirectories() {
+    await ensureDirectChildDirectory(this.paths.backupRoot, this.paths.sessionsRoot);
+    await ensureDirectChildDirectory(this.paths.backupRoot, this.paths.archivedSessionsRoot);
   }
 
   async discoverSessionFiles() {
@@ -153,91 +190,105 @@ class BackupAgent {
     }
 
     return discovered
-      .sort((lhs, rhs) => {
-        if (lhs.priority !== rhs.priority) {
-          return lhs.priority - rhs.priority;
-        }
-        return lhs.filePath.localeCompare(rhs.filePath);
-      })
+      .sort((lhs, rhs) => lhs.priority - rhs.priority || lhs.filePath.localeCompare(rhs.filePath))
       .map((entry) => entry.filePath);
   }
 
   async processSessionFile({ sourcePath, sessionId, scanDate, manifest, cursorStore }) {
+    const sourceStats = await trustedSourceMetadata(sourcePath);
     const existingRecord = manifest.sessions[sessionId] || null;
     const currentCursor = await cursorStore.get(sourcePath);
-    const baselineCursor = currentCursor
-      || await this.migratedCursor(existingRecord, sourcePath, cursorStore);
-    const firstSeenAt = existingRecord?.firstSeenAt
-      ? new Date(existingRecord.firstSeenAt)
-      : scanDate;
-    const backupPath = this.backupFilePathFor(sessionId, firstSeenAt, existingRecord, baselineCursor);
+    const baselineCursor = currentCursor || await this.migratedCursor(existingRecord, sourcePath, cursorStore);
+    const mappedBackupPath = this.paths.backupFilePath(sourcePath);
+    const backupPath = this.backupFilePathFor(sourcePath, existingRecord, baselineCursor);
     const relativeBackupPath = this.validatedRelativeBackupPath(backupPath);
-    const readOffset = baselineCursor?.lastByteOffset ?? 0;
-    const lineCountBeforeReadOffset = readOffset > 0 ? baselineCursor?.lineCount ?? 0 : 0;
-    const tailResult = await this.readTail(sourcePath, readOffset);
-    const sourceMetadata = await metadataFor(sourcePath);
-    const recordedLineCount = Math.max(
-      Number(existingRecord?.lineCount ?? 0),
-      Number(baselineCursor?.lineCount ?? 0),
-    );
-    const recordedBytesBackedUp = Number(existingRecord?.bytesBackedUp ?? 0);
-    const sourcePathMigrated = existingRecord ? existingRecord.sourcePath !== sourcePath : false;
-    const firstSeenBackupExists = !existingRecord && !baselineCursor && await fileExists(backupPath);
-    const needsBackupStats = this.shouldReadBackupFileStats({
-      baselineCursor,
-      existingRecord,
-      firstSeenBackupExists,
-      sourcePathMigrated,
-    });
-    const backupStatsBeforeAppend = needsBackupStats
-      ? await backupFileStats(backupPath)
-      : { byteCount: recordedBytesBackedUp, lineCount: recordedLineCount };
-    const skippedAlreadyBackedUpLineCount = Math.min(
-      tailResult.lines.length,
-      Math.max(0, backupStatsBeforeAppend.lineCount - lineCountBeforeReadOffset),
-    );
-    const linesToAppend = tailResult.lines.slice(skippedAlreadyBackedUpLineCount);
-    const appendedLineStats = lineStats(linesToAppend);
+    const mappedRelativePath = this.validatedRelativeBackupPath(mappedBackupPath);
+    const targetState = await this.fileCommitter.inspectTarget(backupPath);
+    const recordedBytes = Number(existingRecord?.bytesBackedUp ?? 0);
+    const recordedLines = Number(existingRecord?.lineCount ?? 0);
+    const recordedOffset = Number(baselineCursor?.lastByteOffset ?? 0);
+    const pathChanged = Boolean(existingRecord && existingRecord.backupPath !== mappedRelativePath);
+    let rebuild = pathChanged || sourceStats.size < recordedOffset;
+    let readOffset = recordedOffset;
+    let baseLineCount = recordedLines;
 
-    if (linesToAppend.length > 0) {
-      await appendLines(backupPath, linesToAppend);
+    if (targetState.exists && !rebuild) {
+      if (targetState.byteCount === recordedBytes) {
+        if (existingRecord?.contentHash && recordedOffset > 0) {
+          rebuild = await hashPrefix(sourcePath, recordedOffset) !== existingRecord.contentHash
+            || !await this.fileCommitter.targetMatchesBoundedFingerprint(
+              backupPath,
+              sourcePath,
+              recordedBytes,
+            );
+        } else if (targetState.byteCount > 0) {
+          rebuild = !await this.fileCommitter.targetIsCompletePrefix(backupPath, sourcePath);
+        }
+      } else if (
+        targetState.byteCount > recordedBytes
+        && await this.fileCommitter.targetIsCompletePrefix(backupPath, sourcePath)
+      ) {
+        readOffset = targetState.byteCount;
+        baseLineCount = (await this.fileCommitter.stats(backupPath)).lineCount;
+      } else {
+        rebuild = true;
+      }
+    } else if (!targetState.exists && (recordedOffset > 0 || recordedBytes > 0)) {
+      rebuild = true;
     }
 
-    const backupStatsAfterAppend = {
-      byteCount: backupStatsBeforeAppend.byteCount + appendedLineStats.byteCount,
-      lineCount: backupStatsBeforeAppend.lineCount + appendedLineStats.lineCount,
-    };
-    const consumedCompleteLineCount = lineCountBeforeReadOffset + tailResult.lines.length;
-    const totalLineCount = Math.max(
-      recordedLineCount,
-      consumedCompleteLineCount,
-      backupStatsAfterAppend.lineCount,
-    );
-    const totalBytesBackedUp = Math.max(recordedBytesBackedUp, backupStatsAfterAppend.byteCount);
-    const titleFromNewLines = firstTitle(tailResult.lines);
+    let tailResult;
+    let finalStats;
+    let wroteData;
+    if (rebuild) {
+      tailResult = await this.readTail(sourcePath, 0);
+      finalStats = await this.fileCommitter.rebuildCompleteLines(
+        backupPath,
+        tailResult.lines,
+        this.paths.backupRoot,
+      );
+      wroteData = true;
+    } else {
+      tailResult = await this.readTail(sourcePath, readOffset);
+      if (targetState.exists) {
+        finalStats = await this.fileCommitter.appendAndSynchronize(
+          backupPath,
+          tailResult.lines,
+          this.paths.backupRoot,
+        );
+      } else {
+        finalStats = await this.fileCommitter.commitInitial(
+          backupPath,
+          tailResult.lines,
+          this.paths.backupRoot,
+        );
+      }
+      wroteData = tailResult.lines.length > 0 || targetState.byteCount !== recordedBytes;
+    }
+
+    const finalOffset = tailResult.nextOffset;
+    const contentHash = finalOffset > 0 ? await hashPrefix(sourcePath, finalOffset) : null;
+    const firstSeenAt = existingRecord?.firstSeenAt || scanDate.toISOString();
     const title = existingRecord?.title
-      ?? titleFromNewLines
-      ?? await backupTitleIfAlreadyInspectingFile(backupPath, needsBackupStats);
-    const lastBackedUpAt = resolveLastBackedUpAt({
-      appendedLineCount: linesToAppend.length,
-      existingRecord,
-      scanDate,
-      totalBytesBackedUp,
-      totalLineCount,
-    });
+      || firstTitle(tailResult.lines)
+      || await firstTitleInBackup(backupPath);
     const updatedRecord = {
       sessionId,
       sourcePath,
       backupPath: relativeBackupPath,
-      title: title ?? null,
-      firstSeenAt: firstSeenAt.toISOString(),
-      lastBackedUpAt,
-      lineCount: totalLineCount,
-      bytesBackedUp: totalBytesBackedUp,
+      title: title || null,
+      firstSeenAt,
+      lastBackedUpAt: wroteData || (!existingRecord?.lastBackedUpAt && finalStats.lineCount > 0)
+        ? scanDate.toISOString()
+        : existingRecord?.lastBackedUpAt ?? null,
+      lineCount: rebuild || !targetState.exists
+        ? finalStats.lineCount
+        : Math.max(baseLineCount + tailResult.lines.length, baseLineCount),
+      bytesBackedUp: finalStats.byteCount,
+      contentHash,
       status: ACTIVE_STATUS,
     };
     const manifestChanged = !sameRecord(existingRecord, updatedRecord);
-
     if (manifestChanged) {
       manifest.sessions[sessionId] = updatedRecord;
     }
@@ -246,99 +297,57 @@ class BackupAgent {
       sessionId,
       sourcePath,
       backupPath: relativeBackupPath,
-      lastByteOffset: tailResult.nextOffset,
-      lastSourceSize: sourceMetadata.size,
-      lastSourceModifiedAt: sourceMetadata.modifiedAt,
-      lineCount: totalLineCount,
+      lastByteOffset: finalOffset,
+      lastSourceSize: sourceStats.size,
+      lastSourceModifiedAt: sourceStats.modifiedAt,
+      lineCount: updatedRecord.lineCount,
       pendingPartialLine: tailResult.pendingPartialLine,
       status: ACTIVE_STATUS,
       lastError: tailResult.blockedError || null,
       updatedAt: scanDate.getTime() / 1000,
     };
 
-    if (!sameCursor(currentCursor, updatedCursor)) {
-      await cursorStore.upsert(updatedCursor);
-    }
-
     return {
       manifestChanged,
+      cursor: sameCursor(currentCursor, updatedCursor)
+        ? null
+        : { store: cursorStore, cursor: updatedCursor },
       lastError: tailResult.blockedError || null,
     };
   }
 
-  async migratedCursor(existingRecord, currentSourcePath, cursorStore) {
-    if (!existingRecord || !existingRecord.sourcePath || existingRecord.sourcePath === currentSourcePath) {
+  async migratedCursor(existingRecord, sourcePath, cursorStore) {
+    if (!existingRecord?.sourcePath || existingRecord.sourcePath === sourcePath) {
       return null;
     }
-
     return cursorStore.get(existingRecord.sourcePath);
   }
 
-  backupFilePathFor(sessionId, firstSeenAt, existingRecord, baselineCursor) {
-    const recordedBackupPath = existingRecord?.backupPath ?? baselineCursor?.backupPath;
-    if (recordedBackupPath) {
-      if (path.isAbsolute(recordedBackupPath)) {
-        return recordedBackupPath;
-      }
-
-      return path.join(this.paths.backupRoot, recordedBackupPath);
+  backupFilePathFor(sourcePath, existingRecord, baselineCursor) {
+    const recordedPath = existingRecord?.backupPath ?? baselineCursor?.backupPath;
+    if (!recordedPath) {
+      return this.paths.backupFilePath(sourcePath);
     }
-
-    return this.paths.backupFilePath(sessionId, firstSeenAt);
+    return path.isAbsolute(recordedPath) ? recordedPath : path.join(this.paths.backupRoot, recordedPath);
   }
 
   validatedRelativeBackupPath(backupPath) {
-    const relativeBackupPath = this.paths.relativeBackupPath(backupPath);
-    if (!relativeBackupPath) {
+    const relative = this.paths.relativeBackupPath(backupPath);
+    if (!relative) {
       throw new Error(`Backup path is outside backup root: ${backupPath} is not contained in ${this.paths.backupRoot}.`);
     }
-
-    return relativeBackupPath;
+    return relative;
   }
 
   async readTail(sourcePath, offset) {
     if (typeof this.tailer === 'function') {
       return this.tailer(sourcePath, offset);
     }
-
     return this.tailer.readNewCompleteLines(sourcePath, offset);
   }
 
-  shouldReadBackupFileStats({
-    existingRecord,
-    baselineCursor,
-    firstSeenBackupExists,
-    sourcePathMigrated,
-  }) {
-    if (firstSeenBackupExists) {
-      return true;
-    }
-
-    if (!existingRecord) {
-      return false;
-    }
-
-    if (!baselineCursor) {
-      return true;
-    }
-
-    const baselineLineCount = baselineCursor?.lineCount;
-    const recordedLineCount = Math.max(existingRecord.lineCount ?? 0, baselineLineCount ?? 0);
-    if (sourcePathMigrated) {
-      if (baselineCursor.lineCount !== existingRecord.lineCount) {
-        return true;
-      }
-    } else if (baselineLineCount != null && baselineLineCount !== existingRecord.lineCount) {
-      return true;
-    }
-
-    return recordedLineCount > 0 && Number(existingRecord.bytesBackedUp ?? 0) === 0;
-  }
-
   async writeStatus(manifest, status, lastError, date) {
-    await fsp.mkdir(path.dirname(this.paths.statusPath), { recursive: true });
-
-    const existingStatus = await loadStatus(this.paths.statusPath);
+    const existingStatus = await loadStatus(this.paths.localStatusPath);
     const records = Object.values(manifest.sessions || {});
     const snapshot = {
       agentVersion: AGENT_VERSION,
@@ -348,9 +357,7 @@ class BackupAgent {
       codexRoot: this.paths.codexRoot,
       backupRoot: this.paths.backupRoot,
       firstRunAt: existingStatus?.firstRunAt ?? date.toISOString(),
-      lastStartedAt: this.pollingStartedAt?.toISOString()
-        ?? existingStatus?.lastStartedAt
-        ?? date.toISOString(),
+      lastStartedAt: this.pollingStartedAt?.toISOString() ?? existingStatus?.lastStartedAt ?? date.toISOString(),
       lastHeartbeatAt: date.toISOString(),
       lastBackupAt: maxIsoDate(records.map((record) => record.lastBackedUpAt)),
       sessionCount: records.length,
@@ -360,14 +367,191 @@ class BackupAgent {
       lastError,
     };
 
-    await writeJsonAtomic(this.paths.statusPath, snapshot);
+    await replaceFileDurably(this.paths.remoteStatusPath, jsonPayload(snapshot));
+    await replaceFileDurably(this.paths.localStatusPath, jsonPayload(snapshot));
   }
 
-  async writeErrorStatus(error) {
-    await this.ensureBackupDirectories();
+  async writeLocalErrorStatus(error) {
+    await this.ensureStateDirectories();
+    const date = this.now();
+    const existing = await loadStatus(this.paths.localStatusPath);
+    const snapshot = {
+      ...(existing || {}),
+      agentVersion: AGENT_VERSION,
+      enabled: true,
+      status: 'error',
+      mode: 'polling',
+      codexRoot: this.paths.codexRoot,
+      backupRoot: this.paths.backupRoot,
+      firstRunAt: existing?.firstRunAt ?? date.toISOString(),
+      lastHeartbeatAt: date.toISOString(),
+      lastError: error?.message || String(error),
+    };
+    await replaceFileDurably(this.paths.localStatusPath, jsonPayload(snapshot));
+  }
 
-    const manifest = safeLoadManifest(this.paths, this.now());
-    await this.writeStatus(manifest, 'error', error?.message || String(error), this.now());
+  async pendingSessionCount() {
+    await this.ensureStateDirectories();
+    const store = new CursorStore({ paths: this.paths });
+    await store.open();
+    try {
+      const pending = [];
+      for (const sourcePath of await this.discoverSessionFiles()) {
+        const cursor = await store.get(sourcePath);
+        const metadata = await trustedSourceMetadata(sourcePath);
+        if (!cursor || cursor.lastSourceSize !== metadata.size || cursor.lastSourceModifiedAt !== metadata.modifiedAt) {
+          pending.push({ sourcePath, size: metadata.size, modifiedAt: metadata.modifiedAt });
+        }
+      }
+      await replaceFileDurably(this.paths.pendingSourcesPath, jsonPayload({ pending }));
+      return pending.length;
+    } finally {
+      await store.close();
+    }
+  }
+}
+
+function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
+  const lineBuffer = (lines) => Buffer.from(lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
+
+  return {
+    async inspectTarget(targetPath) {
+      try {
+        const stats = await fsp.lstat(targetPath);
+        if (!stats.isFile() || stats.isSymbolicLink()) {
+          throw new Error(`Backup target is not a trusted regular file: ${targetPath}`);
+        }
+        return { exists: true, byteCount: stats.size };
+      } catch (error) {
+        if (error.code === 'ENOENT') return { exists: false, byteCount: 0 };
+        throw error;
+      }
+    },
+
+    async targetIsCompletePrefix(targetPath, sourcePath) {
+      const target = await fsp.readFile(targetPath);
+      const sourcePrefix = await readPrefix(sourcePath, target.length);
+      return target.equals(sourcePrefix) && (target.length === 0 || target[target.length - 1] === 0x0A);
+    },
+
+    async targetMatchesBoundedFingerprint(targetPath, sourcePath, byteCount) {
+      if (byteCount === 0) return true;
+      const window = Math.min(64 * 1024, byteCount);
+      const [targetFirst, sourceFirst, targetLast, sourceLast] = await Promise.all([
+        readRange(targetPath, 0, window),
+        readRange(sourcePath, 0, window),
+        readRange(targetPath, byteCount - window, window),
+        readRange(sourcePath, byteCount - window, window),
+      ]);
+      return targetFirst.equals(sourceFirst) && targetLast.equals(sourceLast);
+    },
+
+    async stats(targetPath) {
+      const content = await fsp.readFile(targetPath);
+      return {
+        byteCount: content.length,
+        lineCount: countNewlines(content),
+      };
+    },
+
+    async commitInitial(targetPath, lines, backupRoot) {
+      const content = lineBuffer(lines);
+      if (content.length > 0) {
+        await ensureContainedParent(backupRoot, targetPath);
+        await writeFileDurably(targetPath, content, { sync });
+      }
+      return { byteCount: content.length, lineCount: lines.length };
+    },
+
+    async appendAndSynchronize(targetPath, lines, backupRoot) {
+      const before = await this.stats(targetPath);
+      if (lines.length === 0) return before;
+      await assertContainedTarget(backupRoot, targetPath);
+      const content = lineBuffer(lines);
+      const handle = await fsp.open(targetPath, 'a');
+      try {
+        await handle.writeFile(content);
+        await sync(handle);
+      } finally {
+        await handle.close();
+      }
+      return {
+        byteCount: before.byteCount + content.length,
+        lineCount: before.lineCount + lines.length,
+      };
+    },
+
+    async rebuildCompleteLines(targetPath, lines, backupRoot) {
+      const content = lineBuffer(lines);
+      await ensureContainedParent(backupRoot, targetPath);
+      if (await fileExists(targetPath)) {
+        await replaceFileDurably(targetPath, content, { sync });
+      } else if (content.length > 0) {
+        await writeFileDurably(targetPath, content, { sync });
+      }
+      return { byteCount: content.length, lineCount: lines.length };
+    },
+  };
+}
+
+async function defaultValidateTarget(paths) {
+  let stats;
+  try {
+    stats = await fsp.lstat(paths.backupRoot);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      throw new Error(`NAS backup root is unavailable or missing: ${paths.backupRoot}`);
+    }
+    throw error;
+  }
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error(`NAS backup root is unavailable or unsafe: ${paths.backupRoot}`);
+  }
+}
+
+async function ensureDirectChildDirectory(root, child) {
+  if (path.dirname(child) !== root) {
+    throw new Error(`Managed backup directory is not a direct child of backup root: ${child}`);
+  }
+  try {
+    await fsp.mkdir(child);
+  } catch (error) {
+    if (error.code !== 'EEXIST') {
+      throw error;
+    }
+    const stats = await fsp.lstat(child);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      throw new Error(`Managed backup directory is unsafe: ${child}`);
+    }
+  }
+}
+
+async function ensureContainedParent(root, targetPath) {
+  const relative = path.relative(path.resolve(root), path.resolve(path.dirname(targetPath)));
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Backup target is outside backup root: ${targetPath}`);
+  }
+
+  let current = path.resolve(root);
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    try {
+      await fsp.mkdir(current);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+    const stats = await fsp.lstat(current);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      throw new Error(`Backup target parent is unsafe: ${targetPath}`);
+    }
+  }
+}
+
+async function assertContainedTarget(root, targetPath) {
+  await ensureContainedParent(root, targetPath);
+  const stats = await fsp.lstat(targetPath);
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new Error(`Backup target is unsafe: ${targetPath}`);
   }
 }
 
@@ -393,50 +577,12 @@ async function walkJsonlFiles(root, priority, discovered) {
   }
 }
 
-async function metadataFor(filePath) {
-  const stats = await fsp.stat(filePath);
-  return {
-    modifiedAt: stats.mtimeMs / 1000,
-    size: stats.size,
-  };
-}
-
-function lineStats(lines) {
-  return {
-    byteCount: lines.reduce((total, line) => total + Buffer.byteLength(line, 'utf8') + 1, 0),
-    lineCount: lines.length,
-  };
-}
-
-async function appendLines(filePath, lines) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.appendFile(filePath, lines.map((line) => `${line}\n`).join(''), 'utf8');
-}
-
-async function backupFileStats(filePath) {
-  let stats;
-  try {
-    stats = await fsp.stat(filePath);
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      return { byteCount: 0, lineCount: 0 };
-    }
-    throw error;
+async function trustedSourceMetadata(sourcePath) {
+  const stats = await fsp.lstat(sourcePath);
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new Error(`Session source is not a trusted regular file: ${sourcePath}`);
   }
-
-  let lineCount = 0;
-  for await (const chunk of fs.createReadStream(filePath)) {
-    for (const byte of chunk) {
-      if (byte === NEWLINE_BYTE) {
-        lineCount += 1;
-      }
-    }
-  }
-
-  return {
-    byteCount: stats.size,
-    lineCount,
-  };
+  return { modifiedAt: stats.mtimeMs / 1000, size: stats.size };
 }
 
 function firstTitle(lines) {
@@ -446,114 +592,87 @@ function firstTitle(lines) {
       return title;
     }
   }
-
   return null;
 }
 
-async function backupTitleIfAlreadyInspectingFile(filePath, needsBackupStats) {
-  if (!needsBackupStats || !await fileExists(filePath)) {
-    return null;
-  }
-
-  let pending = Buffer.alloc(0);
-  for await (const chunk of fs.createReadStream(filePath, { highWaterMark: 64 * 1024 })) {
-    let lineStart = 0;
-    for (let index = 0; index < chunk.length; index += 1) {
-      if (chunk[index] !== NEWLINE_BYTE) {
-        continue;
-      }
-
-      const line = Buffer.concat([pending, chunk.subarray(lineStart, index)]).toString('utf8');
+async function firstTitleInBackup(filePath) {
+  try {
+    const content = await readPrefix(filePath, 256 * 1024);
+    for (const line of content.toString('utf8').split('\n')) {
       const title = titleFromJsonLine(line);
-      if (title) {
-        return title;
-      }
-      pending = Buffer.alloc(0);
-      lineStart = index + 1;
+      if (title) return title;
     }
-
-    pending = Buffer.concat([pending, chunk.subarray(lineStart)]);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
   }
-
   return null;
 }
 
-function resolveLastBackedUpAt({
-  existingRecord,
-  appendedLineCount,
-  totalLineCount,
-  totalBytesBackedUp,
-  scanDate,
-}) {
-  if (appendedLineCount > 0) {
-    return scanDate.toISOString();
+async function hashPrefix(filePath, byteCount) {
+  const handle = await fsp.open(filePath, 'r');
+  const hash = crypto.createHash('sha256');
+  let offset = 0;
+  try {
+    while (offset < byteCount) {
+      const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, byteCount - offset));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+  } finally {
+    await handle.close();
   }
-
-  if (!existingRecord?.lastBackedUpAt && (totalLineCount > 0 || totalBytesBackedUp > 0)) {
-    return scanDate.toISOString();
+  if (offset !== byteCount) {
+    throw new Error(`Source file became shorter while hashing: ${filePath}`);
   }
+  return hash.digest('hex');
+}
 
-  return existingRecord?.lastBackedUpAt ?? null;
+async function readPrefix(filePath, byteCount) {
+  return readRange(filePath, 0, byteCount);
+}
+
+async function readRange(filePath, position, byteCount) {
+  if (byteCount <= 0) return Buffer.alloc(0);
+  const handle = await fsp.open(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(byteCount);
+  let offset = 0;
+  try {
+    while (offset < byteCount) {
+      const { bytesRead } = await handle.read(buffer, offset, byteCount - offset, position + offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+  return buffer.subarray(0, offset);
+}
+
+function countNewlines(content) {
+  let total = 0;
+  for (const byte of content) {
+    if (byte === 0x0A) total += 1;
+  }
+  return total;
 }
 
 function sameRecord(lhs, rhs) {
-  if (!lhs) {
-    return false;
-  }
-
-  const keys = [
-    'sessionId',
-    'sourcePath',
-    'backupPath',
-    'title',
-    'firstSeenAt',
-    'lastBackedUpAt',
-    'lineCount',
-    'bytesBackedUp',
-    'status',
-  ];
-
-  return keys.every((key) => lhs[key] === rhs[key]);
+  if (!lhs) return false;
+  return ['sessionId', 'sourcePath', 'backupPath', 'title', 'firstSeenAt', 'lastBackedUpAt',
+    'lineCount', 'bytesBackedUp', 'contentHash', 'status'].every((key) => lhs[key] === rhs[key]);
 }
 
 function sameCursor(lhs, rhs) {
-  if (!lhs) {
-    return false;
-  }
-
-  const keys = [
-    'sessionId',
-    'sourcePath',
-    'backupPath',
-    'lastByteOffset',
-    'lastSourceSize',
-    'lastSourceModifiedAt',
-    'lineCount',
-    'pendingPartialLine',
-    'status',
-    'lastError',
-  ];
-
-  return keys.every((key) => lhs[key] === rhs[key]);
+  if (!lhs) return false;
+  return ['sessionId', 'sourcePath', 'backupPath', 'lastByteOffset', 'lastSourceSize',
+    'lastSourceModifiedAt', 'lineCount', 'pendingPartialLine', 'status', 'lastError']
+    .every((key) => lhs[key] === rhs[key]);
 }
 
 function maxIsoDate(values) {
-  let winner = null;
-  let winnerTime = Number.NEGATIVE_INFINITY;
-
-  for (const value of values) {
-    if (!value) {
-      continue;
-    }
-
-    const time = new Date(value).getTime();
-    if (Number.isFinite(time) && time > winnerTime) {
-      winner = value;
-      winnerTime = time;
-    }
-  }
-
-  return winner;
+  return values.filter(Boolean).sort((a, b) => new Date(b) - new Date(a))[0] || null;
 }
 
 async function loadStatus(statusPath) {
@@ -564,51 +683,17 @@ async function loadStatus(statusPath) {
   }
 }
 
-function safeLoadManifest(paths, now) {
-  try {
-    return loadOrCreateManifest(paths, now);
-  } catch {
-    return {
-      version: 1,
-      codexRoot: paths.codexRoot,
-      backupRoot: paths.backupRoot,
-      createdAt: now.toISOString(),
-      updatedAt: now.toISOString(),
-      sessions: {},
-    };
-  }
-}
-
-async function writeJsonAtomic(filePath, value) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-
-  try {
-    await fsp.writeFile(tempPath, `${JSON.stringify(sortedValue(value), null, 2)}\n`, 'utf8');
-    await fsp.rename(tempPath, filePath);
-  } catch (error) {
-    try {
-      await fsp.rm(tempPath, { force: true });
-    } catch {
-      // Best effort cleanup after a failed temp write.
-    }
-    throw error;
-  }
-}
-
 function sortedValue(value) {
-  if (Array.isArray(value)) {
-    return value.map(sortedValue);
-  }
-
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-
+  if (Array.isArray(value)) return value.map(sortedValue);
+  if (!value || typeof value !== 'object') return value;
   return Object.keys(value).sort().reduce((result, key) => {
     result[key] = sortedValue(value[key]);
     return result;
   }, {});
+}
+
+function jsonPayload(value) {
+  return `${JSON.stringify(sortedValue(value), null, 2)}\n`;
 }
 
 async function fileExists(filePath) {
@@ -622,4 +707,5 @@ async function fileExists(filePath) {
 
 module.exports = {
   BackupAgent,
+  createFileCommitter,
 };

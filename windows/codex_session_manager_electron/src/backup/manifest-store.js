@@ -1,7 +1,7 @@
 const fs = require('node:fs');
-const path = require('node:path');
 
 const { MANIFEST_VERSION } = require('./models');
+const { replaceFileDurably } = require('./durable-write');
 
 function isoString(value) {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
@@ -42,23 +42,9 @@ function sortedValue(value) {
   }, {});
 }
 
-function saveManifest(paths, manifest) {
-  fs.mkdirSync(path.dirname(paths.manifestPath), { recursive: true });
-
-  const tempPath = `${paths.manifestPath}.tmp-${process.pid}-${Date.now()}`;
+async function saveManifest(paths, manifest) {
   const payload = `${JSON.stringify(sortedValue(manifest), null, 2)}\n`;
-
-  try {
-    fs.writeFileSync(tempPath, payload, 'utf8');
-    fs.renameSync(tempPath, paths.manifestPath);
-  } catch (error) {
-    try {
-      fs.rmSync(tempPath, { force: true });
-    } catch {
-      // Best effort cleanup after a failed temp write.
-    }
-    throw error;
-  }
+  await replaceFileDurably(paths.manifestPath, payload);
 }
 
 module.exports = {

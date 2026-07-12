@@ -1,5 +1,5 @@
-const MANIFEST_VERSION = 1;
-const AGENT_VERSION = '1.0.0';
+const MANIFEST_VERSION = 2;
+const AGENT_VERSION = '2.0.0';
 
 module.exports = {
   AGENT_VERSION,

@@ -7,8 +7,32 @@ const { backupPaths } = require('../../src/backup/paths');
 const homeDir = 'C:\\Users\\Ada';
 
 test('backup model constants are exported', () => {
-  assert.equal(MANIFEST_VERSION, 1);
-  assert.equal(AGENT_VERSION, '1.0.0');
+  assert.equal(MANIFEST_VERSION, 2);
+  assert.equal(AGENT_VERSION, '2.0.0');
+});
+
+test('backupPaths splits NAS content from local state and mirrors source paths', () => {
+  const pathImpl = require('node:path');
+  const paths = backupPaths({
+    homeDir: '/home/ada',
+    codexRoot: '/home/ada/.codex',
+    backupRoot: '/mnt/nas/device/incremental-backups',
+    stateRoot: '/home/ada/.codex-session-vault/nas-state/device',
+    pathImpl,
+  });
+
+  assert.ok(paths.cursorDatabasePath.startsWith(paths.stateRoot));
+  assert.ok(paths.localStatusPath.startsWith(paths.stateRoot));
+  assert.ok(paths.manifestPath.startsWith(paths.backupRoot));
+  assert.ok(paths.remoteStatusPath.startsWith(paths.backupRoot));
+  assert.equal(
+    paths.backupFilePath('/home/ada/.codex/sessions/2026/07/active.jsonl'),
+    '/mnt/nas/device/incremental-backups/sessions/2026/07/active.jsonl',
+  );
+  assert.equal(
+    paths.backupFilePath('/home/ada/.codex/archived_sessions/2026/07/old.jsonl'),
+    '/mnt/nas/device/incremental-backups/archived_sessions/2026/07/old.jsonl',
+  );
 });
 
 test('backupPaths returns the Windows backup layout', () => {
