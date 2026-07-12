@@ -1,6 +1,6 @@
 {
   "name": "codex-session-manager-win10-electron",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "Codex session manager for Windows 10",
   "main": "src/main.js",
   "private": true,

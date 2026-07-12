@@ -235,3 +235,9 @@ test('NAS setup and recovery IPC stays guarded and accepts identities instead of
   assert.ok(restoreHandler.indexOf('preflightIncrementalRecovery(') < restoreHandler.indexOf('createRestoreProtectionSnapshot('));
   assert.doesNotMatch(restoreHandler, /recovery-packages|buildIncrementalRecoveryPackage/);
 });
+
+test('Electron enforces one backup writer per device identity', () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'main.js'), 'utf8');
+  assert.match(mainSource, /app\.requestSingleInstanceLock\(\)/);
+  assert.match(mainSource, /app\.on\('second-instance'/);
+});

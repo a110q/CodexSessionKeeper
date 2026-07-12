@@ -29,9 +29,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key>
   <string>local.codex.session-manager</string>
   <key>CFBundleVersion</key>
-  <string>1.0.13</string>
+  <string>1.0.14</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.13</string>
+  <string>1.0.14</string>
   <key>CFBundleExecutable</key>
   <string>CodexSessionVault</string>
   <key>CFBundleIconFile</key>

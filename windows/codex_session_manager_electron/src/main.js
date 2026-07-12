@@ -42,7 +42,7 @@ const {
 let mainWindow;
 let sqlPromise;
 
-const appVersion = '1.0.13';
+const appVersion = '1.0.14';
 const codexRoot = path.join(os.homedir(), '.codex');
 const vaultRoot = path.join(os.homedir(), '.codex-session-vault');
 const snapshotRoot = path.join(vaultRoot, 'snapshots');
@@ -67,6 +67,8 @@ const handleTrustedIpc = createTrustedIpcRegistrar({
   getMainWindow: () => mainWindow,
   expectedURL: applicationPageURL,
 });
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
 
 const backupCandidates = [
   'config.toml',
@@ -149,10 +151,19 @@ function createWindow() {
   mainWindow.loadFile(applicationPagePath);
 }
 
-app.whenReady().then(async () => {
-  Menu.setApplicationMenu(null);
-  await nasRuntime.initialize();
-  createWindow();
+if (hasSingleInstanceLock) {
+  app.whenReady().then(async () => {
+    Menu.setApplicationMenu(null);
+    await nasRuntime.initialize();
+    createWindow();
+  });
+}
+
+app.on('second-instance', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 });
 
 app.on('window-all-closed', () => {

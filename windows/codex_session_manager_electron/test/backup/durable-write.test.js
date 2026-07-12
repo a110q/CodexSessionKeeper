@@ -49,3 +49,40 @@ test('writeFileDurably never overwrites an existing destination', async (t) => {
   await assert.rejects(writeFileDurably(destination, 'backup'));
   assert.equal(await fsp.readFile(destination, 'utf8'), 'live');
 });
+
+test('writeFileDurably falls back to atomic rename when SMB rejects hard links', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const destination = path.join(root, 'session.jsonl');
+  let linkAttempts = 0;
+
+  await writeFileDurably(destination, 'backup', {
+    link: async () => {
+      linkAttempts += 1;
+      const error = new Error('SMB hard links are unsupported');
+      error.code = 'ENOTSUP';
+      throw error;
+    },
+  });
+
+  assert.equal(linkAttempts, 1);
+  assert.equal(await fsp.readFile(destination, 'utf8'), 'backup');
+  assert.deepEqual(await fsp.readdir(root), ['session.jsonl']);
+});
+
+test('SMB fallback still refuses an existing destination', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const destination = path.join(root, 'session.jsonl');
+  await fsp.writeFile(destination, 'live');
+
+  await assert.rejects(writeFileDurably(destination, 'backup', {
+    link: async () => {
+      const error = new Error('SMB hard links are unsupported');
+      error.code = 'ENOTSUP';
+      throw error;
+    },
+  }));
+
+  assert.equal(await fsp.readFile(destination, 'utf8'), 'live');
+});
