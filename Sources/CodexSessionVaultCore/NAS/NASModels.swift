@@ -129,3 +129,37 @@ public struct NASBackupTarget: Equatable, Sendable {
         self.localStateRoot = localStateRoot
     }
 }
+
+public struct NASRecoverySourceIdentity: Codable, Equatable, Hashable, Sendable {
+    public let department: String
+    public let employee: String
+    public let deviceID: UUID
+    public let deviceDirectoryName: String
+
+    public init(department: String, employee: String, deviceID: UUID, deviceDirectoryName: String) {
+        self.department = department
+        self.employee = employee
+        self.deviceID = deviceID
+        self.deviceDirectoryName = deviceDirectoryName
+    }
+}
+
+public struct NASRecoverySource: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID { identity.deviceID }
+    public let identity: NASRecoverySourceIdentity
+    public let deviceName: String
+    public let lastBackupAt: Date?
+    public let isCurrentDevice: Bool
+
+    public init(
+        identity: NASRecoverySourceIdentity,
+        deviceName: String,
+        lastBackupAt: Date?,
+        isCurrentDevice: Bool
+    ) {
+        self.identity = identity
+        self.deviceName = deviceName
+        self.lastBackupAt = lastBackupAt
+        self.isCurrentDevice = isCurrentDevice
+    }
+}

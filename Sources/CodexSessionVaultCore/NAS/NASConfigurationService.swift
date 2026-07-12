@@ -206,6 +206,94 @@ public final class NASConfigurationService {
         )
     }
 
+    public func recoverySources() throws -> [NASRecoverySource] {
+        guard let configuration = try store.load() else {
+            throw NASConfigurationError.configurationMissing
+        }
+        let mount = try locator.locate()
+        let departmentRoot = try pathValidator.resolveDirectDirectory(
+            named: configuration.department,
+            under: mount.trustedRootURL
+        )
+        let employeeRoot = try pathValidator.resolveDirectDirectory(
+            named: configuration.employee,
+            under: departmentRoot
+        )
+        let devicesRoot = try pathValidator.resolveDirectDirectory(named: "devices", under: employeeRoot)
+        let deviceDirectories = try pathValidator.directDirectories(under: devicesRoot)
+        var sources: [NASRecoverySource] = []
+        for option in deviceDirectories {
+            guard let deviceRoot = try? pathValidator.resolveDirectDirectory(named: option.name, under: devicesRoot),
+                  let marker = try? readMarker(from: deviceRoot),
+                  marker.endpoint == mount.endpoint,
+                  marker.department == configuration.department,
+                  marker.employee == configuration.employee,
+                  marker.deviceDirectoryName == option.name,
+                  (try? pathValidator.resolveDirectDirectory(named: "incremental-backups", under: deviceRoot)) != nil
+            else { continue }
+            let identity = NASRecoverySourceIdentity(
+                department: marker.department,
+                employee: marker.employee,
+                deviceID: marker.deviceID,
+                deviceDirectoryName: marker.deviceDirectoryName
+            )
+            let target = try resolveRecoveryTarget(identity)
+            sources.append(NASRecoverySource(
+                identity: identity,
+                deviceName: marker.deviceName,
+                lastBackupAt: lastBackupDate(at: target.backupRoot),
+                isCurrentDevice: marker.deviceID == configuration.deviceID
+                    && marker.deviceDirectoryName == configuration.deviceDirectoryName
+            ))
+        }
+        return sources.sorted {
+            if $0.isCurrentDevice != $1.isCurrentDevice { return $0.isCurrentDevice }
+            if $0.lastBackupAt != $1.lastBackupAt {
+                return ($0.lastBackupAt ?? .distantPast) > ($1.lastBackupAt ?? .distantPast)
+            }
+            return $0.identity.deviceDirectoryName < $1.identity.deviceDirectoryName
+        }
+    }
+
+    public func resolveRecoveryTarget(_ identity: NASRecoverySourceIdentity) throws -> NASBackupTarget {
+        let mount = try locator.locate()
+        let departmentRoot = try pathValidator.resolveDirectDirectory(
+            named: identity.department,
+            under: mount.trustedRootURL
+        )
+        let employeeRoot = try pathValidator.resolveDirectDirectory(named: identity.employee, under: departmentRoot)
+        let devicesRoot = try pathValidator.resolveDirectDirectory(named: "devices", under: employeeRoot)
+        let deviceRoot = try pathValidator.resolveDirectDirectory(
+            named: identity.deviceDirectoryName,
+            under: devicesRoot
+        )
+        let marker = try readMarker(from: deviceRoot)
+        guard marker.endpoint == mount.endpoint,
+              marker.department == identity.department,
+              marker.employee == identity.employee,
+              marker.deviceID == identity.deviceID,
+              marker.deviceDirectoryName == identity.deviceDirectoryName
+        else {
+            throw NASConfigurationError.invalidDeviceMarker(deviceRoot.path)
+        }
+        let backupRoot = try pathValidator.resolveDirectDirectory(named: "incremental-backups", under: deviceRoot)
+        let configuration = NASBackupConfiguration(
+            endpoint: marker.endpoint,
+            department: marker.department,
+            employee: marker.employee,
+            deviceID: marker.deviceID,
+            deviceName: marker.deviceName,
+            deviceDirectoryName: marker.deviceDirectoryName
+        )
+        return NASBackupTarget(
+            configuration: configuration,
+            employeeRoot: employeeRoot,
+            deviceRoot: deviceRoot,
+            backupRoot: backupRoot,
+            localStateRoot: localStateRoot.appendingPathComponent(marker.deviceID.uuidString.lowercased(), isDirectory: true)
+        )
+    }
+
     private func selectDeviceRoot(
         devicesRoot: URL,
         preferredDirectoryName: String?,
@@ -276,6 +364,14 @@ public final class NASConfigurationService {
         else {
             throw NASConfigurationError.invalidDeviceMarker(deviceRoot.path)
         }
+    }
+
+    private func lastBackupDate(at backupRoot: URL) -> Date? {
+        let manifestURL = backupRoot.appendingPathComponent("manifest.json")
+        guard let data = try? Data(contentsOf: manifestURL) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode(BackupManifest.self, from: data))?.updatedAt
     }
 
     private static func deviceDirectoryName(deviceName: String, deviceID: UUID) -> String {

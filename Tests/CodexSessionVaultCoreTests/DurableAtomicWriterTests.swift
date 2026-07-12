@@ -55,6 +55,22 @@ struct DurableAtomicWriterTests {
 
         #expect(FileManager.default.fileExists(atPath: missingParent.path) == false)
     }
+
+    @Test
+    func writeIfAbsentNeverReplacesExistingDestination() throws {
+        let root = makeDurableWriterTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let destination = root.appendingPathComponent("session.jsonl")
+        try Data("live".utf8).write(to: destination)
+
+        #expect(throws: (any Error).self) {
+            try DurableAtomicWriter().writeIfAbsent(Data("backup".utf8), to: destination)
+        }
+
+        #expect(try String(contentsOf: destination, encoding: .utf8) == "live")
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.path) == ["session.jsonl"])
+    }
 }
 
 private enum DurableAtomicWriterTestError: Error, Equatable {

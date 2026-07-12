@@ -17,6 +17,33 @@ public struct DurableAtomicWriter {
         to destination: URL,
         createParentDirectories: Bool = false
     ) throws {
+        try commit(
+            data,
+            to: destination,
+            createParentDirectories: createParentDirectories,
+            replaceExisting: true
+        )
+    }
+
+    public func writeIfAbsent(
+        _ data: Data,
+        to destination: URL,
+        createParentDirectories: Bool = false
+    ) throws {
+        try commit(
+            data,
+            to: destination,
+            createParentDirectories: createParentDirectories,
+            replaceExisting: false
+        )
+    }
+
+    private func commit(
+        _ data: Data,
+        to destination: URL,
+        createParentDirectories: Bool,
+        replaceExisting: Bool
+    ) throws {
         let parent = destination.deletingLastPathComponent().standardizedFileURL
         if createParentDirectories {
             try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -46,7 +73,7 @@ public struct DurableAtomicWriter {
                 throw error
             }
 
-            if fileManager.fileExists(atPath: destination.path) {
+            if replaceExisting, fileManager.fileExists(atPath: destination.path) {
                 _ = try fileManager.replaceItemAt(destination, withItemAt: temporary)
             } else {
                 try fileManager.moveItem(at: temporary, to: destination)
