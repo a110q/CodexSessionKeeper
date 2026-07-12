@@ -36,13 +36,14 @@ struct NASBackupRuntimeTests {
     func disconnectedStartupSchedulesThirtySecondRetryAndReconnectStartsOneAgent() throws {
         let fixture = try NASRuntimeFixture()
         defer { fixture.cleanup() }
-        _ = try fixture.activateStoredConfiguration()
+        let configured = try fixture.activateStoredConfiguration()
         fixture.connected = false
         let runtime = fixture.makeRuntime()
 
         try runtime.initialize()
 
         #expect(runtime.setupSnapshot().state == .disconnected)
+        #expect(runtime.setupSnapshot().configuration == configured.configuration)
         #expect(fixture.agentFactory.agents.isEmpty)
         #expect(fixture.scheduler.delays == [30])
 
@@ -68,6 +69,36 @@ struct NASBackupRuntimeTests {
     }
 
     @Test
+    func setupSnapshotReportsMetadataOnlyPendingCount() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        fixture.agentFactory.agents[0].pendingCount = 2
+
+        let snapshot = runtime.setupSnapshot()
+
+        #expect(snapshot.state == .pending)
+        #expect(snapshot.pendingCount == 2)
+    }
+
+    @Test
+    func setupSnapshotSurfacesAgentLocalErrorStatus() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        let target = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        try fixture.writeLocalErrorStatus(for: target, message: "NAS volume disappeared")
+
+        let snapshot = runtime.setupSnapshot()
+
+        #expect(snapshot.state == .error)
+        #expect(snapshot.lastError == "NAS volume disappeared")
+    }
+
+    @Test
     func manualRetryAfterReconnectStartsAgent() throws {
         let fixture = try NASRuntimeFixture()
         defer { fixture.cleanup() }
@@ -81,6 +112,22 @@ struct NASBackupRuntimeTests {
 
         #expect(fixture.agentFactory.agents.count == 1)
         #expect(runtime.setupSnapshot().state == .running)
+    }
+
+    @Test
+    func manualRetryRevalidatesAndRestartsAnExistingAgent() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+
+        try runtime.retry()
+
+        #expect(fixture.agentFactory.agents.count == 2)
+        #expect(fixture.agentFactory.agents[0].stopCount == 1)
+        let restarted = try #require(fixture.agentFactory.agents.dropFirst().first)
+        #expect(restarted.startCount == 1)
     }
 
     @Test
@@ -235,6 +282,30 @@ private final class NASRuntimeFixture {
         )
     }
 
+    func writeLocalErrorStatus(for target: NASBackupTarget, message: String) throws {
+        let status = BackupStatus(
+            agentVersion: "2.0.0",
+            enabled: true,
+            status: .error,
+            mode: .polling,
+            codexRoot: codexRoot.path,
+            backupRoot: target.backupRoot.path,
+            firstRunAt: Date(timeIntervalSince1970: 1_700_000_000),
+            lastStartedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            lastHeartbeatAt: Date(timeIntervalSince1970: 1_700_000_001),
+            lastBackupAt: nil,
+            sessionCount: 1,
+            lineCount: 1,
+            bytesBackedUp: 32,
+            autoStartEnabled: false,
+            lastError: message
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try FileManager.default.createDirectory(at: target.localStateRoot, withIntermediateDirectories: true)
+        try encoder.encode(status).write(to: target.localStateRoot.appendingPathComponent("status.json"))
+    }
+
     func cleanup() {
         try? FileManager.default.removeItem(at: root)
     }
@@ -259,6 +330,7 @@ private final class RecordingNASAgent: NASBackupAgentControlling {
     let paths: BackupPaths
     private(set) var startCount = 0
     private(set) var stopCount = 0
+    var pendingCount = 0
 
     init(paths: BackupPaths) {
         self.paths = paths
@@ -272,7 +344,7 @@ private final class RecordingNASAgent: NASBackupAgentControlling {
         stopCount += 1
     }
 
-    func pendingSessionCount() throws -> Int { 0 }
+    func pendingSessionCount() throws -> Int { pendingCount }
 }
 
 @MainActor

@@ -107,6 +107,10 @@ public final class NASConfigurationService {
         try locator.locate()
     }
 
+    public func savedConfiguration() throws -> NASBackupConfiguration? {
+        try store.load()
+    }
+
     public func departments() throws -> [NASDirectoryOption] {
         let mount = try locator.locate()
         return try pathValidator.directDirectories(under: mount.trustedRootURL)

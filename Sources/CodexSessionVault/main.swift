@@ -101,16 +101,6 @@ private struct SessionDatabaseRow: Decodable {
     let archived: Int
 }
 
-private struct IncrementalRecoveryIndexEntry: Decodable {
-    let id: String
-    let rolloutPath: String
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case rolloutPath = "rollout_path"
-    }
-}
-
 private struct RolloutFileMetadata {
     var cwd = ""
     var modelProvider = "unknown"
@@ -168,6 +158,7 @@ private struct VaultWorkerCommand: Codable, Sendable {
     let snapshotName: String?
     let restoreMode: RestoreMode?
     let protectionMode: RestoreProtectionMode?
+    let incrementalRecoverySource: NASRecoverySourceIdentity?
     let cancellationPath: String?
 
     init(
@@ -180,6 +171,7 @@ private struct VaultWorkerCommand: Codable, Sendable {
         snapshotName: String? = nil,
         restoreMode: RestoreMode? = nil,
         protectionMode: RestoreProtectionMode? = nil,
+        incrementalRecoverySource: NASRecoverySourceIdentity? = nil,
         cancellationPath: String? = nil
     ) {
         self.operation = operation
@@ -191,6 +183,7 @@ private struct VaultWorkerCommand: Codable, Sendable {
         self.snapshotName = snapshotName
         self.restoreMode = restoreMode
         self.protectionMode = protectionMode
+        self.incrementalRecoverySource = incrementalRecoverySource
         self.cancellationPath = cancellationPath
     }
 
@@ -205,6 +198,7 @@ private struct VaultWorkerCommand: Codable, Sendable {
             snapshotName: snapshotName,
             restoreMode: restoreMode,
             protectionMode: protectionMode,
+            incrementalRecoverySource: incrementalRecoverySource,
             cancellationPath: cancellationPath
         )
     }
@@ -346,12 +340,17 @@ final class VaultModel: ObservableObject {
     @Published var isCancellationRequested = false
     @Published var snapshotName = ""
     @Published var lastError: String?
-    @Published private(set) var localBackupStatus: BackupStatus?
-    @Published private(set) var localBackupStatusLabel = "备份：未启动"
-    @Published private(set) var localBackupStatusDetail = "等待启动"
+    @Published private(set) var nasSetupSnapshot = NASSetupSnapshot.unconfigured
+    @Published var nasDepartments: [NASDirectoryOption] = []
+    @Published var nasEmployees: [NASDirectoryOption] = []
+    @Published var selectedNASDepartment = ""
+    @Published var selectedNASEmployee = ""
+    @Published var nasRecoverySources: [NASRecoverySource] = []
+    @Published var selectedNASRecoverySourceID: UUID?
+    @Published var isNASSetupPresented = false
 
     private static let autoRestoreDefaultsKey = "autoRestoreOnLaunch"
-    private static let localBackupStatusRefreshInterval: UInt64 = 15_000_000_000
+    private static let nasStatusRefreshInterval: UInt64 = 2_000_000_000
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
@@ -359,9 +358,9 @@ final class VaultModel: ObservableObject {
     private var didRunLaunchAutoRestore = false
     private var conversationLoadID = UUID()
     private var sessionSearchTask: Task<Void, Never>?
-    private var localBackupAgent: BackupAgent?
-    private var localBackupPaths: BackupPaths?
-    private var localBackupStatusTask: Task<Void, Never>?
+    private var nasRuntime: NASBackupRuntime!
+    private var nasConfigurationService: NASConfigurationService!
+    private var nasStatusTask: Task<Void, Never>?
     private var currentCancellationURL: URL?
     fileprivate var operationCancellationURL: URL?
 
@@ -390,16 +389,28 @@ final class VaultModel: ObservableObject {
         vaultRoot = explicitVaultRoot ?? "\(home)/.codex-session-vault"
         autoRestoreOnLaunch = false
         UserDefaults.standard.set(false, forKey: Self.autoRestoreDefaultsKey)
+        let vaultURL = URL(fileURLWithPath: vaultRoot, isDirectory: true)
+        let store = NASConfigurationStore(
+            fileURL: vaultURL.appendingPathComponent("nas-backup-settings.json")
+        )
+        let service = NASConfigurationService(
+            store: store,
+            localStateRoot: vaultURL.appendingPathComponent("nas-state", isDirectory: true)
+        )
+        nasConfigurationService = service
+        nasRuntime = NASBackupRuntime(
+            configurationService: service,
+            codexRoot: URL(fileURLWithPath: codexRoot, isDirectory: true)
+        )
         if refreshOnInit {
             refresh()
-            startLocalIncrementalBackup()
+            initializeNASBackup()
         }
     }
 
     deinit {
         sessionSearchTask?.cancel()
-        localBackupStatusTask?.cancel()
-        localBackupAgent?.stop()
+        nasStatusTask?.cancel()
     }
 
     var selectedSnapshot: SnapshotMeta? {
@@ -445,8 +456,31 @@ final class VaultModel: ObservableObject {
         incrementalBackupCandidates.filter { checkedIncrementalBackupIDs.contains($0.id) && $0.isRestorable }
     }
 
-    var localBackupStatusIsError: Bool {
-        localBackupStatus?.status == .error || localBackupStatusLabel.contains("错误")
+    var nasBackupStatusIsError: Bool {
+        nasSetupSnapshot.state == .error || nasSetupSnapshot.state == .disconnected
+    }
+
+    var nasBackupStatusLabel: String {
+        switch nasSetupSnapshot.state {
+        case .unconfigured: return "公司 NAS 会话备份：未配置"
+        case .disconnected: return "公司 NAS 会话备份：NAS 未连接"
+        case .validating: return "公司 NAS 会话备份：验证中"
+        case .seeding: return "公司 NAS 会话备份：正在建立初始备份"
+        case .running: return "公司 NAS 会话备份：正常"
+        case .pending: return "公司 NAS 会话备份：存在待补传内容"
+        case .error: return "公司 NAS 会话备份：失败"
+        }
+    }
+
+    var nasBackupStatusDetail: String {
+        if let error = nasSetupSnapshot.lastError, !error.isEmpty { return Self.shortBackupDetail(error) }
+        guard let configuration = nasSetupSnapshot.configuration else { return "请完成部门和姓名配置" }
+        let identity = "\(configuration.department)/\(configuration.employee) · \(configuration.deviceName)"
+        if nasSetupSnapshot.pendingCount > 0 {
+            return "\(identity) · 待补传 \(nasSetupSnapshot.pendingCount)"
+        }
+        let lastBackup = nasSetupSnapshot.lastBackupAt?.formatted(date: .omitted, time: .shortened) ?? "尚无成功备份"
+        return "\(identity) · \(lastBackup)"
     }
 
     var filteredSnapshots: [SnapshotMeta] {
@@ -526,38 +560,25 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    private func startLocalIncrementalBackup() {
-        guard localBackupAgent == nil else {
-            refreshLocalBackupStatus()
-            return
+    private func initializeNASBackup() {
+        try? nasRuntime.initialize()
+        syncNASSetupSnapshot()
+        if nasSetupSnapshot.state == .unconfigured {
+            isNASSetupPresented = true
+            refreshNASCatalog()
+        } else {
+            refreshNASRecoverySources()
         }
-
-        let codexRootURL = URL(fileURLWithPath: codexRoot, isDirectory: true)
-        let backupRootURL = URL(fileURLWithPath: vaultRoot, isDirectory: true)
-            .appendingPathComponent("incremental-backups", isDirectory: true)
-        let paths = BackupPaths(codexRoot: codexRootURL, backupRoot: backupRootURL)
-        let agent = BackupAgent(paths: paths)
-
-        localBackupPaths = paths
-        localBackupAgent = agent
-        publishLocalBackupStatus(
-            status: nil,
-            label: "备份：启动中",
-            detail: "准备扫描"
-        )
-
-        agent.startPolling(intervalSeconds: 10)
-        refreshLocalBackupStatus()
-        startLocalBackupStatusRefreshLoop()
+        startNASStatusRefreshLoop()
     }
 
-    private func startLocalBackupStatusRefreshLoop() {
-        localBackupStatusTask?.cancel()
-        localBackupStatusTask = Task { [weak self] in
+    private func startNASStatusRefreshLoop() {
+        nasStatusTask?.cancel()
+        nasStatusTask = Task { [weak self] in
             while !Task.isCancelled {
-                self?.refreshLocalBackupStatus()
+                self?.syncNASSetupSnapshot()
                 do {
-                    try await Task.sleep(nanoseconds: Self.localBackupStatusRefreshInterval)
+                    try await Task.sleep(nanoseconds: Self.nasStatusRefreshInterval)
                 } catch {
                     return
                 }
@@ -565,86 +586,119 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    private func refreshLocalBackupStatus() {
-        guard let paths = localBackupPaths else {
-            publishLocalBackupStatus(
-                status: nil,
-                label: "备份：未启动",
-                detail: "等待启动"
-            )
-            return
-        }
+    private func syncNASSetupSnapshot() {
+        nasSetupSnapshot = nasRuntime.setupSnapshot()
+    }
 
-        guard fileManager.fileExists(atPath: paths.statusURL.path) else {
-            publishLocalBackupStatus(
-                status: nil,
-                label: "备份：启动中",
-                detail: "等待状态"
-            )
-            return
-        }
-
+    func refreshNASCatalog() {
         do {
-            let status = try loadLocalBackupStatus(from: paths.statusURL)
-            publishLocalBackupStatus(
-                status: status,
-                label: Self.localBackupStatusLabel(for: status.status),
-                detail: Self.localBackupStatusDetail(for: status)
-            )
+            let departments = try nasConfigurationService.departments()
+            nasDepartments = departments
+            if !departments.contains(where: { $0.name == selectedNASDepartment }) {
+                let savedDepartment: String? = nasSetupSnapshot.configuration?.department
+                selectedNASDepartment = savedDepartment
+                    .flatMap { saved in departments.first(where: { $0.name == saved })?.name }
+                    ?? departments.first?.name
+                    ?? ""
+            }
+            loadNASEmployees()
+            lastError = nil
         } catch {
-            publishLocalBackupStatus(
-                status: nil,
-                label: "备份：错误",
-                detail: Self.shortBackupDetail(error.localizedDescription)
-            )
+            nasDepartments = []
+            nasEmployees = []
+            selectedNASDepartment = ""
+            selectedNASEmployee = ""
+            lastError = "检测公司 NAS 失败：\(error.localizedDescription)"
         }
     }
 
-    private func publishLocalBackupStatus(
-        status nextStatus: BackupStatus?,
-        label nextLabel: String,
-        detail nextDetail: String
-    ) {
-        let currentIsError = localBackupStatus?.status == .error || localBackupStatusLabel.contains("错误")
-        let nextIsError = nextStatus?.status == .error || nextLabel.contains("错误")
-        guard localBackupStatusLabel != nextLabel
-            || localBackupStatusDetail != nextDetail
-            || currentIsError != nextIsError
-        else {
+    func loadNASEmployees() {
+        guard !selectedNASDepartment.isEmpty else {
+            nasEmployees = []
+            selectedNASEmployee = ""
             return
         }
-
-        localBackupStatus = nextStatus
-        localBackupStatusLabel = nextLabel
-        localBackupStatusDetail = nextDetail
-    }
-
-    private func loadLocalBackupStatus(from url: URL) throws -> BackupStatus {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(BackupStatus.self, from: Data(contentsOf: url))
-    }
-
-    private static func localBackupStatusLabel(for status: BackupHealthStatus) -> String {
-        switch status {
-        case .running:
-            return "备份：运行中"
-        case .waiting:
-            return "备份：等待"
-        case .error:
-            return "备份：错误"
-        case .paused:
-            return "备份：暂停"
+        do {
+            let employees = try nasConfigurationService.employees(in: selectedNASDepartment)
+            nasEmployees = employees
+            if !employees.contains(where: { $0.name == selectedNASEmployee }) {
+                let savedEmployee: String? = nasSetupSnapshot.configuration?.employee
+                selectedNASEmployee = savedEmployee
+                    .flatMap { saved in employees.first(where: { $0.name == saved })?.name }
+                    ?? employees.first?.name
+                    ?? ""
+            }
+        } catch {
+            nasEmployees = []
+            selectedNASEmployee = ""
+            lastError = "读取员工目录失败：\(error.localizedDescription)"
         }
     }
 
-    private static func localBackupStatusDetail(for status: BackupStatus) -> String {
-        if let lastError = status.lastError, !lastError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return shortBackupDetail(lastError)
+    func activateSelectedNASIdentity() {
+        guard nasDepartments.contains(where: { $0.name == selectedNASDepartment }),
+              nasEmployees.contains(where: { $0.name == selectedNASEmployee }) else {
+            lastError = "请从当前 NAS 列表选择部门和姓名。"
+            return
         }
+        if let old = nasSetupSnapshot.configuration,
+           old.department != selectedNASDepartment || old.employee != selectedNASEmployee {
+            let alert = NSAlert()
+            alert.messageText = "更换 NAS 备份身份？"
+            alert.informativeText = "当前：\(old.department)/\(old.employee)\n新的：\(selectedNASDepartment)/\(selectedNASEmployee)\n\n旧备份不会迁移或删除，新身份会重新建立初始备份。"
+            alert.addButton(withTitle: "确认更换")
+            alert.addButton(withTitle: "取消")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        do {
+            _ = try nasRuntime.activate(
+                department: selectedNASDepartment,
+                employee: selectedNASEmployee
+            )
+            syncNASSetupSnapshot()
+            refreshNASRecoverySources()
+            isNASSetupPresented = false
+            lastError = nil
+        } catch {
+            syncNASSetupSnapshot()
+            lastError = "NAS 配置失败：\(error.localizedDescription)"
+        }
+    }
 
-        let backupTime = status.lastBackupAt?.formatted(date: .omitted, time: .shortened) ?? "尚无备份"
-        return "\(status.sessionCount) 会话 · \(status.lineCount) 行 · \(backupTime)"
+    func retryNASBackup() {
+        do {
+            try nasRuntime.retry()
+            syncNASSetupSnapshot()
+            refreshNASRecoverySources()
+            lastError = nil
+        } catch {
+            syncNASSetupSnapshot()
+            lastError = "NAS 重新连接失败：\(error.localizedDescription)"
+        }
+    }
+
+    func presentNASReconfiguration() {
+        selectedNASDepartment = nasSetupSnapshot.configuration?.department ?? ""
+        selectedNASEmployee = nasSetupSnapshot.configuration?.employee ?? ""
+        isNASSetupPresented = true
+        refreshNASCatalog()
+    }
+
+    func stopNASBackup() {
+        nasRuntime.stop()
+    }
+
+    func refreshNASRecoverySources() {
+        do {
+            let sources = try nasRuntime.recoverySources()
+            nasRecoverySources = sources
+            if !sources.contains(where: { $0.id == selectedNASRecoverySourceID }) {
+                selectedNASRecoverySourceID = sources.first?.id
+            }
+        } catch {
+            nasRecoverySources = []
+            selectedNASRecoverySourceID = nil
+        }
     }
 
     private static func shortBackupDetail(_ detail: String) -> String {
@@ -775,11 +829,10 @@ final class VaultModel: ObservableObject {
 
     func refreshIncrementalBackupCandidates() {
         do {
-            let paths = localBackupPaths ?? BackupPaths(
-                codexRoot: URL(fileURLWithPath: codexRoot, isDirectory: true),
-                backupRoot: URL(fileURLWithPath: vaultRoot, isDirectory: true)
-                    .appendingPathComponent("incremental-backups", isDirectory: true)
-            )
+            guard let source = nasRecoverySources.first(where: { $0.id == selectedNASRecoverySourceID }) else {
+                throw VaultError.commandFailed("请先选择一个 NAS 备份设备。")
+            }
+            let paths = try nasRuntime.paths(for: source.identity)
             let currentIDs = Set((try loadSessions()).map(\.id))
             let result = try IncrementalBackupCatalog(paths: paths).load(currentSessionIDs: currentIDs)
             incrementalBackupCatalogSummary = result
@@ -1065,7 +1118,7 @@ final class VaultModel: ObservableObject {
         let names = targets.prefix(8).map(\.title).joined(separator: "\n")
         let suffix = targets.count > 8 ? "\n等 \(targets.count) 个会话" : ""
         guard let protectionMode = chooseRestoreProtectionMode(
-            title: "从本地备份恢复缺失会话？",
+            title: "从公司 NAS 恢复缺失会话？",
             message: """
             将恢复 \(targets.count) 个当前 Codex 中缺失的会话：
 
@@ -1093,15 +1146,20 @@ final class VaultModel: ObservableObject {
             )
         }
 
+        guard let recoverySource = nasRecoverySources.first(where: { $0.id == selectedNASRecoverySourceID }) else {
+            inform(title: "没有选择 NAS 备份设备", message: "请先选择当前设备或旧设备备份。")
+            return
+        }
         let command = VaultWorkerCommand(
             operation: .restoreIncrementalBackupSessions,
             codexRoot: codexRoot,
             vaultRoot: vaultRoot,
             sessions: commandSessions,
-            protectionMode: protectionMode
+            protectionMode: protectionMode,
+            incrementalRecoverySource: recoverySource.identity
         )
         Task {
-            await runWorker("正在从本地备份恢复缺失会话...", command: command) { response in
+            await runWorker("正在从公司 NAS 恢复缺失会话...", command: command) { response in
                 self.checkedIncrementalBackupIDs.removeAll()
                 self.refresh()
                 self.refreshIncrementalBackupCandidates()
@@ -2145,78 +2203,6 @@ final class VaultModel: ObservableObject {
                 snapshotID: attachmentSnapshotID
             )
         }
-    }
-
-    private func repairRecoveredThreadIndex(
-        package: BackupRecoveryPackage,
-        catalog: IncrementalBackupCatalogResult,
-        sessionIDs: [String],
-        codexRoot: URL
-    ) -> RecoveredThreadIndexResult {
-        do {
-            let entries = try recoveredThreadIndexEntries(
-                package: package,
-                catalog: catalog,
-                sessionIDs: sessionIDs,
-                codexRoot: codexRoot
-            )
-            let databaseURL = codexRoot.appendingPathComponent("state_5.sqlite", isDirectory: false)
-            try RestoreFilesystemValidator.validateDestination(databaseURL, under: codexRoot)
-            return try RecoveredThreadIndexWriter().ensureThreads(
-                entries: entries,
-                databaseURL: databaseURL
-            )
-        } catch {
-            return RecoveredThreadIndexResult(
-                insertedCount: 0,
-                skippedCount: 0,
-                warning: "SQLite 索引未写入：\(error.localizedDescription)"
-            )
-        }
-    }
-
-    private func recoveredThreadIndexEntries(
-        package: BackupRecoveryPackage,
-        catalog: IncrementalBackupCatalogResult,
-        sessionIDs: [String],
-        codexRoot: URL
-    ) throws -> [RecoveredThreadIndexEntry] {
-        let candidatesByID = Dictionary(uniqueKeysWithValues: catalog.candidates.map { ($0.sessionId, $0) })
-        let rolloutPathsByID = try recoveredRolloutPathsByID(from: package.sessionIndexURL)
-        return try sessionIDs.compactMap { sessionID in
-            guard let candidate = candidatesByID[sessionID],
-                  let rolloutPath = rolloutPathsByID[sessionID] else {
-                return nil
-            }
-            let record = BackupSessionRecord(
-                sessionId: candidate.sessionId,
-                sourcePath: candidate.sourcePath,
-                backupPath: candidate.backupPath,
-                title: candidate.title,
-                firstSeenAt: candidate.firstSeenAt,
-                lastBackedUpAt: candidate.lastBackedUpAt,
-                lineCount: candidate.lineCount,
-                bytesBackedUp: candidate.bytesBackedUp,
-                status: "active"
-            )
-            return try makeRecoveredThreadIndexEntry(
-                record: record,
-                recoveredURL: URL(fileURLWithPath: rolloutPath, isDirectory: false),
-                codexRoot: codexRoot
-            )
-        }
-    }
-
-    private func recoveredRolloutPathsByID(from sessionIndexURL: URL) throws -> [String: String] {
-        let data = try Data(contentsOf: sessionIndexURL)
-        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
-        let decoder = JSONDecoder()
-        return Dictionary(
-            uniqueKeysWithValues: try lines.map { line in
-                let entry = try decoder.decode(IncrementalRecoveryIndexEntry.self, from: Data(line))
-                return (entry.id, entry.rolloutPath)
-            }
-        )
     }
 
     private func restoreSingleSession(snapshot: SnapshotMeta, session: CodexSession) throws {
@@ -4167,38 +4153,32 @@ final class VaultModel: ObservableObject {
         case .restoreIncrementalBackupSessions:
             let requestedIDs = Set(command.sessions.map(\.id))
             guard !requestedIDs.isEmpty else {
-                throw VaultError.commandFailed("没有选择要从备份恢复的会话。")
+                throw VaultError.commandFailed("没有选择要从 NAS 恢复的会话。")
             }
-
-            let incrementalBackupRoot = URL(fileURLWithPath: command.vaultRoot, isDirectory: true)
-                .appendingPathComponent("incremental-backups", isDirectory: true)
+            guard let recoverySource = command.incrementalRecoverySource else {
+                throw VaultError.commandFailed("缺少 NAS 恢复设备身份。")
+            }
+            let vaultURL = URL(fileURLWithPath: command.vaultRoot, isDirectory: true)
+            let service = NASConfigurationService(
+                store: NASConfigurationStore(
+                    fileURL: vaultURL.appendingPathComponent("nas-backup-settings.json")
+                ),
+                localStateRoot: vaultURL.appendingPathComponent("nas-state", isDirectory: true)
+            )
+            let target = try service.resolveRecoveryTarget(recoverySource)
             let paths = BackupPaths(
                 codexRoot: URL(fileURLWithPath: command.codexRoot, isDirectory: true),
-                backupRoot: incrementalBackupRoot
+                backupRoot: target.backupRoot,
+                stateRoot: target.localStateRoot
             )
             let currentIDs = Set((try? loadSessions().map(\.id)) ?? [])
-            let catalog = try IncrementalBackupCatalog(paths: paths).load(currentSessionIDs: currentIDs)
-            let restorableIDs = catalog.candidates
-                .filter { requestedIDs.contains($0.sessionId) && $0.status == .missing }
-                .map(\.sessionId)
-                .sorted()
-            guard !restorableIDs.isEmpty else {
-                throw VaultError.commandFailed("选中的备份会话都已存在或不可恢复。")
-            }
+            let restorer = IncrementalRecoveryRestorer(paths: paths)
+            let plan = try restorer.preflight(
+                sessionIDs: Array(requestedIDs),
+                currentSessionIDs: currentIDs
+            )
+            guard !plan.items.isEmpty else { throw VaultError.commandFailed("选中的 NAS 会话都已存在。") }
             let destinationRoot = URL(fileURLWithPath: command.codexRoot, isDirectory: true)
-            try RestoreFilesystemValidator.validateDestination(
-                destinationRoot.appendingPathComponent("sessions", isDirectory: true),
-                under: destinationRoot,
-                recursive: true
-            )
-            try RestoreFilesystemValidator.validateDestination(
-                destinationRoot.appendingPathComponent("session_index.jsonl"),
-                under: destinationRoot
-            )
-            try RestoreFilesystemValidator.validateDestination(
-                destinationRoot.appendingPathComponent("state_5.sqlite"),
-                under: destinationRoot
-            )
 
             let protectionMode = selectedProtectionMode(default: .lightweight)
             try reportProtectionStart(
@@ -4221,25 +4201,35 @@ final class VaultModel: ObservableObject {
                 )
             }
 
-            try report(0.38, "正在生成增量备份恢复包...", "只打包当前仍缺失且被选中的会话。")
-            let package = try BackupRecoveryBuilder(paths: paths).buildRecoveryPackage(sessionIDs: restorableIDs)
-
-            try report(0.68, "正在恢复缺失会话...", "正在复制 recovered 会话文件并合并 session_index.jsonl。")
-            let root = URL(fileURLWithPath: command.codexRoot, isDirectory: true)
-            try restoreConversationsOnly(
-                from: package.dataURL,
-                to: root,
-                includedPaths: ["session_index.jsonl", "sessions"],
-                snapshotCodexRoot: command.codexRoot
-            )
-            let indexResult = repairRecoveredThreadIndex(
-                package: package,
-                catalog: catalog,
-                sessionIDs: restorableIDs,
-                codexRoot: root
-            )
-            try report(1.0, "备份恢复完成", "已恢复 \(restorableIDs.count) 个缺失会话。\(indexResult.message)")
-            return .ok(message: "已从本地增量备份恢复 \(restorableIDs.count) 个缺失会话。\(indexResult.message) 请重启 Codex 后查看。")
+            try report(0.60, "正在恢复 NAS 缺失会话...", "正在直接原子写入 recovered 会话并合并 session_index.jsonl。")
+            let result = try restorer.restore(plan, to: destinationRoot)
+            let manifest = try BackupManifestStore(
+                manifestURL: paths.manifestURL,
+                createParentDirectories: false
+            ).loadOrCreate(codexRoot: paths.codexRoot.path, backupRoot: paths.backupRoot.path)
+            let threadEntries = try result.threadRecords.compactMap { thread -> RecoveredThreadIndexEntry? in
+                guard let record = manifest.sessions[thread.sessionID] else { return nil }
+                return try makeRecoveredThreadIndexEntry(
+                    record: record,
+                    recoveredURL: URL(fileURLWithPath: thread.rolloutPath),
+                    codexRoot: destinationRoot
+                )
+            }
+            let indexResult: RecoveredThreadIndexResult
+            do {
+                indexResult = try RecoveredThreadIndexWriter().ensureThreads(
+                    entries: threadEntries,
+                    databaseURL: destinationRoot.appendingPathComponent("state_5.sqlite")
+                )
+            } catch {
+                indexResult = RecoveredThreadIndexResult(
+                    insertedCount: 0,
+                    skippedCount: 0,
+                    warning: "SQLite 索引未写入：\(error.localizedDescription)"
+                )
+            }
+            try report(1.0, "NAS 恢复完成", "已恢复 \(result.restoredSessionIDs.count) 个缺失会话。\(indexResult.message)")
+            return .ok(message: "已从公司 NAS 恢复 \(result.restoredSessionIDs.count) 个缺失会话。\(indexResult.message) 请重启 Codex 后查看。")
 
         case .deleteSnapshots:
             let snapshotURLs = try command.snapshots.map(snapshotDirectoryURL)
@@ -4611,6 +4601,7 @@ private enum ConversationLogParser {
 
 @main
 struct CodexSessionVaultApp: App {
+    @NSApplicationDelegateAdaptor(AppTerminationDelegate.self) private var appDelegate
     @StateObject private var model = VaultModel(refreshOnInit: CommandLine.arguments.dropFirst().first != "--worker")
 
     init() {
@@ -4622,6 +4613,7 @@ struct CodexSessionVaultApp: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 1280, minHeight: 760)
+                .onAppear { appDelegate.model = model }
         }
         .windowStyle(.titleBar)
         .commands {
@@ -4764,6 +4756,11 @@ struct ContentView: View {
                     .frame(minWidth: 520, minHeight: 360)
             }
         }
+        .sheet(isPresented: $model.isNASSetupPresented) {
+            NASSetupView()
+                .environmentObject(model)
+                .interactiveDismissDisabled(model.nasSetupSnapshot.state == .unconfigured)
+        }
         .onAppear {
             model.clearSessionSearch()
             model.runLaunchAutoRestoreIfNeeded()
@@ -4801,6 +4798,119 @@ struct ContentView: View {
             )
         }
         .ignoresSafeArea()
+    }
+}
+
+final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
+    weak var model: VaultModel?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model,
+              model.nasSetupSnapshot.state == .seeding
+                || model.nasSetupSnapshot.state == .pending else {
+            return .terminateNow
+        }
+        let alert = NSAlert()
+        alert.messageText = "NAS 备份尚未完成，仍要退出吗？"
+        alert.informativeText = "仍有会话正在建立初始备份或等待补传。退出不会创建本地会话缓存，下次连接 NAS 后会继续。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "继续等待")
+        alert.addButton(withTitle: "仍然退出")
+        return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model?.stopNASBackup()
+    }
+}
+
+struct NASSetupView: View {
+    @EnvironmentObject private var model: VaultModel
+
+    private var selectionIsValid: Bool {
+        model.nasDepartments.contains { $0.name == model.selectedNASDepartment }
+            && model.nasEmployees.contains { $0.name == model.selectedNASEmployee }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(model.nasSetupSnapshot.configuration == nil ? "检测公司 NAS" : "更换 NAS 备份身份")
+                        .font(.title2.bold())
+                    Text("只需选择部门和姓名，软件会验证固定服务器、共享盘和目标目录。")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.nasSetupSnapshot.state != .unconfigured {
+                    Button("关闭") { model.isNASSetupPresented = false }
+                }
+            }
+
+            if model.nasSetupSnapshot.state == .disconnected {
+                GroupBox("NAS 未连接") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(model.nasSetupSnapshot.lastError ?? "请先在 Finder 中连接 192.168.10.99 的“文件中转站”共享盘。")
+                            .foregroundStyle(.secondary)
+                        Button("立即重试") { model.retryNASBackup() }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
+            if let error = model.lastError, !error.isEmpty {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            GroupBox("备份身份") {
+                VStack(alignment: .leading, spacing: 14) {
+                    Picker("部门", selection: $model.selectedNASDepartment) {
+                        Text("请选择部门").tag("")
+                        ForEach(model.nasDepartments) { option in
+                            Text(option.name).tag(option.name)
+                        }
+                    }
+                    .onChange(of: model.selectedNASDepartment) { _, _ in model.loadNASEmployees() }
+
+                    Picker("姓名", selection: $model.selectedNASEmployee) {
+                        Text("请选择姓名").tag("")
+                        ForEach(model.nasEmployees) { option in
+                            Text(option.name).tag(option.name)
+                        }
+                    }
+
+                    LabeledContent("固定目标") {
+                        Text("192.168.10.99 / 文件中转站 / codex会话备份 / \(model.selectedNASDepartment) / \(model.selectedNASEmployee)")
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+
+            if model.nasSetupSnapshot.state == .validating || model.nasSetupSnapshot.state == .seeding {
+                VStack(alignment: .leading, spacing: 8) {
+                    ProgressView()
+                    Text(model.nasSetupSnapshot.state == .seeding ? "正在建立初始备份" : "正在验证 NAS 目录和写入能力")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                Button("刷新列表") { model.refreshNASCatalog() }
+                Spacer()
+                Button("验证并启用备份") { model.activateSelectedNASIdentity() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!selectionIsValid || model.nasSetupSnapshot.state == .validating)
+            }
+        }
+        .padding(24)
+        .frame(width: 620)
+        .onAppear { model.refreshNASCatalog() }
     }
 }
 
@@ -5468,7 +5578,7 @@ struct SnapshotPane: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("快照恢复")
                             .font(.largeTitle.bold())
-                        Text(model.snapshotRestoreSource == .snapshots ? "用于切换账号后找回或回滚对话。" : "从本地增量备份恢复当前缺失的对话。")
+                        Text(model.snapshotRestoreSource == .snapshots ? "用于切换账号后找回或回滚对话。" : "从公司 NAS 设备备份恢复当前缺失的对话。")
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -5625,6 +5735,22 @@ struct IncrementalBackupRestoreControls: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Picker("NAS 备份设备", selection: $model.selectedNASRecoverySourceID) {
+                    ForEach(model.nasRecoverySources) { source in
+                        Text(source.isCurrentDevice
+                            ? "当前设备 · \(source.deviceName)"
+                            : "旧设备 · \(source.deviceName) · \(source.lastBackupAt?.formatted(date: .numeric, time: .shortened) ?? "无时间")")
+                            .tag(Optional(source.id))
+                    }
+                }
+                .frame(minWidth: 280)
+                .onChange(of: model.selectedNASRecoverySourceID) { _, _ in
+                    model.refreshIncrementalBackupCandidates()
+                }
+                Button("刷新设备") { model.refreshNASRecoverySources() }
+            }
+
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) {
                     searchAndToggles
@@ -5644,7 +5770,7 @@ struct IncrementalBackupRestoreControls: View {
                     .lineLimit(2)
                     .textSelection(.enabled)
             } else {
-                Text("读取本地增量备份后，会只列出当前 Codex 中缺失的会话。")
+                Text("读取所选公司 NAS 设备备份后，只列出当前 Codex 中缺失的会话。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -5689,7 +5815,7 @@ struct IncrementalBackupRestoreList: View {
             ContentUnavailableView(
                 "没有可显示的备份会话",
                 systemImage: "arrow.counterclockwise.circle",
-                description: Text(model.showExistingIncrementalBackups ? "本地增量备份为空，或搜索条件没有匹配。" : "当前没有缺失会话；打开“显示已存在”可排查全部备份记录。")
+                description: Text(model.showExistingIncrementalBackups ? "所选 NAS 设备备份为空，或搜索条件没有匹配。" : "当前没有缺失会话；打开“显示已存在”可排查全部备份记录。")
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -5836,7 +5962,7 @@ struct IncrementalBackupRestoreDetail: View {
             ContentUnavailableView(
                 "没有选中备份会话",
                 systemImage: "arrow.counterclockwise.circle",
-                description: Text("从左侧选择一个缺失会话，或刷新本地增量备份。")
+                description: Text("从左侧选择一个缺失会话，或刷新所选 NAS 设备备份。")
             )
         }
     }
@@ -6355,11 +6481,17 @@ struct StatusBar: View {
                 .foregroundStyle(model.lastError == nil ? Color(red: 0.29, green: 0.42, blue: 0.58) : Color(red: 0.76, green: 0.24, blue: 0.31))
                 Spacer()
                 HStack(spacing: 4) {
-                    Text(model.localBackupStatusLabel)
-                        .foregroundStyle(model.localBackupStatusIsError ? Color(red: 0.76, green: 0.24, blue: 0.31) : Color(red: 0.29, green: 0.42, blue: 0.58))
-                    Text(model.localBackupStatusDetail)
+                    Text(model.nasBackupStatusLabel)
+                        .foregroundStyle(model.nasBackupStatusIsError ? Color(red: 0.76, green: 0.24, blue: 0.31) : Color(red: 0.29, green: 0.42, blue: 0.58))
+                    Text(model.nasBackupStatusDetail)
                         .foregroundStyle(Color(red: 0.46, green: 0.56, blue: 0.69))
                         .truncationMode(.middle)
+                    Button("更换 NAS 备份身份") { model.presentNASReconfiguration() }
+                        .buttonStyle(.plain)
+                    if model.nasSetupSnapshot.state == .disconnected || model.nasSetupSnapshot.state == .error {
+                        Button("立即重试") { model.retryNASBackup() }
+                            .buttonStyle(.plain)
+                    }
                 }
                 .lineLimit(1)
                 Text(model.codexRoot)

@@ -18,6 +18,7 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
     public let pendingCount: Int
     public let completedCount: Int
     public let totalCount: Int
+    public let lastBackupAt: Date?
     public let lastError: String?
 
     public init(
@@ -26,6 +27,7 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
         pendingCount: Int = 0,
         completedCount: Int = 0,
         totalCount: Int = 0,
+        lastBackupAt: Date? = nil,
         lastError: String? = nil
     ) {
         self.state = state
@@ -33,6 +35,7 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
         self.pendingCount = pendingCount
         self.completedCount = completedCount
         self.totalCount = totalCount
+        self.lastBackupAt = lastBackupAt
         self.lastError = lastError
     }
 }
@@ -92,7 +95,10 @@ public final class NASBackupRuntime {
     public func initialize() throws {
         stopped = false
         guard agent == nil else { return }
-        snapshot = NASSetupSnapshot(state: .validating)
+        snapshot = NASSetupSnapshot(
+            state: .validating,
+            configuration: try configurationService.savedConfiguration()
+        )
         do {
             let target = try configurationService.resolveActiveTarget()
             startAgent(for: target)
@@ -123,8 +129,9 @@ public final class NASBackupRuntime {
     }
 
     public func retry() throws {
-        guard !stopped, agent == nil else { return }
+        guard !stopped else { return }
         retryScheduled = false
+        stopAgent()
         snapshot = NASSetupSnapshot(state: .validating, configuration: snapshot.configuration)
         do {
             let target = try configurationService.resolveActiveTarget()
@@ -142,7 +149,40 @@ public final class NASBackupRuntime {
     }
 
     public func setupSnapshot() -> NASSetupSnapshot {
-        snapshot
+        if let target = activeTarget,
+           let status = loadLocalStatus(from: target.localStateRoot.appendingPathComponent("status.json")) {
+            if status.status == .error {
+                snapshot = NASSetupSnapshot(
+                    state: .error,
+                    configuration: target.configuration,
+                    pendingCount: snapshot.pendingCount,
+                    completedCount: snapshot.completedCount,
+                    totalCount: snapshot.totalCount,
+                    lastBackupAt: status.lastBackupAt,
+                    lastError: status.lastError
+                )
+            } else if snapshot.state == .error {
+                snapshot = NASSetupSnapshot(
+                    state: .running,
+                    configuration: target.configuration,
+                    lastBackupAt: status.lastBackupAt
+                )
+            }
+        }
+        if let agent,
+           snapshot.state == .running || snapshot.state == .pending,
+           let pendingCount = try? agent.pendingSessionCount() {
+            snapshot = NASSetupSnapshot(
+                state: pendingCount > 0 ? .pending : .running,
+                configuration: snapshot.configuration,
+                pendingCount: pendingCount,
+                completedCount: snapshot.completedCount,
+                totalCount: snapshot.totalCount,
+                lastBackupAt: snapshot.lastBackupAt,
+                lastError: snapshot.lastError
+            )
+        }
+        return snapshot
     }
 
     public func recoverySources() throws -> [NASRecoverySource] {
@@ -216,5 +256,12 @@ public final class NASBackupRuntime {
             self.retryScheduled = false
             try? self.retry()
         }
+    }
+
+    private func loadLocalStatus(from url: URL) -> BackupStatus? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(BackupStatus.self, from: data)
     }
 }
