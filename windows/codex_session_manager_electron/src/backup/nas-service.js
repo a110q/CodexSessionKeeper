@@ -110,6 +110,56 @@ function createNasService({
     return Object.freeze({ configuration: Object.freeze({ ...configuration }), employeeRoot, deviceRoot, backupRoot });
   }
 
+  async function recoveryDevices(configuration) {
+    if (!configuration) throw new Error('NAS configuration is missing.');
+    const mount = await detect();
+    if (configuration.endpoint
+      && (configuration.endpoint.server !== endpoint.server || configuration.endpoint.share !== endpoint.share)) {
+      throw new Error('NAS configuration endpoint does not match the company endpoint.');
+    }
+    const departmentRoot = await directDirectory(mount.trustedRoot, configuration.department);
+    const employeeRoot = await directDirectory(departmentRoot, configuration.employee);
+    const devicesRoot = await directDirectory(employeeRoot, 'devices');
+    const names = await directDirectoryNames(devicesRoot);
+    const devices = [];
+    for (const directoryName of names) {
+      try {
+        const deviceRoot = await directDirectory(devicesRoot, directoryName);
+        const marker = await readJson(pathImpl.join(deviceRoot, 'device.json'));
+        const deviceConfiguration = {
+          version: Number(marker.version || 1),
+          endpoint: { ...endpoint },
+          department: configuration.department,
+          employee: configuration.employee,
+          deviceId: String(marker.deviceId || '').toLowerCase(),
+          deviceName: String(marker.deviceName || directoryName),
+          deviceDirectoryName: directoryName,
+        };
+        validateDeviceId(deviceConfiguration.deviceId);
+        if (!markerMatches(marker, deviceConfiguration, directoryName)) continue;
+        const backupRoot = await directDirectory(deviceRoot, 'incremental-backups');
+        devices.push(Object.freeze({
+          configuration: Object.freeze(deviceConfiguration),
+          deviceId: deviceConfiguration.deviceId,
+          deviceName: deviceConfiguration.deviceName,
+          deviceRoot,
+          backupRoot,
+        }));
+      } catch {
+        // Ignore malformed or incomplete device directories in the recovery catalog.
+      }
+    }
+    return Object.freeze(devices.sort((a, b) => a.deviceName.localeCompare(b.deviceName, 'zh-CN')));
+  }
+
+  async function resolveDevice(configuration, deviceId) {
+    validateDeviceId(deviceId);
+    const normalizedId = String(deviceId).toLowerCase();
+    const target = (await recoveryDevices(configuration)).find((device) => device.deviceId === normalizedId);
+    if (!target) throw new Error(`Unknown NAS backup device: ${deviceId}`);
+    return target;
+  }
+
   async function selectDeviceRoot({ devicesRoot, baseName, deviceId, selectedDeviceName, department, employee }) {
     let suffix = 1;
     while (true) {
@@ -184,6 +234,13 @@ function createNasService({
     }
   }
 
+  function validateDeviceId(value) {
+    if (typeof value !== 'string'
+      || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)) {
+      throw new Error(`Unknown NAS backup device: ${String(value)}`);
+    }
+  }
+
   async function verifyWritable(directory) {
     const probeRoot = pathImpl.join(directory, `.codex-session-keeper-probe-${randomUUID()}`);
     const source = pathImpl.join(probeRoot, 'write-test');
@@ -248,7 +305,16 @@ function createNasService({
     return normalize(lhs) === normalize(rhs);
   }
 
-  return Object.freeze({ endpoint, detect, departments, employees, activate, resolve });
+  return Object.freeze({
+    endpoint,
+    detect,
+    departments,
+    employees,
+    activate,
+    resolve,
+    recoveryDevices,
+    resolveDevice,
+  });
 }
 
 function deviceDirectoryName(name, deviceId) {

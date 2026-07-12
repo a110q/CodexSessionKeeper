@@ -204,3 +204,34 @@ test('Electron source contract exposes no renderer-controlled filesystem path ch
     .sort();
   assert.deepEqual(mainChannels, preloadChannels);
 });
+
+test('NAS setup and recovery IPC stays guarded and accepts identities instead of paths', () => {
+  const sourceRoot = path.join(__dirname, '..', '..', 'src');
+  const mainSource = fs.readFileSync(path.join(sourceRoot, 'main.js'), 'utf8');
+  const preloadSource = fs.readFileSync(path.join(sourceRoot, 'preload.js'), 'utf8');
+  const requiredChannels = [
+    'get-nas-setup-state',
+    'detect-company-nas',
+    'list-nas-departments',
+    'list-nas-employees',
+    'activate-nas-backup',
+    'retry-nas-backup',
+    'list-nas-backup-devices',
+    'load-incremental-backup-sessions',
+    'restore-incremental-backup-sessions',
+  ];
+
+  for (const channel of requiredChannels) {
+    assert.match(mainSource, new RegExp(`handleTrustedIpc\\('${channel}'`));
+    assert.match(preloadSource, new RegExp(`ipcRenderer\\.invoke\\('${channel}'`));
+  }
+  assert.doesNotMatch(mainSource, /\blocalBackupPaths\b|\blocalBackupAgent\b|buildIncrementalRecoveryPackage/);
+  assert.doesNotMatch(preloadSource, /backupRoot|targetPath|sourcePath|destinationPath/);
+  assert.match(preloadSource, /loadIncrementalBackupSessions:\s*\(deviceId\)/);
+  assert.match(preloadSource, /restoreIncrementalBackupSessions:\s*\(deviceId, sessionIds, protectionMode\)/);
+
+  const restoreHandler = mainSource.slice(mainSource.indexOf("handleTrustedIpc('restore-incremental-backup-sessions'"));
+  assert.ok(restoreHandler.indexOf('resolveRecoveryDevicePaths(deviceId)') < restoreHandler.indexOf('createRestoreProtectionSnapshot('));
+  assert.ok(restoreHandler.indexOf('preflightIncrementalRecovery(') < restoreHandler.indexOf('createRestoreProtectionSnapshot('));
+  assert.doesNotMatch(restoreHandler, /recovery-packages|buildIncrementalRecoveryPackage/);
+});

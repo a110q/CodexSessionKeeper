@@ -1,7 +1,8 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
-const { assertSafeSourcePath } = require('./restore-filesystem');
+const { replaceFileDurably, writeFileDurably } = require('./durable-write');
+const { assertSafeDestinationPath, assertSafeSourcePath } = require('./restore-filesystem');
 
 function safePathComponent(value) {
   const safe = String(value || '')
@@ -121,93 +122,145 @@ async function loadIncrementalBackupCatalog({ paths, currentSessionIds }) {
   };
 }
 
-async function uniquePackagePath(paths, createdAt) {
-  const packagesRoot = path.join(paths.backupRoot, 'recovery-packages');
-  await fsp.mkdir(packagesRoot, { recursive: true });
-  const baseName = `incremental-recovery-${createdAt.toISOString().replace(/[:.]/g, '-')}`;
-  let candidate = path.join(packagesRoot, baseName);
-  let suffix = 2;
-  while (existsSync(candidate)) {
-    candidate = path.join(packagesRoot, `${baseName}-${suffix}`);
-    suffix += 1;
-  }
-  await fsp.mkdir(candidate, { recursive: true });
-  return candidate;
-}
-
-async function buildIncrementalRecoveryPackage({ paths, sessionIds, now = () => new Date() }) {
+async function preflightIncrementalRecovery({ paths, sessionIds }) {
   const manifest = await readManifest(paths);
   const selected = new Set((sessionIds || []).map(String));
   const records = Object.values(manifest.sessions || {})
     .filter((record) => selected.has(record.sessionId))
     .sort((a, b) => String(a.sessionId).localeCompare(String(b.sessionId)));
 
-  if (!records.length) throw new Error('No requested sessions were found in the backup manifest.');
-
-  const backupSources = records.map((record) => ({
-    record,
-    backupFilePath: resolveBackupFile(paths, record, { requireExisting: true }),
-  }));
-  const createdAt = now();
-  const packagePath = await uniquePackagePath(paths, createdAt);
-  const dataPath = path.join(packagePath, 'data');
-  const recoveredRoot = path.join(dataPath, 'sessions', 'recovered');
-  await fsp.mkdir(recoveredRoot, { recursive: true });
-
-  const includedPaths = ['session_index.jsonl', 'sessions'];
-  const indexLines = [];
-  const recoveredFiles = {};
-  for (const { record, backupFilePath: validatedBackupFilePath } of backupSources) {
-    const backupFilePath = resolveBackupFile(paths, record, { requireExisting: true });
-    if (backupFilePath !== validatedBackupFilePath) {
-      throw new Error(`Backup path for session ${record.sessionId} changed during recovery packaging.`);
-    }
-    const filename = `${safePathComponent(record.sessionId)}.jsonl`;
-    const recoveredRelativePath = path.join('sessions', 'recovered', filename);
-    const recoveredPath = path.join(recoveredRoot, filename);
-    await fsp.copyFile(backupFilePath, recoveredPath);
-    recoveredFiles[record.sessionId] = recoveredPath;
-    includedPaths.push(recoveredRelativePath.split(path.sep).join('/'));
-    indexLines.push(JSON.stringify({
-      id: record.sessionId,
-      title: record.title || record.sessionId,
-      thread_name: record.title || record.sessionId,
-      rollout_path: path.join(paths.codexRoot, 'sessions', 'recovered', filename),
-      source_path: record.sourcePath || '',
-      backup_path: record.backupPath || '',
-      updated_at: record.lastBackedUpAt || record.firstSeenAt,
-      line_count: record.lineCount || 0,
-      bytes_backed_up: record.bytesBackedUp || 0,
-    }));
+  if (!records.length || records.length !== selected.size) {
+    throw new Error('No requested sessions were found in the backup manifest.');
   }
 
-  await fsp.writeFile(path.join(dataPath, 'session_index.jsonl'), `${indexLines.join('\n')}\n`, 'utf8');
+  const destinationRoot = paths.codexRoot;
+  const seenDestinations = new Set();
+  const restorePaths = records.map((record) => {
+    const sourcePath = resolveBackupFile(paths, record, { requireExisting: true });
+    const filename = `${safePathComponent(record.sessionId)}.jsonl`;
+    const destinationPath = path.join(destinationRoot, 'sessions', 'recovered', filename);
+    assertSafeDestinationPath(destinationPath, destinationRoot);
+    const normalizedDestination = path.resolve(destinationPath);
+    if (seenDestinations.has(normalizedDestination)) {
+      throw new Error(`Multiple sessions map to the same recovery destination: ${filename}`);
+    }
+    seenDestinations.add(normalizedDestination);
+    return Object.freeze({
+      sessionId: record.sessionId,
+      sourcePath,
+      destinationPath,
+      record: Object.freeze({ ...record }),
+    });
+  });
 
-  const createdAtString = createdAt.toISOString();
-  const snapshot = {
-    id: path.basename(packagePath),
-    name: `Incremental Recovery ${createdAtString}`,
-    createdAt: createdAtString,
-    codexRoot: paths.codexRoot,
-    backupRoot: paths.backupRoot,
-    reason: 'incremental-recovery',
-    kind: 'system',
-    modelProvider: 'unknown',
-    model: 'unknown',
-    accountFingerprint: 'none',
-    sessionCount: records.length,
-    archivedSessionCount: 0,
-    sizeBytes: records.reduce((sum, record) => sum + Number(record.bytesBackedUp || 0), 0),
-    includedPaths: includedPaths.sort(),
-    appVersion: '1.0.13',
-  };
-  await fsp.writeFile(path.join(packagePath, 'snapshot.json'), JSON.stringify(snapshot, null, 2), 'utf8');
+  assertSafeDestinationPath(path.join(destinationRoot, 'session_index.jsonl'), destinationRoot);
+  return Object.freeze(restorePaths);
+}
 
-  return { path: packagePath, dataPath, recoveredFiles, ...snapshot };
+async function restoreIncrementalSessions({ paths, preflight }) {
+  const restorePaths = Array.isArray(preflight) ? preflight : [];
+  if (!restorePaths.length) throw new Error('No preflighted sessions were provided.');
+
+  // Revalidate the complete source and destination set before the first write.
+  for (const item of restorePaths) {
+    const sourcePath = resolveBackupFile(paths, item.record, { requireExisting: true });
+    if (sourcePath !== item.sourcePath) {
+      throw new Error(`Backup path for session ${item.sessionId} changed after preflight.`);
+    }
+    assertSafeDestinationPath(item.destinationPath, paths.codexRoot);
+    if (existsSync(item.destinationPath)) {
+      throw new Error(`Recovery destination already exists: ${item.destinationPath}`);
+    }
+  }
+
+  const recoveredRoot = path.join(paths.codexRoot, 'sessions', 'recovered');
+  await createSafeDestinationDirectory(recoveredRoot, paths.codexRoot);
+  const recoveredFiles = {};
+  for (const item of restorePaths) {
+    const content = await readValidatedSource(paths, item);
+    await writeFileDurably(item.destinationPath, content);
+    recoveredFiles[item.sessionId] = item.destinationPath;
+  }
+
+  const indexPath = path.join(paths.codexRoot, 'session_index.jsonl');
+  assertSafeDestinationPath(indexPath, paths.codexRoot);
+  const existingLines = await readExistingLines(indexPath);
+  const restoredIds = new Set(restorePaths.map((item) => item.sessionId));
+  const retained = existingLines.filter((line) => {
+    try {
+      return !restoredIds.has(String(JSON.parse(line).id || ''));
+    } catch {
+      return true;
+    }
+  });
+  const recoveredLines = restorePaths.map(({ record, destinationPath }) => JSON.stringify({
+    id: record.sessionId,
+    title: record.title || record.sessionId,
+    thread_name: record.title || record.sessionId,
+    rollout_path: destinationPath,
+    source_path: record.sourcePath || '',
+    backup_path: record.backupPath || '',
+    updated_at: record.lastBackedUpAt || record.firstSeenAt,
+    line_count: record.lineCount || 0,
+    bytes_backed_up: record.bytesBackedUp || 0,
+  }));
+  const payload = `${[...retained, ...recoveredLines].join('\n')}\n`;
+  if (existsSync(indexPath)) await replaceFileDurably(indexPath, payload);
+  else await writeFileDurably(indexPath, payload);
+
+  return Object.freeze({ recoveredFiles: Object.freeze(recoveredFiles), records: restorePaths.map((item) => item.record) });
+}
+
+async function createSafeDestinationDirectory(directory, root) {
+  const relative = path.relative(path.resolve(root), path.resolve(directory));
+  let current = path.resolve(root);
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    try {
+      await fsp.mkdir(current);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+    assertSafeDestinationPath(current, root);
+  }
+}
+
+async function readExistingLines(filePath) {
+  try {
+    return (await fsp.readFile(filePath, 'utf8')).split(/\r?\n/).filter(Boolean);
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+async function readValidatedSource(paths, item) {
+  const resolved = resolveBackupFile(paths, item.record, { requireExisting: true });
+  if (resolved !== item.sourcePath) {
+    throw new Error(`Backup path for session ${item.sessionId} changed during restore.`);
+  }
+  const before = await fsp.lstat(item.sourcePath);
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw new Error(`Backup source is not a regular file: ${item.sourcePath}`);
+  }
+  const handle = await fsp.open(item.sourcePath, 'r');
+  try {
+    const opened = await handle.stat();
+    const stillResolved = resolveBackupFile(paths, item.record, { requireExisting: true });
+    if (stillResolved !== item.sourcePath
+      || !opened.isFile()
+      || (before.ino && opened.ino && (before.ino !== opened.ino || before.dev !== opened.dev))) {
+      throw new Error(`Backup source changed during restore: ${item.sourcePath}`);
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
 }
 
 module.exports = {
-  buildIncrementalRecoveryPackage,
   loadIncrementalBackupCatalog,
+  preflightIncrementalRecovery,
   resolveBackupFile,
+  restoreIncrementalSessions,
 };

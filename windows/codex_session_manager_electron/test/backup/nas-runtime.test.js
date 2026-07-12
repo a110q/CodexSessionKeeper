@@ -23,6 +23,18 @@ test('settings store atomically preserves auto restore while patching NAS identi
   assert.deepEqual(await fsp.readdir(root), ['settings.json']);
 });
 
+test('settings store fails safely to defaults when the existing file is malformed', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'nas-settings-test-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const filePath = path.join(root, 'settings.json');
+  await fsp.writeFile(filePath, '{broken');
+  const store = createSettingsStore({ filePath, fs, pathImpl: path });
+
+  assert.deepEqual(store.load(), { autoRestoreOnLaunch: false, nasBackup: null });
+  store.savePatch({ autoRestoreOnLaunch: true });
+  assert.equal(store.load().autoRestoreOnLaunch, true);
+});
+
 test('unconfigured startup creates no agent and activation starts one', async () => {
   const harness = runtimeHarness();
   await harness.runtime.initialize();
@@ -76,6 +88,18 @@ test('failed reconfiguration preserves settings and restarts previous validated 
   assert.equal(harness.created[1].target.configuration.employee, '陈超');
 });
 
+test('agent progress exposes seeding and pending states for exit protection', async () => {
+  const harness = runtimeHarness({ saved: configuration('运营部', '陈超') });
+  await harness.runtime.initialize();
+
+  harness.created[0].report({ phase: 'seeding', totalFiles: 3, completedFiles: 1, pendingFiles: 2 });
+  assert.equal(harness.runtime.snapshot().state, 'seeding');
+  harness.created[0].report({ phase: 'scanning', totalFiles: 3, completedFiles: 2, pendingFiles: 1 });
+  assert.equal(harness.runtime.snapshot().state, 'pending');
+  harness.created[0].report({ phase: 'scanning', totalFiles: 3, completedFiles: 3, pendingFiles: 0 });
+  assert.equal(harness.runtime.snapshot().state, 'running');
+});
+
 function runtimeHarness(options = {}) {
   let settings = { autoRestoreOnLaunch: false, nasBackup: options.saved || null };
   const settingsStore = {
@@ -101,12 +125,13 @@ function runtimeHarness(options = {}) {
     settingsStore,
     homeDir: '/home/alice',
     pathsFactory: ({ target: selectedTarget }) => ({ backupRoot: selectedTarget.backupRoot }),
-    agentFactory: ({ target: selectedTarget, paths }) => {
+    agentFactory: ({ target: selectedTarget, paths, onProgress }) => {
       const agent = {
         target: selectedTarget,
         paths,
         started: false,
         stopped: false,
+        report: onProgress,
         async start() { this.started = true; },
         async stop() { this.stopped = true; }
       };

@@ -9,7 +9,11 @@ function createSettingsStore({ filePath, fs = fsDefault, pathImpl = pathDefault 
 
   function load() {
     if (!fs.existsSync(filePath)) return { ...defaults };
-    return { ...defaults, ...JSON.parse(fs.readFileSync(filePath, 'utf8')) };
+    try {
+      return { ...defaults, ...JSON.parse(fs.readFileSync(filePath, 'utf8')) };
+    } catch {
+      return { ...defaults };
+    }
   }
 
   function savePatch(patch) {

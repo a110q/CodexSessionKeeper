@@ -7,10 +7,13 @@ const { pathToFileURL } = require('node:url');
 const { backupPaths } = require('./backup/paths');
 const { BackupAgent } = require('./backup/backup-agent');
 const {
-  buildIncrementalRecoveryPackage,
   loadIncrementalBackupCatalog,
-  resolveBackupFile,
+  preflightIncrementalRecovery,
+  restoreIncrementalSessions,
 } = require('./backup/incremental-recovery');
+const { createNasRuntime } = require('./backup/nas-runtime');
+const { createNasService } = require('./backup/nas-service');
+const { createSettingsStore } = require('./settings');
 const {
   ensureRecoveredThreadsInStateDatabase,
   extractRecoveredThreadMetadata,
@@ -44,8 +47,19 @@ const codexRoot = path.join(os.homedir(), '.codex');
 const vaultRoot = path.join(os.homedir(), '.codex-session-vault');
 const snapshotRoot = path.join(vaultRoot, 'snapshots');
 const settingsPath = path.join(vaultRoot, 'settings.json');
-const localBackupPaths = backupPaths(os.homedir());
-const localBackupAgent = new BackupAgent({ paths: localBackupPaths });
+const settingsStore = createSettingsStore({ filePath: settingsPath });
+const nasService = createNasService();
+const nasRuntime = createNasRuntime({
+  nasService,
+  settingsStore,
+  homeDir: os.homedir(),
+  pathsFactory: ({ target }) => pathsForNasTarget(target),
+  agentFactory: ({ paths: selectedPaths, validateTarget, onProgress }) => new BackupAgent({
+    paths: selectedPaths,
+    validateTarget,
+    onProgress,
+  }),
+});
 const applicationPagePath = path.join(__dirname, 'index.html');
 const applicationPageURL = pathToFileURL(applicationPagePath).href;
 const handleTrustedIpc = createTrustedIpcRegistrar({
@@ -131,19 +145,14 @@ function createWindow() {
   });
 
   installNavigationGuards(mainWindow.webContents, applicationPageURL);
+  installBackupExitGuard(mainWindow);
   mainWindow.loadFile(applicationPagePath);
 }
 
-app.whenReady().then(createWindow);
 app.whenReady().then(async () => {
-  try {
-    localBackupAgent.startPolling(10000);
-  } catch (error) {
-    console.error('Local incremental backup failed to start:', error);
-  }
-});
-app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
+  await nasRuntime.initialize();
+  createWindow();
 });
 
 app.on('window-all-closed', () => {
@@ -154,6 +163,58 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
+function pathsForNasTarget(target) {
+  return backupPaths({
+    homeDir: os.homedir(),
+    codexRoot,
+    backupRoot: target.backupRoot,
+    stateRoot: path.join(vaultRoot, 'nas-state', target.configuration.deviceId),
+    pathImpl: path,
+  });
+}
+
+function nasSetupState() {
+  const runtime = nasRuntime.snapshot();
+  const configuration = runtime.configuration;
+  return {
+    state: runtime.state,
+    configured: Boolean(configuration),
+    department: configuration?.department || null,
+    employee: configuration?.employee || null,
+    deviceId: configuration?.deviceId || null,
+    deviceName: configuration?.deviceName || null,
+    lastError: runtime.lastError,
+    progress: runtime.progress,
+  };
+}
+
+function installBackupExitGuard(window) {
+  let allowClose = false;
+  let promptOpen = false;
+  window.on('close', (event) => {
+    if (allowClose || !['seeding', 'pending'].includes(nasRuntime.snapshot().state)) return;
+    event.preventDefault();
+    if (promptOpen) return;
+    promptOpen = true;
+    void dialog.showMessageBox(window, {
+      type: 'warning',
+      title: 'NAS 备份尚未完成',
+      message: 'NAS 备份尚未完成，仍要退出吗？',
+      detail: '现在退出可能会让最新会话留到下次启动后继续补传。',
+      buttons: ['继续备份', '仍要退出'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    }).then((result) => {
+      promptOpen = false;
+      if (result.response === 1) {
+        allowClose = true;
+        window.close();
+      }
+    });
+  });
+}
+
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
@@ -163,15 +224,13 @@ function exists(targetPath) {
 }
 
 function loadSettings() {
-  const defaults = { autoRestoreOnLaunch: false };
+  const defaults = { autoRestoreOnLaunch: false, nasBackup: null };
   try {
-    if (!exists(settingsPath)) return defaults;
-    const settings = { ...defaults, ...JSON.parse(readText(settingsPath)) };
+    const settings = { ...defaults, ...settingsStore.load() };
     if (!settings.autoRestoreDefaultOffMigrationV1) {
       settings.autoRestoreOnLaunch = false;
       settings.autoRestoreDefaultOffMigrationV1 = true;
-      ensureDir(vaultRoot);
-      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+      settingsStore.savePatch(settings);
     }
     return settings;
   } catch {
@@ -180,8 +239,7 @@ function loadSettings() {
 }
 
 function saveSettings(nextSettings) {
-  ensureDir(vaultRoot);
-  fs.writeFileSync(settingsPath, JSON.stringify({ ...loadSettings(), autoRestoreDefaultOffMigrationV1: true, ...nextSettings }, null, 2), 'utf8');
+  settingsStore.savePatch({ autoRestoreDefaultOffMigrationV1: true, ...nextSettings });
   return loadSettings();
 }
 
@@ -190,11 +248,23 @@ function readText(targetPath) {
 }
 
 function readBackupStatus() {
+  const runtime = nasRuntime.snapshot();
+  const configuration = runtime.configuration;
+  if (!configuration?.deviceId) {
+    return { status: runtime.state === 'unconfigured' ? 'waiting' : runtime.state, mode: 'polling', lastError: runtime.lastError };
+  }
+  const localStatusPath = path.join(vaultRoot, 'nas-state', configuration.deviceId, 'status.json');
   try {
-    if (!exists(localBackupPaths.statusPath)) {
-      return { status: 'waiting', mode: 'polling', lastError: null };
+    if (!exists(localStatusPath)) {
+      return { status: runtime.state, mode: 'polling', lastError: runtime.lastError };
     }
-    return JSON.parse(readText(localBackupPaths.statusPath));
+    const localStatus = JSON.parse(readText(localStatusPath));
+    const runtimeOwnsStatus = ['validating', 'disconnected', 'seeding', 'pending'].includes(runtime.state);
+    return {
+      ...localStatus,
+      status: runtimeOwnsStatus ? runtime.state : localStatus.status,
+      lastError: runtime.lastError || localStatus.lastError || null,
+    };
   } catch (error) {
     return { status: 'error', mode: 'polling', lastError: error.message || String(error) };
   }
@@ -1507,6 +1577,7 @@ async function loadState() {
     sessions,
     snapshots,
     settings: loadSettings(),
+    nasSetup: nasSetupState(),
     backupStatus: readBackupStatus(),
     autoRestoreSuggestion: await autoRestoreSuggestion(sessions, snapshots)
   };
@@ -1519,6 +1590,13 @@ async function getSessionById(sessionId) {
 
 async function currentSessionIds() {
   return new Set((await loadSessions()).map((session) => session.id));
+}
+
+async function resolveRecoveryDevicePaths(deviceId) {
+  const configuration = loadSettings().nasBackup;
+  if (!configuration) throw new Error('尚未配置公司 NAS 会话备份。');
+  const target = await nasService.resolveDevice(configuration, String(deviceId || ''));
+  return pathsForNasTarget(target);
 }
 
 async function deleteSessionArtifacts(session) {
@@ -1543,9 +1621,47 @@ handleTrustedIpc('load-state', async () => loadState());
 
 handleTrustedIpc('load-backup-status', async () => readBackupStatus());
 
-handleTrustedIpc('load-incremental-backup-sessions', async () => {
+handleTrustedIpc('get-nas-setup-state', async () => nasSetupState());
+
+handleTrustedIpc('detect-company-nas', async () => {
+  await nasService.detect();
+  return {
+    available: true,
+    server: nasService.endpoint.server,
+    share: nasService.endpoint.share,
+    backupRootName: nasService.endpoint.backupRootName,
+  };
+});
+
+handleTrustedIpc('list-nas-departments', async () => nasService.departments());
+
+handleTrustedIpc('list-nas-employees', async (_event, department) => nasService.employees(String(department || '')));
+
+handleTrustedIpc('activate-nas-backup', async (_event, department, employee) => {
+  await nasRuntime.activate({ department: String(department || ''), employee: String(employee || '') });
+  return nasSetupState();
+});
+
+handleTrustedIpc('retry-nas-backup', async () => {
+  await nasRuntime.retry();
+  return nasSetupState();
+});
+
+handleTrustedIpc('list-nas-backup-devices', async () => {
+  const configuration = loadSettings().nasBackup;
+  if (!configuration) return [];
+  const devices = await nasService.recoveryDevices(configuration);
+  return devices.map((device) => ({
+    deviceId: device.deviceId,
+    deviceName: device.deviceName,
+    isCurrent: device.deviceId === configuration.deviceId,
+  }));
+});
+
+handleTrustedIpc('load-incremental-backup-sessions', async (_event, deviceId) => {
+  const selectedPaths = await resolveRecoveryDevicePaths(deviceId);
   return loadIncrementalBackupCatalog({
-    paths: localBackupPaths,
+    paths: selectedPaths,
     currentSessionIds: await currentSessionIds(),
   });
 });
@@ -1739,12 +1855,15 @@ handleTrustedIpc('restore-snapshot-sessions', async (_event, snapshotId, session
   return { ok: true, message: `已从 ${snapshot.name} 批量恢复 ${restoredIds.size} 个会话。` };
 });
 
-handleTrustedIpc('restore-incremental-backup-sessions', async (_event, sessionIds, protectionMode = 'lightweight') => {
+handleTrustedIpc('restore-incremental-backup-sessions', async (_event, deviceId, sessionIds, protectionMode = 'lightweight') => {
   const selectedIds = new Set(Array.isArray(sessionIds) ? sessionIds.map(String) : []);
   if (!selectedIds.size) throw new Error('没有选择要从备份恢复的会话。');
 
+  // Resolve the logical device ID and revalidate the fixed NAS hierarchy before
+  // catalog access or creation of the local restore protection point.
+  const selectedPaths = await resolveRecoveryDevicePaths(deviceId);
   const catalog = await loadIncrementalBackupCatalog({
-    paths: localBackupPaths,
+    paths: selectedPaths,
     currentSessionIds: await currentSessionIds(),
   });
   const restorableIds = catalog.candidates
@@ -1752,11 +1871,7 @@ handleTrustedIpc('restore-incremental-backup-sessions', async (_event, sessionId
     .map((candidate) => candidate.sessionId)
     .sort();
   if (!restorableIds.length) throw new Error('选中的备份会话都已存在或不可恢复。');
-  for (const candidate of catalog.candidates.filter((item) => restorableIds.includes(item.sessionId))) {
-    resolveBackupFile(localBackupPaths, candidate.backupRecord, { requireExisting: true });
-  }
-  assertSafeDestinationPath(path.join(codexRoot, 'sessions'), codexRoot, { recursive: true });
-  assertSafeDestinationPath(path.join(codexRoot, 'session_index.jsonl'), codexRoot);
+  const preflight = await preflightIncrementalRecovery({ paths: selectedPaths, sessionIds: restorableIds });
   assertSafeDestinationPath(path.join(codexRoot, 'state_5.sqlite'), codexRoot);
 
   const mode = normalizeRestoreProtectionMode(protectionMode);
@@ -1772,19 +1887,12 @@ handleTrustedIpc('restore-incremental-backup-sessions', async (_event, sessionId
     mode === 'lightweight' ? conversationBackupCandidates : backupCandidates
   );
 
-  const recovery = await buildIncrementalRecoveryPackage({
-    paths: localBackupPaths,
-    sessionIds: restorableIds,
-  });
-  const sqliteMessage = await restoreConversationsOnly({
-    ...recovery,
-    includedPaths: ['session_index.jsonl', 'sessions'],
-  });
+  const recovery = await restoreIncrementalSessions({ paths: selectedPaths, preflight });
   const threadIndexResult = await repairRecoveredThreadIndexFromIncrementalRecovery(catalog, recovery, restorableIds);
   return {
     ok: true,
     restoredCount: restorableIds.length,
-    message: `已从本地增量备份恢复 ${restorableIds.length} 个缺失会话。${sqliteMessage} ${threadIndexResult.message} 请重启 Codex 后查看。`,
+    message: `已从公司 NAS 会话备份恢复 ${restorableIds.length} 个缺失会话。${threadIndexResult.message} 请重启 Codex 后查看。`,
   };
 });
 

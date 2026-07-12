@@ -117,6 +117,12 @@ class BackupAgent {
 
       const sources = await this.discoverSessionFiles();
       const phase = manifestExisted ? 'scanning' : 'seeding';
+      this.onProgress?.({
+        totalFiles: sources.length,
+        completedFiles: 0,
+        pendingFiles: sources.length,
+        phase,
+      });
       const processedSessionIds = new Set();
       const updatedCursors = [];
       const scanErrors = [];
@@ -146,7 +152,7 @@ class BackupAgent {
         this.onProgress?.({
           totalFiles: sources.length,
           completedFiles,
-          pendingFiles: Math.max(0, sources.length - completedFiles),
+          pendingFiles: Math.max(1, sources.length - completedFiles),
           phase,
         });
       }
@@ -162,6 +168,12 @@ class BackupAgent {
       const lastError = scanErrors[0] || null;
       await this.writeStatus(manifest, lastError ? 'error' : 'running', lastError, scanDate);
       await replaceFileDurably(this.paths.pendingSourcesPath, jsonPayload({ pending: [] }));
+      this.onProgress?.({
+        totalFiles: sources.length,
+        completedFiles: sources.length,
+        pendingFiles: 0,
+        phase,
+      });
       return manifest;
     } finally {
       await cursorStore.close();

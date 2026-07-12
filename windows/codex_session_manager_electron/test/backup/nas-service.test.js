@@ -63,6 +63,21 @@ test('activation probes cleanly, reuses stable identity, and suffixes marker col
   assert.equal((await fsp.readdir(first.deviceRoot)).some((name) => name.includes('probe')), false);
 });
 
+test('recovery devices are resolved by marker ID and unknown IDs are rejected', async (t) => {
+  const fixture = await makeFixture(t);
+  await fixture.employee('运营部', '陈超');
+  const service = fixture.service();
+  const current = await service.activate({ department: '运营部', employee: '陈超' });
+
+  const devices = await service.recoveryDevices(current.configuration);
+  assert.deepEqual(devices.map((device) => device.deviceId), [current.configuration.deviceId]);
+  assert.equal((await service.resolveDevice(current.configuration, current.configuration.deviceId)).backupRoot, current.backupRoot);
+  await assert.rejects(
+    service.resolveDevice(current.configuration, '22222222-2222-2222-2222-222222222222'),
+    /unknown NAS backup device/i,
+  );
+});
+
 async function makeFixture(t) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'nas-service-test-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));

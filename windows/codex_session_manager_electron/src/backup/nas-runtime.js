@@ -84,7 +84,13 @@ function createNasRuntime({
     const created = agentFactory({
       paths,
       target: selectedTarget,
-      validateTarget: () => nasService.resolve(selectedTarget.configuration)
+      validateTarget: () => nasService.resolve(selectedTarget.configuration),
+      onProgress: (progress) => {
+        const progressState = progress?.pendingFiles > 0
+          ? (progress.phase === 'seeding' ? 'seeding' : 'pending')
+          : 'running';
+        state = snapshotValue(progressState, selectedTarget.configuration, null, progress);
+      }
     });
     agent = created;
     target = selectedTarget;
@@ -130,11 +136,12 @@ function createNasRuntime({
   return Object.freeze({ initialize, activate, retry, stop, snapshot });
 }
 
-function snapshotValue(state, configuration = null, error = null) {
+function snapshotValue(state, configuration = null, error = null, progress = null) {
   return {
     state,
     configuration: configuration ? { ...configuration } : null,
-    lastError: error ? (error.message || String(error)) : null
+    lastError: error ? (error.message || String(error)) : null,
+    progress: progress ? { ...progress } : null
   };
 }
 
