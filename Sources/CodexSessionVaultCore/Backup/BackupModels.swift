@@ -22,6 +22,7 @@ public struct BackupSessionRecord: Codable, Equatable, Sendable {
     public var lineCount: Int
     public var bytesBackedUp: Int64
     public var status: String
+    public var contentHash: String?
 
     public init(
         sessionId: String,
@@ -32,7 +33,8 @@ public struct BackupSessionRecord: Codable, Equatable, Sendable {
         lastBackedUpAt: Date?,
         lineCount: Int,
         bytesBackedUp: Int64,
-        status: String
+        status: String,
+        contentHash: String? = nil
     ) {
         self.sessionId = sessionId
         self.sourcePath = sourcePath
@@ -43,6 +45,7 @@ public struct BackupSessionRecord: Codable, Equatable, Sendable {
         self.lineCount = lineCount
         self.bytesBackedUp = bytesBackedUp
         self.status = status
+        self.contentHash = contentHash
     }
 }
 

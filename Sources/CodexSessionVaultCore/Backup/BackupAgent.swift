@@ -1,15 +1,29 @@
 import Foundation
 
+public enum BackupProgressPhase: String, Codable, Sendable {
+    case seeding
+    case scanning
+}
+
+public struct BackupProgress: Equatable, Sendable {
+    public let totalFiles: Int
+    public let completedFiles: Int
+    public let pendingFiles: Int
+    public let phase: BackupProgressPhase
+}
+
 public final class BackupAgent: @unchecked Sendable {
-    private static let agentVersion = "1.0.0"
+    private static let agentVersion = "2.0.0"
     private static let activeStatus = "active"
-    private static let newlineByte: UInt8 = 0x0A
-    private static let newline = Data([0x0A])
 
     private let paths: BackupPaths
     private let now: () -> Date
     private let fileManager: FileManager
     private let tailer: SessionTailer
+    private let targetValidator: BackupTargetValidator
+    private let fileCommitter: BackupFileCommitter
+    private let progressHandler: ((BackupProgress) -> Void)?
+    private let remoteStatusWriter: (Data, URL) throws -> Void
     private let scanLock = NSLock()
     private let taskLock = NSLock()
     private var pollingTask: Task<Void, Never>?
@@ -17,6 +31,7 @@ public final class BackupAgent: @unchecked Sendable {
 
     private struct ProcessSessionFileResult {
         var manifestChanged: Bool
+        var cursor: BackupCursor?
         var lastError: String?
     }
 
@@ -24,12 +39,22 @@ public final class BackupAgent: @unchecked Sendable {
         paths: BackupPaths = BackupPaths(),
         now: @escaping () -> Date = Date.init,
         fileManager: FileManager = .default,
-        tailer: SessionTailer = SessionTailer()
+        tailer: SessionTailer = SessionTailer(),
+        targetValidator: BackupTargetValidator? = nil,
+        fileCommitter: BackupFileCommitter = BackupFileCommitter(),
+        progressHandler: ((BackupProgress) -> Void)? = nil,
+        remoteStatusWriter: ((Data, URL) throws -> Void)? = nil
     ) {
         self.paths = paths
         self.now = now
         self.fileManager = fileManager
         self.tailer = tailer
+        self.targetValidator = targetValidator ?? BackupTargetValidator(backupRoot: paths.backupRoot)
+        self.fileCommitter = fileCommitter
+        self.progressHandler = progressHandler
+        self.remoteStatusWriter = remoteStatusWriter ?? { data, url in
+            try DurableAtomicWriter().write(data, to: url, createParentDirectories: false)
+        }
     }
 
     deinit {
@@ -39,27 +64,36 @@ public final class BackupAgent: @unchecked Sendable {
     public func performOneShotScan() throws {
         scanLock.lock()
         defer { scanLock.unlock() }
-
-        try performOneShotScanLocked()
+        do {
+            try performOneShotScanLocked()
+        } catch {
+            try? writeErrorStatus(error)
+            throw error
+        }
     }
 
     private func performOneShotScanLocked() throws {
+        try targetValidator.validateTarget()
+        try ensureLocalStateDirectoriesExist()
         let scanDate = now()
-        try ensureBackupDirectoriesExist()
-
         let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
         try cursorStore.open()
 
-        let manifestURL = paths.manifestURL
-        let manifestExisted = fileManager.fileExists(atPath: manifestURL.path)
-        let manifestStore = BackupManifestStore(manifestURL: manifestURL)
+        let manifestExisted = fileManager.fileExists(atPath: paths.manifestURL.path)
+        let manifestStore = BackupManifestStore(
+            manifestURL: paths.manifestURL,
+            createParentDirectories: false
+        )
         var manifest = try manifestStore.loadOrCreate(
             codexRoot: paths.codexRoot.path,
             backupRoot: paths.backupRoot.path,
             now: scanDate
         )
         var manifestChanged = !manifestExisted
-
+        if manifest.version != 2 {
+            manifest.version = 2
+            manifestChanged = true
+        }
         if manifest.codexRoot != paths.codexRoot.path {
             manifest.codexRoot = paths.codexRoot.path
             manifestChanged = true
@@ -69,16 +103,17 @@ public final class BackupAgent: @unchecked Sendable {
             manifestChanged = true
         }
 
+        let sources = try discoverSessionFiles()
+        let phase: BackupProgressPhase = manifestExisted ? .scanning : .seeding
         var processedSessionIDs = Set<String>()
+        var updatedCursors: [BackupCursor] = []
         var scanErrors: [String] = []
-        for sourceURL in try discoverSessionFiles() {
-            guard let sessionID = SessionIdentity.sessionID(from: sourceURL) else {
+        var completed = 0
+        for sourceURL in sources {
+            guard let sessionID = SessionIdentity.sessionID(from: sourceURL),
+                  processedSessionIDs.insert(sessionID).inserted else {
                 continue
             }
-            guard processedSessionIDs.insert(sessionID).inserted else {
-                continue
-            }
-
             let result = try processSessionFile(
                 sourceURL,
                 sessionID: sessionID,
@@ -87,53 +122,53 @@ public final class BackupAgent: @unchecked Sendable {
                 cursorStore: cursorStore
             )
             manifestChanged = manifestChanged || result.manifestChanged
+            if let cursor = result.cursor {
+                updatedCursors.append(cursor)
+            }
             if let lastError = result.lastError {
                 scanErrors.append(lastError)
             }
+            completed += 1
+            progressHandler?(BackupProgress(
+                totalFiles: sources.count,
+                completedFiles: completed,
+                pendingFiles: max(0, sources.count - completed),
+                phase: phase
+            ))
         }
 
         if manifestChanged {
             manifest.updatedAt = scanDate
             try manifestStore.save(manifest)
         }
+        for cursor in updatedCursors {
+            let current = try cursorStore.cursor(sourcePath: cursor.sourcePath)
+            if cursorNeedsUpsert(currentCursor: current, updatedCursor: cursor) {
+                try cursorStore.upsert(cursor)
+            }
+        }
 
-        let lastError = scanErrors.first
         try writeStatus(
             for: manifest,
-            status: lastError == nil ? .running : .error,
-            lastError: lastError,
-            at: scanDate
+            status: scanErrors.isEmpty ? .running : .error,
+            lastError: scanErrors.first,
+            at: scanDate,
+            includeRemote: true
         )
+        try writePendingSources([])
     }
 
     public func startPolling(intervalSeconds: UInt64 = 10) {
         taskLock.lock()
         defer { taskLock.unlock() }
-
-        guard pollingTask == nil else {
-            return
-        }
-
+        guard pollingTask == nil else { return }
         pollingStartedAt = now()
         let sleepNanoseconds = Self.nanoseconds(fromSeconds: intervalSeconds)
         pollingTask = Task { [weak self] in
             while !Task.isCancelled {
-                do {
-                    guard let agent = self else {
-                        return
-                    }
-                    try agent.performOneShotScan()
-                } catch {
-                    guard let agent = self else {
-                        return
-                    }
-                    try? agent.writeErrorStatus(error)
-                }
-
-                guard !Task.isCancelled else {
-                    return
-                }
-
+                guard let self else { return }
+                try? self.performOneShotScan()
+                guard !Task.isCancelled else { return }
                 do {
                     try await Task.sleep(nanoseconds: sleepNanoseconds)
                 } catch {
@@ -148,66 +183,44 @@ public final class BackupAgent: @unchecked Sendable {
         let task = pollingTask
         pollingTask = nil
         taskLock.unlock()
-
         task?.cancel()
     }
 
-    private func ensureBackupDirectoriesExist() throws {
-        try fileManager.createDirectory(at: paths.backupRoot, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: paths.sessionsRoot, withIntermediateDirectories: true)
-        try fileManager.createDirectory(
-            at: paths.statusURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try fileManager.createDirectory(
-            at: paths.logURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-    }
-
-    private func discoverSessionFiles() throws -> [URL] {
-        let roots = [
-            (
-                url: paths.codexRoot.appendingPathComponent("sessions", isDirectory: true),
-                priority: 0
-            ),
-            (
-                url: paths.codexRoot.appendingPathComponent("archived_sessions", isDirectory: true),
-                priority: 1
-            )
-        ]
-        var discovered: [(url: URL, priority: Int)] = []
-
-        for root in roots where fileManager.fileExists(atPath: root.url.path) {
-            guard let enumerator = fileManager.enumerator(
-                at: root.url,
-                includingPropertiesForKeys: [.isRegularFileKey],
-                options: []
-            ) else {
-                continue
-            }
-
-            for case let fileURL as URL in enumerator {
-                guard fileURL.pathExtension.lowercased() == "jsonl" else {
-                    continue
-                }
-
-                let resourceValues = try fileURL.resourceValues(forKeys: [.isRegularFileKey])
-                guard resourceValues.isRegularFile == true else {
-                    continue
-                }
-
-                discovered.append((url: fileURL, priority: root.priority))
+    public func pendingSessionCount() throws -> Int {
+        try ensureLocalStateDirectoriesExist()
+        let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
+        try cursorStore.open()
+        let existing = try loadPendingSources()
+        var pendingByPath: [String: PendingSourceRecord] = [:]
+        let sources = try discoverSessionFiles()
+        let discoveredPaths = Set(sources.map(\.path))
+        for source in sources {
+            let metadata = try metadata(for: source)
+            let cursor = try cursorStore.cursor(sourcePath: source.path)
+            if cursor == nil
+                || cursor?.lastSourceSize != metadata.size
+                || cursor?.lastSourceModifiedAt != metadata.modifiedAt {
+                pendingByPath[source.path] = PendingSourceRecord(
+                    sourcePath: source.path,
+                    sourceSize: metadata.size,
+                    sourceModifiedAt: metadata.modifiedAt,
+                    committedOffset: cursor?.lastByteOffset ?? 0,
+                    unrecoverable: false
+                )
             }
         }
-
-        return discovered.sorted { lhs, rhs in
-            if lhs.priority != rhs.priority {
-                return lhs.priority < rhs.priority
-            }
-
-            return lhs.url.path < rhs.url.path
-        }.map(\.url)
+        for record in existing where !discoveredPaths.contains(record.sourcePath) {
+            pendingByPath[record.sourcePath] = PendingSourceRecord(
+                sourcePath: record.sourcePath,
+                sourceSize: record.sourceSize,
+                sourceModifiedAt: record.sourceModifiedAt,
+                committedOffset: record.committedOffset,
+                unrecoverable: true
+            )
+        }
+        let pending = pendingByPath.values.sorted { $0.sourcePath < $1.sourcePath }
+        try writePendingSources(pending)
+        return pending.count
     }
 
     private func processSessionFile(
@@ -225,64 +238,83 @@ public final class BackupAgent: @unchecked Sendable {
             currentSourcePath: sourcePath,
             cursorStore: cursorStore
         )
-        let firstSeenAt = existingRecord?.firstSeenAt ?? scanDate
-        let backupURL = try backupFileURL(
-            for: sessionID,
-            firstSeenAt: firstSeenAt,
-            existingRecord: existingRecord,
-            baselineCursor: baselineCursor
-        )
-        let relativeBackupPath = try validatedRelativeBackupPath(for: backupURL)
-        let readOffset = baselineCursor?.lastByteOffset ?? 0
-        let lineCountBeforeReadOffset = readOffset > 0 ? (baselineCursor?.lineCount ?? 0) : 0
-        let tailResult = try tailer.readNewCompleteLines(from: sourceURL, offset: readOffset)
-        let sourceMetadata = try metadata(for: sourceURL)
-        let recordedLineCount = max(existingRecord?.lineCount ?? 0, baselineCursor?.lineCount ?? 0)
-        let recordedBytesBackedUp = existingRecord?.bytesBackedUp ?? 0
-        let sourcePathMigrated = existingRecord.map { $0.sourcePath != sourcePath } ?? false
-        let needsBackupStats = shouldReadBackupFileStats(
-            existingRecord: existingRecord,
-            baselineCursor: baselineCursor,
-            sourcePathMigrated: sourcePathMigrated,
-            hasNewCompleteLines: !tailResult.lines.isEmpty
-        )
-        let backupStatsBeforeAppend = needsBackupStats
-            ? try backupFileStats(at: backupURL)
-            : BackupFileStats(byteCount: recordedBytesBackedUp, lineCount: recordedLineCount)
-        let skippedAlreadyBackedUpLineCount = min(
-            tailResult.lines.count,
-            max(0, backupStatsBeforeAppend.lineCount - lineCountBeforeReadOffset)
-        )
-        let linesToAppend = Array(tailResult.lines.dropFirst(skippedAlreadyBackedUpLineCount))
-        let appendedLineStats = lineStats(for: linesToAppend)
-
-        if !linesToAppend.isEmpty {
-            _ = try append(lines: linesToAppend, to: backupURL)
+        let targetURL = try paths.backupFileURL(for: sourceURL)
+        guard let relativeBackupPath = paths.relativeBackupPath(for: targetURL) else {
+            throw BackupTargetValidationError.unsafeTarget(targetURL.path)
         }
-        let backupStatsAfterAppend = BackupFileStats(
-            byteCount: backupStatsBeforeAppend.byteCount + appendedLineStats.byteCount,
-            lineCount: backupStatsBeforeAppend.lineCount + appendedLineStats.lineCount
-        )
+        let sourceMetadata = try fileCommitter.inspectSource(sourceURL)
+        let targetState = try fileCommitter.inspectTarget(targetURL)
+        let targetExists = targetState.exists
+        let recordedBytes = existingRecord?.bytesBackedUp ?? 0
+        let recordedLines = existingRecord?.lineCount ?? 0
+        let recordedOffset = baselineCursor?.lastByteOffset ?? 0
+        let pathChanged = existingRecord.map { $0.backupPath != relativeBackupPath } ?? false
+        var rebuild = pathChanged || sourceMetadata.byteCount < recordedOffset
+        var readOffset = recordedOffset
+        var baseLineCount = recordedLines
+        if targetExists, !rebuild {
+            if targetState.byteCount == recordedBytes {
+                if let contentHash = existingRecord?.contentHash, recordedOffset > 0 {
+                    rebuild = try fileCommitter.hashPrefix(of: sourceURL, byteCount: recordedOffset) != contentHash
+                        || !fileCommitter.targetMatchesBoundedFingerprint(
+                            targetURL,
+                            source: sourceURL,
+                            byteCount: recordedBytes
+                        )
+                } else if targetState.byteCount > 0 {
+                    rebuild = try !fileCommitter.targetIsCompletePrefix(targetURL, of: sourceURL)
+                }
+            } else if targetState.byteCount > recordedBytes,
+                      try fileCommitter.targetIsCompletePrefix(targetURL, of: sourceURL) {
+                readOffset = targetState.byteCount
+                baseLineCount = try fileCommitter.stats(at: targetURL).lineCount
+            } else {
+                rebuild = true
+            }
+        } else if !targetExists, recordedOffset > 0 || recordedBytes > 0 {
+            rebuild = true
+        }
 
-        let consumedCompleteLineCount = lineCountBeforeReadOffset + tailResult.lines.count
-        let totalLineCount = max(
-            recordedLineCount,
-            consumedCompleteLineCount,
-            backupStatsAfterAppend.lineCount
-        )
-        let totalBytesBackedUp = max(recordedBytesBackedUp, backupStatsAfterAppend.byteCount)
-        let titleFromNewLines = firstTitle(in: tailResult.lines)
-        let title = existingRecord?.title ?? titleFromNewLines ?? backupTitleIfAlreadyInspectingFile(
-            at: backupURL,
-            needsBackupStats: needsBackupStats
-        )
-        let lastBackedUpAt = resolvedLastBackedUpAt(
-            existingRecord: existingRecord,
-            appendedLineCount: linesToAppend.count,
-            totalLineCount: totalLineCount,
-            totalBytesBackedUp: totalBytesBackedUp,
-            scanDate: scanDate
-        )
+        let tailResult: TailReadResult
+        let finalStats: BackupFileStats
+        let wroteData: Bool
+        if rebuild {
+            tailResult = try tailer.readNewCompleteLines(from: sourceURL, offset: 0)
+            finalStats = try fileCommitter.rebuildCompleteLines(
+                lines: tailResult.lines,
+                at: targetURL,
+                under: paths.backupRoot
+            )
+            wroteData = true
+        } else {
+            tailResult = try tailer.readNewCompleteLines(from: sourceURL, offset: readOffset)
+            if !targetExists {
+                finalStats = try fileCommitter.commitInitial(
+                    lines: tailResult.lines,
+                    to: targetURL,
+                    under: paths.backupRoot
+                )
+            } else {
+                finalStats = try fileCommitter.appendAndSynchronize(
+                    lines: tailResult.lines,
+                    to: targetURL,
+                    under: paths.backupRoot
+                )
+            }
+            wroteData = !tailResult.lines.isEmpty || targetState.byteCount != recordedBytes
+        }
+
+        let finalOffset = tailResult.nextOffset
+        let contentHash = finalOffset > 0
+            ? try fileCommitter.hashPrefix(of: sourceURL, byteCount: finalOffset)
+            : nil
+        let title = existingRecord?.title
+            ?? firstTitle(in: tailResult.lines)
+            ?? firstTitle(inBackupFileAt: targetURL)
+        let firstSeenAt = existingRecord?.firstSeenAt ?? scanDate
+        let lastBackedUpAt = wroteData || existingRecord?.lastBackedUpAt == nil && finalStats.lineCount > 0
+            ? scanDate
+            : existingRecord?.lastBackedUpAt
         let updatedRecord = BackupSessionRecord(
             sessionId: sessionID,
             sourcePath: sourcePath,
@@ -290,35 +322,33 @@ public final class BackupAgent: @unchecked Sendable {
             title: title,
             firstSeenAt: firstSeenAt,
             lastBackedUpAt: lastBackedUpAt,
-            lineCount: totalLineCount,
-            bytesBackedUp: totalBytesBackedUp,
-            status: Self.activeStatus
+            lineCount: rebuild || !targetExists
+                ? finalStats.lineCount
+                : max(baseLineCount + tailResult.lines.count, baseLineCount),
+            bytesBackedUp: finalStats.byteCount,
+            status: Self.activeStatus,
+            contentHash: contentHash
         )
-
         let manifestChanged = existingRecord != updatedRecord
         if manifestChanged {
             manifest.sessions[sessionID] = updatedRecord
         }
-
         let updatedCursor = BackupCursor(
             sessionId: sessionID,
             sourcePath: sourcePath,
             backupPath: relativeBackupPath,
-            lastByteOffset: tailResult.nextOffset,
-            lastSourceSize: sourceMetadata.size,
+            lastByteOffset: finalOffset,
+            lastSourceSize: sourceMetadata.byteCount,
             lastSourceModifiedAt: sourceMetadata.modifiedAt,
-            lineCount: totalLineCount,
+            lineCount: updatedRecord.lineCount,
             pendingPartialLine: tailResult.pendingPartialLine,
             status: Self.activeStatus,
             lastError: tailResult.blockedError,
             updatedAt: scanDate.timeIntervalSince1970
         )
-        if cursorNeedsUpsert(currentCursor: currentCursor, updatedCursor: updatedCursor) {
-            try cursorStore.upsert(updatedCursor)
-        }
-
         return ProcessSessionFileResult(
             manifestChanged: manifestChanged,
+            cursor: cursorNeedsUpsert(currentCursor: currentCursor, updatedCursor: updatedCursor) ? updatedCursor : nil,
             lastError: tailResult.blockedError
         )
     }
@@ -329,188 +359,84 @@ public final class BackupAgent: @unchecked Sendable {
         cursorStore: BackupCursorStore
     ) throws -> BackupCursor? {
         guard let previousSourcePath = existingRecord?.sourcePath,
-              previousSourcePath != currentSourcePath
-        else {
+              previousSourcePath != currentSourcePath else {
             return nil
         }
-
         return try cursorStore.cursor(sourcePath: previousSourcePath)
     }
 
-    private func shouldReadBackupFileStats(
-        existingRecord: BackupSessionRecord?,
-        baselineCursor: BackupCursor?,
-        sourcePathMigrated: Bool,
-        hasNewCompleteLines: Bool
-    ) -> Bool {
-        if hasNewCompleteLines {
-            return true
-        }
-
-        guard let existingRecord else {
-            return baselineCursor != nil
-        }
-
-        let baselineLineCount = baselineCursor?.lineCount
-        let recordedLineCount = max(existingRecord.lineCount, baselineLineCount ?? 0)
-        if sourcePathMigrated {
-            guard let baselineCursor else {
-                return true
-            }
-            if baselineCursor.lineCount != existingRecord.lineCount {
-                return true
-            }
-        } else if let baselineLineCount, baselineLineCount != existingRecord.lineCount {
-            return true
-        }
-
-        return recordedLineCount > 0 && existingRecord.bytesBackedUp == 0
-    }
-
-    private func resolvedLastBackedUpAt(
-        existingRecord: BackupSessionRecord?,
-        appendedLineCount: Int,
-        totalLineCount: Int,
-        totalBytesBackedUp: Int64,
-        scanDate: Date
-    ) -> Date? {
-        if appendedLineCount > 0 {
-            return scanDate
-        }
-
-        if existingRecord?.lastBackedUpAt == nil,
-           totalLineCount > 0 || totalBytesBackedUp > 0 {
-            return scanDate
-        }
-
-        return existingRecord?.lastBackedUpAt
-    }
-
-    private func backupFileURL(
-        for sessionID: String,
-        firstSeenAt: Date,
-        existingRecord: BackupSessionRecord?,
-        baselineCursor: BackupCursor?
-    ) throws -> URL {
-        if let backupPath = existingRecord?.backupPath ?? baselineCursor?.backupPath {
-            return backupFileURL(forStoredBackupPath: backupPath)
-        }
-
-        return paths.backupFileURL(sessionID: sessionID, firstSeenAt: firstSeenAt)
-    }
-
-    private func backupFileURL(forStoredBackupPath backupPath: String) -> URL {
-        if backupPath.hasPrefix("/") {
-            return URL(fileURLWithPath: backupPath)
-        }
-
-        return paths.backupRoot.appendingPathComponent(backupPath)
-    }
-
-    private func validatedRelativeBackupPath(for backupURL: URL) throws -> String {
-        guard let relativePath = paths.relativeBackupPath(for: backupURL) else {
-            throw BackupAgentError.backupPathOutsideRoot(
-                path: backupURL.path,
-                backupRoot: paths.backupRoot.path
-            )
-        }
-
-        return relativePath
-    }
-
-    private func append(lines: [Data], to backupURL: URL) throws -> Int64 {
+    private func ensureLocalStateDirectoriesExist() throws {
+        try fileManager.createDirectory(at: paths.stateRoot, withIntermediateDirectories: true)
         try fileManager.createDirectory(
-            at: backupURL.deletingLastPathComponent(),
+            at: paths.logURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+    }
 
-        if !fileManager.fileExists(atPath: backupURL.path) {
-            fileManager.createFile(atPath: backupURL.path, contents: nil)
+    private func discoverSessionFiles() throws -> [URL] {
+        let roots = [
+            (url: paths.codexRoot.appendingPathComponent("sessions", isDirectory: true), priority: 0),
+            (url: paths.codexRoot.appendingPathComponent("archived_sessions", isDirectory: true), priority: 1)
+        ]
+        var discovered: [(url: URL, priority: Int)] = []
+        for root in roots where fileManager.fileExists(atPath: root.url.path) {
+            guard let enumerator = fileManager.enumerator(
+                at: root.url,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                options: []
+            ) else { continue }
+            for case let fileURL as URL in enumerator {
+                guard fileURL.pathExtension.lowercased() == "jsonl" else { continue }
+                let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                discovered.append((url: fileURL, priority: root.priority))
+            }
         }
+        return discovered.sorted {
+            $0.priority == $1.priority ? $0.url.path < $1.url.path : $0.priority < $1.priority
+        }.map(\.url)
+    }
 
-        let handle = try FileHandle(forWritingTo: backupURL)
-        defer { try? handle.close() }
-
-        try handle.seekToEnd()
-        var appendedByteCount: Int64 = 0
-        for line in lines {
-            try handle.write(contentsOf: line)
-            try handle.write(contentsOf: Self.newline)
-            appendedByteCount += Int64(line.count + Self.newline.count)
-        }
-
-        return appendedByteCount
+    private func metadata(for sourceURL: URL) throws -> (size: Int64, modifiedAt: TimeInterval) {
+        let attributes = try fileManager.attributesOfItem(atPath: sourceURL.path)
+        return (
+            (attributes[.size] as? NSNumber)?.int64Value ?? 0,
+            (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        )
     }
 
     private func firstTitle(in lines: [Data]) -> String? {
         for line in lines {
             guard let text = String(data: line, encoding: .utf8),
-                  let title = SessionIdentity.title(fromJSONLine: text)
-            else {
-                continue
-            }
-
+                  let title = SessionIdentity.title(fromJSONLine: text) else { continue }
             return title
         }
-
         return nil
-    }
-
-    private func backupTitleIfAlreadyInspectingFile(at backupURL: URL, needsBackupStats: Bool) -> String? {
-        guard needsBackupStats else {
-            return nil
-        }
-
-        return firstTitle(inBackupFileAt: backupURL)
     }
 
     private func firstTitle(inBackupFileAt backupURL: URL) -> String? {
         guard fileManager.fileExists(atPath: backupURL.path),
-              let handle = try? FileHandle(forReadingFrom: backupURL)
-        else {
-            return nil
-        }
+              let handle = try? FileHandle(forReadingFrom: backupURL) else { return nil }
         defer { try? handle.close() }
-
-        var pendingLine = Data()
+        var pending = Data()
         while let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
             for byte in chunk {
-                if byte == Self.newlineByte {
-                    if let text = String(data: pendingLine, encoding: .utf8),
+                if byte == 0x0A {
+                    if let text = String(data: pending, encoding: .utf8),
                        let title = SessionIdentity.title(fromJSONLine: text) {
                         return title
                     }
-                    pendingLine.removeAll(keepingCapacity: true)
+                    pending.removeAll(keepingCapacity: true)
                 } else {
-                    pendingLine.append(byte)
+                    pending.append(byte)
                 }
             }
         }
-
         return nil
     }
 
-    private func lineStats(for lines: [Data]) -> BackupFileStats {
-        BackupFileStats(
-            byteCount: lines.reduce(Int64(0)) { total, line in
-                total + Int64(line.count + Self.newline.count)
-            },
-            lineCount: lines.count
-        )
-    }
-
-    private func metadata(for sourceURL: URL) throws -> (size: Int64, modifiedAt: TimeInterval) {
-        let attributes = try fileManager.attributesOfItem(atPath: sourceURL.path)
-        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-        let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        return (size, modifiedAt)
-    }
-
     private func cursorNeedsUpsert(currentCursor: BackupCursor?, updatedCursor: BackupCursor) -> Bool {
-        guard let currentCursor else {
-            return true
-        }
-
+        guard let currentCursor else { return true }
         return currentCursor.sessionId != updatedCursor.sessionId
             || currentCursor.sourcePath != updatedCursor.sourcePath
             || currentCursor.backupPath != updatedCursor.backupPath
@@ -523,42 +449,15 @@ public final class BackupAgent: @unchecked Sendable {
             || currentCursor.lastError != updatedCursor.lastError
     }
 
-    private func backupFileStats(at backupURL: URL) throws -> BackupFileStats {
-        guard fileManager.fileExists(atPath: backupURL.path) else {
-            return BackupFileStats(byteCount: 0, lineCount: 0)
-        }
-
-        let attributes = try fileManager.attributesOfItem(atPath: backupURL.path)
-        let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-        let handle = try FileHandle(forReadingFrom: backupURL)
-        defer { try? handle.close() }
-
-        var lineCount = 0
-        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
-            lineCount += chunk.reduce(0) { count, byte in
-                count + (byte == Self.newlineByte ? 1 : 0)
-            }
-        }
-
-        return BackupFileStats(byteCount: byteCount, lineCount: lineCount)
-    }
-
     private func writeStatus(
         for manifest: BackupManifest,
         status: BackupHealthStatus,
         lastError: String?,
-        at date: Date
+        at date: Date,
+        includeRemote: Bool
     ) throws {
-        try fileManager.createDirectory(
-            at: paths.statusURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-
-        let existingStatus = try? loadStatus()
+        let existingStatus = try? loadLocalStatus()
         let records = Array(manifest.sessions.values)
-        let lastBackupAt = records
-            .compactMap(\.lastBackedUpAt)
-            .max()
         let snapshot = BackupStatus(
             agentVersion: Self.agentVersion,
             enabled: true,
@@ -567,83 +466,91 @@ public final class BackupAgent: @unchecked Sendable {
             codexRoot: paths.codexRoot.path,
             backupRoot: paths.backupRoot.path,
             firstRunAt: existingStatus?.firstRunAt ?? date,
-            lastStartedAt: lastStartedAtForStatus(existingStatus: existingStatus, fallback: date),
+            lastStartedAt: startedAt(existingStatus: existingStatus, fallback: date),
             lastHeartbeatAt: date,
-            lastBackupAt: lastBackupAt,
+            lastBackupAt: records.compactMap(\.lastBackedUpAt).max(),
             sessionCount: records.count,
             lineCount: records.reduce(0) { $0 + $1.lineCount },
             bytesBackedUp: records.reduce(Int64(0)) { $0 + $1.bytesBackedUp },
             autoStartEnabled: false,
             lastError: lastError
         )
-
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(snapshot).write(to: paths.statusURL, options: [.atomic])
+        let data = try encoder.encode(snapshot)
+        if includeRemote {
+            try remoteStatusWriter(data, paths.remoteStatusURL)
+        }
+        try DurableAtomicWriter().write(data, to: paths.localStatusURL, createParentDirectories: true)
     }
 
     private func writeErrorStatus(_ error: Error) throws {
-        try ensureBackupDirectoriesExist()
-
-        let manifestStore = BackupManifestStore(manifestURL: paths.manifestURL)
-        let manifest = (try? manifestStore.loadOrCreate(
-            codexRoot: paths.codexRoot.path,
-            backupRoot: paths.backupRoot.path,
-            now: now()
-        )) ?? BackupManifest(
-            codexRoot: paths.codexRoot.path,
-            backupRoot: paths.backupRoot.path,
-            createdAt: now(),
-            updatedAt: now()
-        )
-
+        try ensureLocalStateDirectoriesExist()
+        let manifest: BackupManifest
+        if fileManager.fileExists(atPath: paths.manifestURL.path),
+           let loaded = try? BackupManifestStore(
+               manifestURL: paths.manifestURL,
+               createParentDirectories: false
+           ).loadOrCreate(codexRoot: paths.codexRoot.path, backupRoot: paths.backupRoot.path, now: now()) {
+            manifest = loaded
+        } else {
+            manifest = BackupManifest(
+                codexRoot: paths.codexRoot.path,
+                backupRoot: paths.backupRoot.path,
+                createdAt: now(),
+                updatedAt: now()
+            )
+        }
+        _ = try? pendingSessionCount()
         try writeStatus(
             for: manifest,
             status: .error,
             lastError: error.localizedDescription,
-            at: now()
+            at: now(),
+            includeRemote: false
         )
     }
 
-    private func loadStatus() throws -> BackupStatus {
+    private func loadLocalStatus() throws -> BackupStatus {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(BackupStatus.self, from: Data(contentsOf: paths.statusURL))
+        return try decoder.decode(BackupStatus.self, from: Data(contentsOf: paths.localStatusURL))
     }
 
-    private func lastStartedAtForStatus(existingStatus: BackupStatus?, fallback: Date) -> Date {
-        taskLock.lock()
-        let startedAt = pollingStartedAt
-        taskLock.unlock()
+    private func writePendingSources(_ records: [PendingSourceRecord]) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(records)
+        try DurableAtomicWriter().write(data, to: paths.pendingSourcesURL, createParentDirectories: true)
+    }
 
-        return startedAt ?? existingStatus?.lastStartedAt ?? fallback
+    private func loadPendingSources() throws -> [PendingSourceRecord] {
+        guard fileManager.fileExists(atPath: paths.pendingSourcesURL.path) else { return [] }
+        return try JSONDecoder().decode(
+            [PendingSourceRecord].self,
+            from: Data(contentsOf: paths.pendingSourcesURL)
+        )
+    }
+
+    private func startedAt(existingStatus: BackupStatus?, fallback: Date) -> Date {
+        taskLock.lock()
+        let value = pollingStartedAt
+        taskLock.unlock()
+        return value ?? existingStatus?.lastStartedAt ?? fallback
     }
 
     private static func nanoseconds(fromSeconds seconds: UInt64) -> UInt64 {
         let multiplier: UInt64 = 1_000_000_000
-        guard seconds <= UInt64.max / multiplier else {
-            return UInt64.max
-        }
-
+        guard seconds <= UInt64.max / multiplier else { return UInt64.max }
         return seconds * multiplier
     }
 }
 
-private enum BackupAgentError: Error, Sendable {
-    case backupPathOutsideRoot(path: String, backupRoot: String)
-}
-
-private struct BackupFileStats: Sendable {
-    var byteCount: Int64
-    var lineCount: Int
-}
-
-extension BackupAgentError: LocalizedError {
-    var errorDescription: String? {
-        switch self {
-        case let .backupPathOutsideRoot(path, backupRoot):
-            "Backup path is outside backup root: \(path) is not contained in \(backupRoot)."
-        }
-    }
+private struct PendingSourceRecord: Codable {
+    let sourcePath: String
+    let sourceSize: Int64
+    let sourceModifiedAt: TimeInterval
+    let committedOffset: Int64
+    let unrecoverable: Bool?
 }

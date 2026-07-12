@@ -148,7 +148,7 @@ func cursorAdvancesAndPreventsDuplicateBackup() throws {
 }
 
 @Test
-func steadyStateScanDoesNotReadExistingBackupFile() throws {
+func inaccessibleExistingBackupFailsClosedWithoutAdvancingMetadata() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
     let sessionID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -161,19 +161,23 @@ func steadyStateScanDoesNotReadExistingBackupFile() throws {
     let manifest = try fixture.loadManifest()
     let record = try #require(manifest.sessions[sessionID])
     let backupURL = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    let cursorBefore = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
     try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: backupURL.path)
     defer {
         try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: backupURL.path)
     }
 
-    try agent.performOneShotScan()
+    #expect(throws: (any Error).self) {
+        try agent.performOneShotScan()
+    }
 
     let updatedManifest = try fixture.loadManifest()
     let updatedRecord = try #require(updatedManifest.sessions[sessionID])
-    #expect(updatedRecord.lineCount == 1)
-    #expect(updatedRecord.bytesBackedUp == Int64(fixture.lineBytes([
-        #"{"role":"user","content":"Steady state"}"#
-    ])))
+    let cursorAfter = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+    #expect(updatedRecord == record)
+    #expect(cursorAfter == cursorBefore)
 }
 
 @Test
@@ -346,7 +350,7 @@ func existingBackupFileAheadOfManifestIsReconciledBeforeAppending() throws {
 
         """
     )
-    let backupURL = fixture.paths.backupFileURL(sessionID: sessionID, firstSeenAt: fixture.now)
+    let backupURL = try fixture.paths.backupFileURL(for: sourceURL)
     let relativeBackupPath = try #require(fixture.paths.relativeBackupPath(for: backupURL))
     try fixture.writeBackupFile(
         at: backupURL,
@@ -518,7 +522,7 @@ func oversizedLineBeyondLimitSetsErrorStatusAndContinuesOtherSessions() throws {
 }
 
 @Test
-func corruptedManifestBackupPathOutsideBackupRootThrowsClearError() throws {
+func corruptedManifestBackupPathOutsideBackupRootIsRepairedWithoutWritingOutsideRoot() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
     let sessionID = "88888888-8888-8888-8888-888888888888"
@@ -549,13 +553,11 @@ func corruptedManifestBackupPathOutsideBackupRootThrowsClearError() throws {
     try store.save(manifest)
     let agent = fixture.makeAgent()
 
-    do {
-        try agent.performOneShotScan()
-        #expect(Bool(false), "Expected invalid backup path error")
-    } catch {
-        #expect(error.localizedDescription.contains("outside backup root"))
-        #expect(error.localizedDescription.contains("../outside.jsonl"))
-    }
+    try agent.performOneShotScan()
+
+    let repaired = try #require(fixture.loadManifest().sessions[sessionID])
+    #expect(repaired.backupPath == "sessions/\(sessionID).jsonl")
+    #expect(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("outside.jsonl").path) == false)
 }
 
 }
@@ -570,7 +572,8 @@ private struct BackupAgentFixture {
             .appendingPathComponent("CodexSessionVaultCoreTests-\(UUID().uuidString)", isDirectory: true)
         self.paths = BackupPaths(
             codexRoot: root.appendingPathComponent(".codex", isDirectory: true),
-            backupRoot: root.appendingPathComponent("backup", isDirectory: true)
+            backupRoot: root.appendingPathComponent("backup", isDirectory: true),
+            stateRoot: root.appendingPathComponent("state", isDirectory: true)
         )
         self.now = now
 
@@ -578,6 +581,7 @@ private struct BackupAgentFixture {
             at: paths.codexRoot.appendingPathComponent("sessions", isDirectory: true),
             withIntermediateDirectories: true
         )
+        try FileManager.default.createDirectory(at: paths.backupRoot, withIntermediateDirectories: true)
     }
 
     func cleanup() {

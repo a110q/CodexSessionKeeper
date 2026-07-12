@@ -212,7 +212,7 @@ public final class BackupCursorStore {
     private static func drain(_ pipe: Pipe, into collector: PipeDataCollector, group: DispatchGroup) {
         group.enter()
         let reader = pipe.fileHandleForReading
-        DispatchQueue.global(qos: .utility).async {
+        Thread.detachNewThread {
             let data = reader.readDataToEndOfFile()
             try? reader.close()
             collector.append(data)

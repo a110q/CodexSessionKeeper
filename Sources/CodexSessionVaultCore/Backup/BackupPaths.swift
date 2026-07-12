@@ -46,6 +46,10 @@ public struct BackupPaths: Sendable {
         stateRoot.appendingPathComponent("status.json", isDirectory: false)
     }
 
+    public var pendingSourcesURL: URL {
+        stateRoot.appendingPathComponent("pending-sources.json", isDirectory: false)
+    }
+
     public var statusURL: URL {
         remoteStatusURL
     }
