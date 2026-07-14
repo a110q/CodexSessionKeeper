@@ -58,6 +58,75 @@ struct NASBackupRuntimeTests {
     }
 
     @Test
+    func staleScheduledReconnectCannotReplaceHealthyManualReconnect() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        fixture.connected = false
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        #expect(fixture.scheduler.delays == [30])
+
+        fixture.connected = true
+        try runtime.retry()
+        let healthyAgent = try #require(fixture.agentFactory.agents.first)
+
+        fixture.scheduler.fireNext()
+
+        #expect(fixture.agentFactory.agents.count == 1)
+        #expect(healthyAgent.stopCount == 0)
+        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().lastError == nil)
+    }
+
+    @Test
+    func stopInvalidatesRetryEvenAfterRuntimeStartsAgain() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        fixture.connected = false
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        #expect(fixture.scheduler.delays == [30])
+
+        runtime.stop()
+        fixture.connected = true
+        try runtime.initialize()
+        let healthyAgent = try #require(fixture.agentFactory.agents.first)
+
+        fixture.scheduler.fireNext()
+
+        #expect(fixture.agentFactory.agents.count == 1)
+        #expect(healthyAgent.stopCount == 0)
+        #expect(runtime.setupSnapshot().state == .running)
+    }
+
+    @Test
+    func newerReconnectScheduleInvalidatesOlderAction() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        fixture.connected = false
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+
+        #expect(throws: (any Error).self) {
+            try runtime.retry()
+        }
+        #expect(fixture.scheduler.delays == [30, 30])
+        fixture.connected = true
+
+        fixture.scheduler.fireNext()
+        #expect(fixture.agentFactory.agents.isEmpty)
+        #expect(runtime.setupSnapshot().state == .disconnected)
+
+        fixture.scheduler.fireNext()
+        #expect(fixture.agentFactory.agents.count == 1)
+        #expect(fixture.agentFactory.agents[0].triggers == [.reconnect])
+        #expect(runtime.setupSnapshot().state == .running)
+    }
+
+    @Test
     func markerMismatchDoesNotStartAgent() throws {
         let fixture = try NASRuntimeFixture()
         defer { fixture.cleanup() }

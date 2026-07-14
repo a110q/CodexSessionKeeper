@@ -770,14 +770,14 @@ func concurrentTriggersAreSerializedAndOneDrainIsCappedAtTwoScans() throws {
 }
 
 @Test
-func stopFinishesCurrentAtomicSessionAndSkipsRemainingSessions() throws {
+func stoppedPartialSeedRetainsPendingStateAndReplacementCatchesUp() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
     try fixture.writeSession(
         named: "01010101-0101-0101-0101-010101010101.jsonl",
         contents: #"{"role":"user","content":"first"}"# + "\n"
     )
-    try fixture.writeSession(
+    let secondSource = try fixture.writeSession(
         named: "02020202-0202-0202-0202-020202020202.jsonl",
         contents: #"{"role":"user","content":"second"}"# + "\n"
     )
@@ -802,6 +802,30 @@ func stopFinishesCurrentAtomicSessionAndSkipsRemainingSessions() throws {
     #expect(published.wait(timeout: .now() + 5) == .success)
 
     #expect(stepBarrier.visitedSessionCount == 1)
+    let partialManifest = try fixture.loadManifest()
+    #expect(partialManifest.sessions["01010101-0101-0101-0101-010101010101"] != nil)
+    #expect(partialManifest.sessions["02020202-0202-0202-0202-020202020202"] == nil)
+    #expect(FileManager.default.fileExists(atPath: fixture.paths.auditStateURL.path) == false)
+    #expect(try fixture.loadStatus().status == .waiting)
+    let pendingData = try Data(contentsOf: fixture.paths.pendingSourcesURL)
+    let pendingRecords = try #require(
+        JSONSerialization.jsonObject(with: pendingData) as? [[String: Any]]
+    )
+    #expect(pendingRecords.count == 1)
+    #expect(pendingRecords.first?["sourcePath"] as? String == secondSource.path)
+
+    let replacement = fixture.makeAgent()
+    try replacement.performOneShotScan()
+
+    let completedManifest = try fixture.loadManifest()
+    #expect(completedManifest.sessions["01010101-0101-0101-0101-010101010101"] != nil)
+    #expect(completedManifest.sessions["02020202-0202-0202-0202-020202020202"] != nil)
+    #expect(try fixture.loadAuditState().lastResult == "seeded")
+    #expect(try fixture.loadStatus().status == .running)
+    let clearedPending = try #require(
+        JSONSerialization.jsonObject(with: Data(contentsOf: fixture.paths.pendingSourcesURL)) as? [[String: Any]]
+    )
+    #expect(clearedPending.isEmpty)
 }
 
 @Test

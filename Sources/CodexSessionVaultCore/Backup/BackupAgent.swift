@@ -283,14 +283,21 @@ public final class BackupAgent: @unchecked Sendable {
         var updatedCursors: [BackupCursor] = []
         var scanErrors: [String] = []
         var completed = 0
+        var interrupted = false
+        var remainingSources: [URL] = []
         lastKnownProgress = BackupProgress(
             totalFiles: sources.count,
             completedFiles: 0,
             pendingFiles: sources.count,
             phase: phase
         )
-        for sourceURL in sources {
+        for (sourceIndex, sourceURL) in sources.enumerated() {
             if shouldStopBetweenSessionAtomicSteps() {
+                interrupted = true
+                remainingSources = Array(sources[sourceIndex...]).filter { source in
+                    guard let sessionID = SessionIdentity.sessionID(from: source) else { return false }
+                    return !processedSessionIDs.contains(sessionID)
+                }
                 break
             }
             guard let sessionID = SessionIdentity.sessionID(from: sourceURL),
@@ -329,7 +336,23 @@ public final class BackupAgent: @unchecked Sendable {
         if !updatedCursors.isEmpty {
             try cursorStore.upsertMany(updatedCursors)
         }
-        if !manifestExisted, scanErrors.isEmpty {
+        if interrupted {
+            let pending = try interruptedPendingSources(
+                remainingSources: remainingSources,
+                allDiscoveredSources: sources,
+                cursorMap: cursorMap
+            )
+            try writePendingSources(pending)
+            try writeStatus(
+                for: manifest,
+                status: .waiting,
+                lastError: nil,
+                at: scanDate,
+                includeRemote: true
+            )
+            return
+        }
+        if scanErrors.isEmpty {
             try integrityAuditorFactory(paths).recordInitialSeedCompleted(at: scanDate)
         }
 
@@ -341,6 +364,42 @@ public final class BackupAgent: @unchecked Sendable {
             includeRemote: true
         )
         try writePendingSources([])
+    }
+
+    private func interruptedPendingSources(
+        remainingSources: [URL],
+        allDiscoveredSources: [URL],
+        cursorMap: [String: BackupCursor]
+    ) throws -> [PendingSourceRecord] {
+        let discoveredPaths = Set(allDiscoveredSources.map(canonicalSourcePath))
+        var pendingByPath: [String: PendingSourceRecord] = [:]
+        for record in try loadPendingSources() where !discoveredPaths.contains(record.sourcePath) {
+            pendingByPath[record.sourcePath] = PendingSourceRecord(
+                sourcePath: record.sourcePath,
+                sourceSize: record.sourceSize,
+                sourceModifiedAt: record.sourceModifiedAt,
+                committedOffset: record.committedOffset,
+                unrecoverable: true
+            )
+        }
+        for source in remainingSources {
+            let sourcePath = canonicalSourcePath(source)
+            let sourceMetadata = try metadata(for: source)
+            let cursor = cursorMap[sourcePath] ?? cursorMap[source.path]
+            guard cursor == nil
+                    || cursor?.lastSourceSize != sourceMetadata.size
+                    || cursor?.lastSourceModifiedAt != sourceMetadata.modifiedAt else {
+                continue
+            }
+            pendingByPath[sourcePath] = PendingSourceRecord(
+                sourcePath: sourcePath,
+                sourceSize: sourceMetadata.size,
+                sourceModifiedAt: sourceMetadata.modifiedAt,
+                committedOffset: cursor?.lastByteOffset ?? 0,
+                unrecoverable: false
+            )
+        }
+        return pendingByPath.values.sorted { $0.sourcePath < $1.sourcePath }
     }
 
     public func startPolling(intervalSeconds: UInt64 = 30) {

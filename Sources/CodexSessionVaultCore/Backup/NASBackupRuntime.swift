@@ -124,6 +124,7 @@ public final class NASBackupRuntime {
     private var activeTarget: NASBackupTarget?
     private var snapshot = NASSetupSnapshot.unconfigured
     private var retryScheduled = false
+    private var retryGeneration: UInt64 = 0
     private var stopped = false
     private var agentGeneration: UInt64 = 0
     private var lastAppliedCallbackSequence: UInt64 = 0
@@ -188,6 +189,7 @@ public final class NASBackupRuntime {
 
     @discardableResult
     public func activate(department: String, employee: String) throws -> NASBackupTarget {
+        invalidateScheduledRetry()
         stopped = false
         guard stopAgentForReplacement() else {
             let error = NASBackupRuntimeError.replacementQuiescenceTimedOut
@@ -211,8 +213,8 @@ public final class NASBackupRuntime {
 
     public func retry() throws {
         guard !stopped else { return }
+        invalidateScheduledRetry()
         let trigger: BackupScanTrigger = snapshot.state == .disconnected ? .reconnect : .activation
-        retryScheduled = false
         guard stopAgentForReplacement() else {
             let error = NASBackupRuntimeError.replacementQuiescenceTimedOut
             markReplacementDeferred(error)
@@ -230,7 +232,7 @@ public final class NASBackupRuntime {
 
     public func stop() {
         stopped = true
-        retryScheduled = false
+        invalidateScheduledRetry()
         stopAgentImmediately()
     }
 
@@ -257,6 +259,7 @@ public final class NASBackupRuntime {
     }
 
     private func startAgent(for target: NASBackupTarget, trigger: BackupScanTrigger) {
+        invalidateScheduledRetry()
         let paths = BackupPaths(
             codexRoot: codexRoot,
             backupRoot: target.backupRoot,
@@ -308,7 +311,6 @@ public final class NASBackupRuntime {
             }
         )
         agent = createdAgent
-        retryScheduled = false
         createdAgent.startPolling(intervalSeconds: 30)
         createdAgent.requestImmediateScan(trigger)
     }
@@ -390,12 +392,12 @@ public final class NASBackupRuntime {
     private func markDisconnected(_ error: Error) {
         stopAgentImmediately()
         updateDisconnectedSnapshot(error)
-        scheduleReconnectRetryIfNeeded()
+        scheduleReconnectRetry()
     }
 
     private func markReplacementDeferred(_ error: Error) {
         updateDisconnectedSnapshot(error)
-        scheduleReconnectRetryIfNeeded()
+        scheduleReconnectRetry()
     }
 
     private func updateDisconnectedSnapshot(_ error: Error) {
@@ -414,14 +416,26 @@ public final class NASBackupRuntime {
         )
     }
 
-    private func scheduleReconnectRetryIfNeeded() {
-        guard !retryScheduled, !stopped else { return }
+    private func scheduleReconnectRetry() {
+        guard !stopped else { return }
+        retryGeneration &+= 1
+        let scheduledGeneration = retryGeneration
         retryScheduled = true
         scheduleRetry(retryDelay) { [weak self] in
-            guard let self, !self.stopped else { return }
+            guard let self,
+                  !self.stopped,
+                  self.retryScheduled,
+                  self.retryGeneration == scheduledGeneration else {
+                return
+            }
             self.retryScheduled = false
             try? self.retry()
         }
+    }
+
+    private func invalidateScheduledRetry() {
+        retryGeneration &+= 1
+        retryScheduled = false
     }
 
     private func shouldApplyCallback(
