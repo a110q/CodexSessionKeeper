@@ -1658,6 +1658,48 @@ test('startup scan schedules an autonomous audit that catches up first and resch
   assert.deepEqual(cancelled, []);
 });
 
+test('periodic scan before the scheduled audit does not starve the original timer', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const timers = [];
+  let scanCount = 0;
+  let auditCount = 0;
+  const auditor = {
+    async recoverPendingRepairIfNeeded() {},
+    async recordInitialSeedCompleted() {},
+    async runIfDue() {
+      assert.equal(scanCount, 3);
+      auditCount += 1;
+      return { outcome: 'completed', checked: 0, repaired: 0 };
+    },
+  };
+  const agent = new BackupAgent({
+    paths,
+    deviceId: DEVICE_ID,
+    validateTarget: async () => { scanCount += 1; },
+    integrityAuditorFactory: () => auditor,
+    auditDelayProvider: () => 86400000,
+    auditTimerScheduler: (action, delay) => {
+      const timer = { action, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+  });
+  t.after(() => agent.stop());
+
+  await agent.requestImmediateScan('startup');
+  const originalTimer = timers[0];
+  await agent.requestImmediateScan('timer');
+  assert.equal(timers.length, 1);
+
+  assert.deepEqual(
+    await originalTimer.action(),
+    { outcome: 'completed', checked: 0, repaired: 0 },
+  );
+  assert.equal(auditCount, 1);
+  assert.equal(scanCount, 3);
+  assert.equal(timers.length, 2);
+});
+
 test('wake replaces an audit timer and a stale callback cannot clear or run the replacement', async (t) => {
   const { paths } = await makeTestPaths(t);
   const timers = [];

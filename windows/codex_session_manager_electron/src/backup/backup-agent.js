@@ -203,14 +203,13 @@ class BackupAgent {
     this.auditTimer = null;
     this.auditTimerGeneration += 1;
     const generation = this.auditTimerGeneration;
-    const baselineEpoch = this.auditInterruptionEpoch;
     const delay = normalizedTimerDelay(this.auditDelayProvider(
       this.now(),
       this.auditLastCompletedAt,
       this.deviceId,
     ));
     const action = () => {
-      const work = this.runScheduledAudit(generation, baselineEpoch);
+      const work = this.runScheduledAudit(generation);
       void work.catch(() => {});
       return work;
     };
@@ -220,9 +219,10 @@ class BackupAgent {
     if (previousTimer) this.cancelAuditTimer(previousTimer);
   }
 
-  async runScheduledAudit(generation, baselineEpoch) {
+  async runScheduledAudit(generation) {
     if (this.stopped || generation !== this.auditTimerGeneration) return null;
     this.auditTimer = null;
+    const baselineEpoch = this.auditInterruptionEpoch;
     try {
       this.instrumentation.auditWillStart?.();
       const outcome = await this.performIntegrityAuditIfDue(this.deviceId, baselineEpoch);
