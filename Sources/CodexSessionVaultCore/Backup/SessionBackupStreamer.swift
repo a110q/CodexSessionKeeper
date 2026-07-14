@@ -8,19 +8,22 @@ public struct StreamedBackupResult: Equatable, Sendable {
 
     let pendingPartialLine: Data
     let blockedError: String?
+    let firstTitle: String?
 
     init(
         committedByteCount: Int64,
         lineCount: Int,
         contentHash: String,
         pendingPartialLine: Data,
-        blockedError: String?
+        blockedError: String?,
+        firstTitle: String?
     ) {
         self.committedByteCount = committedByteCount
         self.lineCount = lineCount
         self.contentHash = contentHash
         self.pendingPartialLine = pendingPartialLine
         self.blockedError = blockedError
+        self.firstTitle = firstTitle
     }
 }
 
@@ -30,6 +33,7 @@ struct StreamedAppendResult: Equatable, Sendable {
     let lineCount: Int
     let pendingPartialLine: Data
     let blockedError: String?
+    let firstTitle: String?
 }
 
 public struct SessionBackupStreamer: Sendable {
@@ -81,6 +85,7 @@ public struct SessionBackupStreamer: Sendable {
         var digest = SHA256()
         var pendingLine = Data()
         var blockedError: String?
+        var firstTitle: String?
         var lineOffset: Int64 = 0
 
         try atomicWriter.replace(at: destination) { destinationHandle in
@@ -108,6 +113,9 @@ public struct SessionBackupStreamer: Sendable {
                         )
                         pendingLine.removeAll(keepingCapacity: false)
                         break readLoop
+                    }
+                    if firstTitle == nil {
+                        firstTitle = Self.title(from: pendingLine)
                     }
 
                     if !pendingLine.isEmpty {
@@ -154,7 +162,8 @@ public struct SessionBackupStreamer: Sendable {
             lineCount: lineCount,
             contentHash: Self.hexDigest(digest.finalize()),
             pendingPartialLine: cursorPartialLine,
-            blockedError: blockedError
+            blockedError: blockedError,
+            firstTitle: firstTitle
         )
     }
 
@@ -184,6 +193,7 @@ public struct SessionBackupStreamer: Sendable {
         var lineCount = 0
         var pendingLine = Data()
         var blockedError: String?
+        var firstTitle: String?
 
         readLoop: while true {
             guard let chunk = try sourceHandle.read(upToCount: chunkSize), !chunk.isEmpty else {
@@ -202,6 +212,9 @@ public struct SessionBackupStreamer: Sendable {
                     )
                     pendingLine.removeAll(keepingCapacity: false)
                     break readLoop
+                }
+                if firstTitle == nil {
+                    firstTitle = Self.title(from: pendingLine)
                 }
 
                 if !pendingLine.isEmpty {
@@ -238,7 +251,8 @@ public struct SessionBackupStreamer: Sendable {
             appendedByteCount: appendedByteCount,
             lineCount: lineCount,
             pendingPartialLine: cursorPartialLine,
-            blockedError: blockedError
+            blockedError: blockedError,
+            firstTitle: firstTitle
         )
     }
 
@@ -279,6 +293,11 @@ public struct SessionBackupStreamer: Sendable {
 
     private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
         digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func title(from line: Data) -> String? {
+        guard let text = String(data: line, encoding: .utf8) else { return nil }
+        return SessionIdentity.title(fromJSONLine: text)
     }
 
     private func cursorPartialLine(_ pendingLine: Data, blockedError: String?) -> Data {

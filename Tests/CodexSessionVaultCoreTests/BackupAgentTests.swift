@@ -286,6 +286,71 @@ func appendStreamsLargeDeltaWithoutMaterializingTailerLines() throws {
 }
 
 @Test
+func emptySeedAndEmptyRebuildStoreCanonicalContentHash() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "19191919-1919-1919-1919-191919191919"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: "")
+    let agent = fixture.makeAgent()
+
+    try agent.performOneShotScan()
+
+    let emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    #expect(try fixture.loadManifest().sessions[sessionID]?.contentHash == emptyHash)
+
+    try Data("complete\n".utf8).write(to: source)
+    try FileManager.default.setAttributes(
+        [.modificationDate: fixture.now.addingTimeInterval(120)],
+        ofItemAtPath: source.path
+    )
+    try agent.performOneShotScan()
+    try Data().write(to: source)
+    try FileManager.default.setAttributes(
+        [.modificationDate: fixture.now.addingTimeInterval(240)],
+        ofItemAtPath: source.path
+    )
+
+    try agent.performOneShotScan()
+
+    let rebuiltRecord = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(rebuiltRecord.backupPath)
+    #expect(rebuiltRecord.contentHash == emptyHash)
+    #expect(try Data(contentsOf: target).isEmpty)
+}
+
+@Test
+func appendTitleFallbackUsesOnlyNewRangeInsteadOfLargeTargetPrefix() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "20202020-2020-2020-2020-202020202020"
+    let largeAssistantLine = #"{"role":"assistant","content":""#
+        + String(repeating: "x", count: 3 * 1_048_576 + 17)
+        + #""}"#
+        + "\n"
+    let oldTitleLine = #"{"role":"user","content":"old prefix title"}"# + "\n"
+    let newTitleLine = #"{"role":"user","content":"new appended title"}"# + "\n"
+    let source = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: largeAssistantLine + oldTitleLine
+    )
+    let agent = fixture.makeAgent()
+    try agent.performOneShotScan()
+    var manifest = try fixture.loadManifest()
+    manifest.sessions[sessionID]?.title = nil
+    try fixture.saveManifest(manifest)
+    let oldOffset = Int64(Data((largeAssistantLine + oldTitleLine).utf8).count)
+    fixture.resetSpies()
+
+    try fixture.append(newTitleLine, to: source)
+    try agent.performOneShotScan()
+
+    let newOffset = oldOffset + Int64(Data(newTitleLine.utf8).count)
+    let updatedRecord = try #require(fixture.loadManifest().sessions[sessionID])
+    #expect(updatedRecord.title == "new appended title")
+    #expect(fixture.sourceBodyReadRanges.allSatisfy { $0 == oldOffset..<newOffset })
+}
+
+@Test
 func sameSizeNewMtimeRewriteStreamsRebuild() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
@@ -906,6 +971,10 @@ private final class BackupAgentFixture {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(BackupManifest.self, from: Data(contentsOf: paths.manifestURL))
+    }
+
+    func saveManifest(_ manifest: BackupManifest) throws {
+        try BackupManifestStore(manifestURL: paths.manifestURL).save(manifest)
     }
 
     func loadStatus() throws -> BackupStatus {

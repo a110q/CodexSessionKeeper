@@ -123,6 +123,29 @@ struct SessionBackupStreamerTests {
     }
 
     @Test
+    func appendTitleFallbackStopsAtThirtyTwoMiBLineBound() throws {
+        var sourceData = Data(repeating: 0x78, count: SessionTailer.defaultMaxLineBytes + 1)
+        sourceData.append(0x0A)
+        sourceData.append(Data(#"{"role":"user","content":"must not be reached"}"#.utf8))
+        sourceData.append(0x0A)
+        let fixture = try StreamerFixture(source: sourceData, chunkSize: chunkSize)
+        defer { fixture.cleanup() }
+        try Data().write(to: fixture.target)
+
+        let result = try fixture.streamer.appendCompleteLines(
+            source: fixture.source,
+            from: 0,
+            destination: fixture.target,
+            synchronize: { try $0.synchronize() }
+        )
+
+        #expect(result.firstTitle == nil)
+        #expect(result.blockedError?.contains("exceeds maximum JSONL line size") == true)
+        #expect(result.committedByteCount == 0)
+        #expect(try Data(contentsOf: fixture.target).isEmpty)
+    }
+
+    @Test
     func failedStreamingReplacementPreservesExistingDestination() throws {
         let fixture = try StreamerFixture(source: Data(), chunkSize: chunkSize)
         defer { fixture.cleanup() }

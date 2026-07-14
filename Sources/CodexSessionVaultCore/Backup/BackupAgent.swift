@@ -344,6 +344,7 @@ public final class BackupAgent: @unchecked Sendable {
         let blockedError: String?
         let contentHash: String?
         let appendedLineCount: Int
+        let fallbackTitle: String?
         if rebuild {
             instrumentation.sourceBodyRead(sourceURL, 0, sourceMetadata.byteCount)
             let streamed = try fileCommitter.rebuildCompleteLines(
@@ -363,8 +364,9 @@ public final class BackupAgent: @unchecked Sendable {
             finalOffset = streamed.committedByteCount
             pendingPartialLine = streamed.pendingPartialLine
             blockedError = streamed.blockedError
-            contentHash = streamed.committedByteCount > 0 ? streamed.contentHash : nil
+            contentHash = streamed.contentHash
             appendedLineCount = 0
+            fallbackTitle = streamed.firstTitle
         } else {
             instrumentation.sourceBodyRead(
                 sourceURL,
@@ -388,6 +390,7 @@ public final class BackupAgent: @unchecked Sendable {
             appendedLineCount = appended.lineCount
             wroteData = appended.appendedByteCount > 0
             contentHash = appended.appendedByteCount > 0 ? nil : existingRecord?.contentHash
+            fallbackTitle = appended.firstTitle
 
             if finalOffset > recordedOffset {
                 let verifiedByteCount = finalOffset - recordedOffset
@@ -405,7 +408,7 @@ public final class BackupAgent: @unchecked Sendable {
         }
 
         let title = existingRecord?.title
-            ?? firstTitle(inBackupFileAt: targetURL)
+            ?? fallbackTitle
         let firstSeenAt = existingRecord?.firstSeenAt ?? scanDate
         let lastBackedUpAt = wroteData || existingRecord?.lastBackedUpAt == nil && finalStats.lineCount > 0
             ? scanDate
@@ -530,27 +533,6 @@ public final class BackupAgent: @unchecked Sendable {
             (attributes[.size] as? NSNumber)?.int64Value ?? 0,
             (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         )
-    }
-
-    private func firstTitle(inBackupFileAt backupURL: URL) -> String? {
-        guard fileManager.fileExists(atPath: backupURL.path),
-              let handle = try? FileHandle(forReadingFrom: backupURL) else { return nil }
-        defer { try? handle.close() }
-        var pending = Data()
-        while let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
-            for byte in chunk {
-                if byte == 0x0A {
-                    if let text = String(data: pending, encoding: .utf8),
-                       let title = SessionIdentity.title(fromJSONLine: text) {
-                        return title
-                    }
-                    pending.removeAll(keepingCapacity: true)
-                } else {
-                    pending.append(byte)
-                }
-            }
-        }
-        return nil
     }
 
     private func cursorNeedsUpsert(currentCursor: BackupCursor?, updatedCursor: BackupCursor) -> Bool {
