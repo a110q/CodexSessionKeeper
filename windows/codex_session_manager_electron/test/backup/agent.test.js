@@ -93,6 +93,32 @@ function spyOnDatabaseExport(store) {
   };
 }
 
+function spyOnAllCursorStoreExports() {
+  const originalFlush = CursorStore.prototype.flush;
+  let calls = 0;
+  CursorStore.prototype.flush = async function (...args) {
+    const database = this.db;
+    const originalExport = database.export;
+    database.export = (...exportArgs) => {
+      calls += 1;
+      return originalExport.apply(database, exportArgs);
+    };
+    try {
+      return await originalFlush.apply(this, args);
+    } finally {
+      database.export = originalExport;
+    }
+  };
+  return {
+    get calls() {
+      return calls;
+    },
+    restore() {
+      CursorStore.prototype.flush = originalFlush;
+    },
+  };
+}
+
 test('initial scan backs up existing jsonl and records manifest title and line count', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'alpha.jsonl');
@@ -295,11 +321,22 @@ test('no-op scan does not rewrite the cursor database', async (t) => {
   assert.equal(afterHash, beforeHash);
 });
 
-test('scan batches many changed cursors into one database export', async (t) => {
+test('fresh scan with no changed cursors performs zero total database exports', async (t) => {
   const { paths } = await makeTestPaths(t);
-  const seedStore = new CursorStore({ paths });
-  await seedStore.open();
-  await seedStore.close();
+  const exportSpy = spyOnAllCursorStoreExports();
+
+  try {
+    await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+  } finally {
+    exportSpy.restore();
+  }
+
+  assert.equal(exportSpy.calls, 0);
+  assert.equal(await fileExists(paths.cursorDatabasePath), false);
+});
+
+test('fresh scan batches many changed cursors into one total database export', async (t) => {
+  const { paths } = await makeTestPaths(t);
   await writeSessionFile(path.join(paths.codexRoot, 'sessions', 'batch-one.jsonl'), [
     jsonLine({ role: 'user', content: 'One' }),
   ]);
@@ -307,21 +344,11 @@ test('scan batches many changed cursors into one database export', async (t) => 
     jsonLine({ role: 'user', content: 'Two' }),
   ]);
 
-  const originalOpen = CursorStore.prototype.open;
   const originalAll = CursorStore.prototype.all;
   const originalUpsertMany = CursorStore.prototype.upsertMany;
+  const exportSpy = spyOnAllCursorStoreExports();
   let allCalls = 0;
   let upsertManyCalls = 0;
-  let exportCalls = 0;
-  CursorStore.prototype.open = async function (...args) {
-    const result = await originalOpen.apply(this, args);
-    const originalExport = this.db.export.bind(this.db);
-    this.db.export = (...exportArgs) => {
-      exportCalls += 1;
-      return originalExport(...exportArgs);
-    };
-    return result;
-  };
   CursorStore.prototype.all = function (...args) {
     allCalls += 1;
     return originalAll.apply(this, args);
@@ -334,7 +361,7 @@ test('scan batches many changed cursors into one database export', async (t) => 
   try {
     await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
   } finally {
-    CursorStore.prototype.open = originalOpen;
+    exportSpy.restore();
     if (originalAll) CursorStore.prototype.all = originalAll;
     else delete CursorStore.prototype.all;
     if (originalUpsertMany) CursorStore.prototype.upsertMany = originalUpsertMany;
@@ -343,7 +370,7 @@ test('scan batches many changed cursors into one database export', async (t) => 
 
   assert.equal(allCalls, 1);
   assert.equal(upsertManyCalls, 1);
-  assert.equal(exportCalls, 1);
+  assert.equal(exportSpy.calls, 1);
 });
 
 test('partial trailing line is not backed up until completed', async (t) => {
@@ -730,7 +757,7 @@ test('SQL failure rolls back the cursor batch without a durable replacement', as
   t.after(async () => {
     await store.close();
   });
-  const durableHash = await fileHash(paths.cursorDatabasePath);
+  assert.equal(await fileExists(paths.cursorDatabasePath), false);
   store.db.run(`
     CREATE TRIGGER reject_bad_cursor
     BEFORE INSERT ON backup_cursors
@@ -751,38 +778,120 @@ test('SQL failure rolls back the cursor batch without a durable replacement', as
 
   assert.equal(exportSpy.calls, 0);
   assert.equal(store.all().size, 0);
-  assert.equal(await fileHash(paths.cursorDatabasePath), durableHash);
+  assert.equal(await fileExists(paths.cursorDatabasePath), false);
 });
 
 test('durable cursor replacement failure leaves the previous database readable', async (t) => {
   const { paths } = await makeTestPaths(t);
   const store = new CursorStore({ paths });
   await store.open();
+  t.after(async () => {
+    await store.close();
+  });
   const original = cursorFor(paths, 'durable.jsonl');
   await store.upsert(original);
-  const exportSpy = spyOnDatabaseExport(store);
+  const exportSpy = spyOnAllCursorStoreExports();
+  t.after(() => {
+    exportSpy.restore();
+  });
   const originalRename = fs.rename;
+  const rejectedPath = cursorFor(paths, 'rejected.jsonl').sourcePath;
   fs.rename = async () => {
     throw new Error('injected durable replacement failure');
   };
 
   try {
     await assert.rejects(
-      store.upsertMany([cursorFor(paths, 'durable.jsonl', { lastByteOffset: 99 })]),
+      store.upsertMany([
+        cursorFor(paths, 'durable.jsonl', { lastByteOffset: 99 }),
+        cursorFor(paths, 'rejected.jsonl'),
+      ]),
       /injected durable replacement failure/,
     );
   } finally {
     fs.rename = originalRename;
-    await store.close();
   }
+
+  assert.equal(exportSpy.calls, 1);
+  assert.equal(store.all().size, 1);
+  assert.deepEqual(await store.get(original.sourcePath), original);
+  assert.equal(await store.get(rejectedPath), null);
+
+  const accepted = cursorFor(paths, 'durable.jsonl', { lastByteOffset: 77 });
+  await store.upsertMany([accepted]);
+  assert.equal(exportSpy.calls, 2);
+  assert.deepEqual(await store.get(original.sourcePath), accepted);
+  assert.equal(await store.get(rejectedPath), null);
+  await store.close();
 
   const reopened = new CursorStore({ paths });
   await reopened.open();
   t.after(async () => {
     await reopened.close();
   });
+  assert.equal(reopened.all().size, 1);
+  assert.deepEqual(await reopened.get(original.sourcePath), accepted);
+  assert.equal(await reopened.get(rejectedPath), null);
+});
+
+test('rollback failure restores the last durable database and permits reuse', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const store = new CursorStore({ paths });
+  await store.open();
+  t.after(async () => {
+    await store.close();
+  });
+  const original = cursorFor(paths, 'rollback.jsonl');
+  await store.upsert(original);
+  store.db.run(`
+    CREATE TRIGGER reject_bad_cursor
+    BEFORE INSERT ON backup_cursors
+    WHEN NEW.source_path LIKE '%bad.jsonl'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected SQL failure');
+    END;
+  `);
+  const failedDatabase = store.db;
+  const originalRun = failedDatabase.run;
+  failedDatabase.run = function (sql, ...args) {
+    if (sql === 'ROLLBACK;') {
+      throw new Error('injected rollback failure');
+    }
+    return originalRun.call(failedDatabase, sql, ...args);
+  };
+  const exportSpy = spyOnAllCursorStoreExports();
+  t.after(() => {
+    exportSpy.restore();
+  });
+  const rejectedPath = cursorFor(paths, 'bad.jsonl').sourcePath;
+
+  await assert.rejects(
+    store.upsertMany([
+      cursorFor(paths, 'good.jsonl'),
+      cursorFor(paths, 'bad.jsonl'),
+    ]),
+    /injected SQL failure/,
+  );
+
+  assert.equal(exportSpy.calls, 0);
+  assert.equal(store.all().size, 1);
+  assert.deepEqual(await store.get(original.sourcePath), original);
+  assert.equal(await store.get(rejectedPath), null);
+
+  const accepted = cursorFor(paths, 'rollback.jsonl', { lastByteOffset: 55 });
+  await store.upsertMany([accepted]);
   assert.equal(exportSpy.calls, 1);
-  assert.deepEqual(await reopened.get(original.sourcePath), original);
+  assert.deepEqual(await store.get(original.sourcePath), accepted);
+  await store.close();
+
+  const reopened = new CursorStore({ paths });
+  await reopened.open();
+  t.after(async () => {
+    await reopened.close();
+  });
+  assert.equal(reopened.all().size, 1);
+  assert.deepEqual(await reopened.get(original.sourcePath), accepted);
+  assert.equal(await reopened.get(rejectedPath), null);
 });
 
 test('session tailer reads across chunks until complete lines are exhausted', async (t) => {

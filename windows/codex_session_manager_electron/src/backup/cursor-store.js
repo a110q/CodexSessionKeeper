@@ -82,6 +82,22 @@ const UPSERT_CURSOR = `
     updated_at = excluded.updated_at;
 `;
 
+const CREATE_CURSOR_TABLE = `
+  CREATE TABLE IF NOT EXISTS backup_cursors (
+    source_path TEXT NOT NULL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    backup_path TEXT NOT NULL,
+    last_byte_offset INTEGER NOT NULL,
+    last_source_size INTEGER NOT NULL,
+    last_source_modified_at REAL NOT NULL,
+    line_count INTEGER NOT NULL,
+    pending_partial_line TEXT NOT NULL,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    updated_at REAL NOT NULL
+  );
+`;
+
 function cursorFromRow(row) {
   return {
     sessionId: row.sessionId,
@@ -124,6 +140,7 @@ class CursorStore {
     this.SQL = SQL;
     this.locateFile = locateFile;
     this.db = null;
+    this.durableData = null;
   }
 
   async open() {
@@ -131,7 +148,7 @@ class CursorStore {
       return this;
     }
 
-    const SQL = this.SQL || await loadSqlModule(this.locateFile);
+    this.SQL = this.SQL || await loadSqlModule(this.locateFile);
     await fs.mkdir(path.dirname(this.paths.cursorDatabasePath), { recursive: true });
 
     let data = null;
@@ -143,25 +160,8 @@ class CursorStore {
       }
     }
 
-    this.db = data ? new SQL.Database(data) : new SQL.Database();
-    this.db.run(`
-      CREATE TABLE IF NOT EXISTS backup_cursors (
-        source_path TEXT NOT NULL PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        backup_path TEXT NOT NULL,
-        last_byte_offset INTEGER NOT NULL,
-        last_source_size INTEGER NOT NULL,
-        last_source_modified_at REAL NOT NULL,
-        line_count INTEGER NOT NULL,
-        pending_partial_line TEXT NOT NULL,
-        status TEXT NOT NULL,
-        last_error TEXT,
-        updated_at REAL NOT NULL
-      );
-    `);
-    if (!data) {
-      await this.flush();
-    }
+    this.durableData = data ? Buffer.from(data) : null;
+    this.db = this.createDatabase(this.durableData);
 
     return this;
   }
@@ -224,6 +224,8 @@ class CursorStore {
 
     const statement = this.db.prepare(UPSERT_CURSOR);
     let transactionStarted = false;
+    let transactionError = null;
+    let rollbackFailed = false;
 
     try {
       this.db.run('BEGIN IMMEDIATE;');
@@ -236,16 +238,27 @@ class CursorStore {
       this.db.run('COMMIT;');
       transactionStarted = false;
     } catch (error) {
+      transactionError = error;
       if (transactionStarted) {
         try {
           this.db.run('ROLLBACK;');
         } catch {
-          // Preserve the original SQL failure.
+          rollbackFailed = true;
         }
       }
-      throw error;
     } finally {
       statement.free();
+    }
+
+    if (transactionError) {
+      if (rollbackFailed) {
+        try {
+          this.restoreDurableDatabase();
+        } catch (recoveryError) {
+          transactionError.recoveryError = recoveryError;
+        }
+      }
+      throw transactionError;
     }
 
     await this.flush();
@@ -254,8 +267,20 @@ class CursorStore {
   async flush() {
     this.ensureOpen();
 
-    await fs.mkdir(path.dirname(this.paths.cursorDatabasePath), { recursive: true });
-    await replaceFileDurably(this.paths.cursorDatabasePath, Buffer.from(this.db.export()));
+    let data;
+    try {
+      await fs.mkdir(path.dirname(this.paths.cursorDatabasePath), { recursive: true });
+      data = Buffer.from(this.db.export());
+      await replaceFileDurably(this.paths.cursorDatabasePath, data);
+    } catch (error) {
+      try {
+        this.restoreDurableDatabase();
+      } catch (recoveryError) {
+        error.recoveryError = recoveryError;
+      }
+      throw error;
+    }
+    this.durableData = data;
   }
 
   async close() {
@@ -265,6 +290,33 @@ class CursorStore {
 
     this.db.close();
     this.db = null;
+    this.durableData = null;
+  }
+
+  createDatabase(data) {
+    const database = data ? new this.SQL.Database(data) : new this.SQL.Database();
+    try {
+      database.run(CREATE_CURSOR_TABLE);
+      return database;
+    } catch (error) {
+      database.close();
+      throw error;
+    }
+  }
+
+  restoreDurableDatabase() {
+    const previousDatabase = this.db;
+    let restoredDatabase;
+    try {
+      restoredDatabase = this.createDatabase(this.durableData);
+    } catch (error) {
+      previousDatabase?.close();
+      this.db = null;
+      throw error;
+    }
+
+    this.db = restoredDatabase;
+    previousDatabase?.close();
   }
 
   ensureOpen() {
