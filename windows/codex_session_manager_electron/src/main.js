@@ -54,10 +54,12 @@ const nasRuntime = createNasRuntime({
   settingsStore,
   homeDir: os.homedir(),
   pathsFactory: ({ target }) => pathsForNasTarget(target),
-  agentFactory: ({ paths: selectedPaths, validateTarget, onProgress }) => new BackupAgent({
+  agentFactory: ({ paths: selectedPaths, validateTarget, initialStatus, onProgress, onStatus }) => new BackupAgent({
     paths: selectedPaths,
     validateTarget,
+    initialStatus,
     onProgress,
+    onStatus,
   }),
 });
 const applicationPagePath = path.join(__dirname, 'index.html');
@@ -69,6 +71,8 @@ const handleTrustedIpc = createTrustedIpcRegistrar({
 });
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
+let removePowerMonitorResume = null;
+let backupExitConfirmed = false;
 
 const backupCandidates = [
   'config.toml',
@@ -155,6 +159,7 @@ if (hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     Menu.setApplicationMenu(null);
     await nasRuntime.initialize();
+    installBackupLifecycleListeners();
     createWindow();
   });
 }
@@ -171,8 +176,29 @@ app.on('window-all-closed', () => {
 });
 
 app.on('activate', () => {
+  nasRuntime.requestImmediateScan('activation');
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
+
+app.on('before-quit', () => {
+  const backupBusy = ['seeding', 'pending'].includes(nasRuntime.snapshot().state);
+  if (backupBusy && !backupExitConfirmed) return;
+  teardownBackupLifecycleListeners();
+  nasRuntime.stop();
+});
+
+function installBackupLifecycleListeners() {
+  if (removePowerMonitorResume) return;
+  const { powerMonitor } = require('electron');
+  const resumeHandler = () => nasRuntime.requestImmediateScan('wake');
+  powerMonitor.on('resume', resumeHandler);
+  removePowerMonitorResume = () => powerMonitor.removeListener('resume', resumeHandler);
+}
+
+function teardownBackupLifecycleListeners() {
+  removePowerMonitorResume?.();
+  removePowerMonitorResume = null;
+}
 
 function pathsForNasTarget(target) {
   return backupPaths({
@@ -219,6 +245,7 @@ function installBackupExitGuard(window) {
     }).then((result) => {
       promptOpen = false;
       if (result.response === 1) {
+        backupExitConfirmed = true;
         allowClose = true;
         window.close();
       }
@@ -259,27 +286,7 @@ function readText(targetPath) {
 }
 
 function readBackupStatus() {
-  const runtime = nasRuntime.snapshot();
-  const configuration = runtime.configuration;
-  if (!configuration?.deviceId) {
-    return { status: runtime.state === 'unconfigured' ? 'waiting' : runtime.state, mode: 'polling', lastError: runtime.lastError, progress: runtime.progress };
-  }
-  const localStatusPath = path.join(vaultRoot, 'nas-state', configuration.deviceId, 'status.json');
-  try {
-    if (!exists(localStatusPath)) {
-      return { status: runtime.state, mode: 'polling', lastError: runtime.lastError, progress: runtime.progress };
-    }
-    const localStatus = JSON.parse(readText(localStatusPath));
-    const runtimeOwnsStatus = ['validating', 'disconnected', 'seeding', 'pending'].includes(runtime.state);
-    return {
-      ...localStatus,
-      status: runtimeOwnsStatus ? runtime.state : localStatus.status,
-      lastError: runtime.lastError || localStatus.lastError || null,
-      progress: runtime.progress,
-    };
-  } catch (error) {
-    return { status: 'error', mode: 'polling', lastError: error.message || String(error) };
-  }
+  return nasRuntime.backupStatus();
 }
 
 function readLines(targetPath) {

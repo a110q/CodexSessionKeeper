@@ -62,6 +62,24 @@ function makeClock() {
   return () => new Date(Date.UTC(2026, 0, 2, 3, 4, tick++));
 }
 
+function controlledPromise() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitForCondition(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for test condition.');
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 async function withoutJsonlReadFile(operation) {
   const originalReadFile = fs.readFile;
   fs.readFile = async (filePath, ...args) => {
@@ -1557,6 +1575,170 @@ test('integrity audit runs only after incremental catch-up', async (t) => {
   assert.ok(JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions['audit-catchup'].contentHash);
 });
 
+test('persisted status is published through the agent status callback', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const statuses = [];
+  const agent = new BackupAgent({ paths, onStatus: (status) => statuses.push(status) });
+
+  await agent.performOneShotScan();
+
+  const persisted = JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8'));
+  assert.deepEqual(statuses, [persisted]);
+});
+
+test('polling defaults to 30 seconds and stale timer callbacks are rejected after stop', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const scheduled = [];
+  const cancelled = [];
+  const triggers = [];
+  let validations = 0;
+  const agent = new BackupAgent({
+    paths,
+    validateTarget: async () => { validations += 1; },
+    instrumentation: { scanRequested: (trigger) => triggers.push(trigger) },
+    scheduleInterval: (action, delay) => {
+      const timer = { action, delay, unref() {} };
+      scheduled.push(timer);
+      return timer;
+    },
+    cancelInterval: (timer) => cancelled.push(timer),
+  });
+
+  agent.startPolling();
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delay, 30000);
+  assert.equal(validations, 0);
+
+  await scheduled[0].action();
+  assert.equal(validations, 1);
+  assert.deepEqual(triggers, ['timer']);
+
+  agent.stop();
+  await scheduled[0].action();
+  assert.equal(validations, 1);
+  assert.deepEqual(triggers, ['timer']);
+  assert.deepEqual(cancelled, [scheduled[0]]);
+});
+
+test('concurrent triggers serialize one active scan and at most one queued follow-up', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const gates = [];
+  const triggers = [];
+  let activeScans = 0;
+  let maximumConcurrentScans = 0;
+  let scanCount = 0;
+  const agent = new BackupAgent({
+    paths,
+    validateTarget: async () => {
+      scanCount += 1;
+      activeScans += 1;
+      maximumConcurrentScans = Math.max(maximumConcurrentScans, activeScans);
+      const gate = controlledPromise();
+      gates.push(gate);
+      await gate.promise;
+      activeScans -= 1;
+    },
+    instrumentation: { scanRequested: (trigger) => triggers.push(trigger) },
+  });
+  t.after(() => {
+    for (const gate of gates) gate.resolve();
+    agent.stop();
+  });
+
+  const drain = agent.requestImmediateScan('timer');
+  await waitForCondition(() => scanCount === 1);
+  agent.requestImmediateScan('wake');
+  agent.requestImmediateScan('reconnect');
+  agent.requestImmediateScan('timer');
+  gates[0].resolve();
+  await waitForCondition(() => scanCount === 2);
+  agent.requestImmediateScan('wake');
+  agent.requestImmediateScan('reconnect');
+  agent.requestImmediateScan('timer');
+  gates[1].resolve();
+  await drain;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(scanCount, 2);
+  assert.equal(maximumConcurrentScans, 1);
+  assert.deepEqual(triggers, ['timer', 'wake', 'reconnect', 'timer', 'wake', 'reconnect', 'timer']);
+});
+
+test('replacement quiescence wait is bounded and succeeds after the active writer drains', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const entered = controlledPromise();
+  const release = controlledPromise();
+  const agent = new BackupAgent({
+    paths,
+    validateTarget: async () => {
+      entered.resolve();
+      await release.promise;
+    },
+  });
+
+  const scan = agent.requestImmediateScan('startup');
+  await entered.promise;
+  const startedAt = Date.now();
+  assert.equal(await agent.stopAndAwaitQuiescence(5), false);
+  assert.ok(Date.now() - startedAt < 250);
+  release.resolve();
+  await scan;
+
+  assert.equal(await agent.stopAndAwaitQuiescence(1000), true);
+});
+
+test('stop between atomic session steps retains pending state and does not publish a complete seed', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const firstPath = path.join(paths.codexRoot, 'sessions', 'a-first.jsonl');
+  const secondPath = path.join(paths.codexRoot, 'sessions', 'b-second.jsonl');
+  await writeSessionFile(firstPath, [jsonLine({ role: 'user', content: 'first' })]);
+  await writeSessionFile(secondPath, [jsonLine({ role: 'user', content: 'second' })]);
+  const firstFinished = controlledPromise();
+  const releaseFirst = controlledPromise();
+  const agent = new BackupAgent({ paths });
+  const processSessionFile = agent.processSessionFile.bind(agent);
+  let processed = 0;
+  agent.processSessionFile = async (...args) => {
+    const result = await processSessionFile(...args);
+    processed += 1;
+    if (processed === 1) {
+      firstFinished.resolve();
+      await releaseFirst.promise;
+    }
+    return result;
+  };
+
+  const scan = agent.requestImmediateScan('startup');
+  await firstFinished.promise;
+  agent.stop();
+  releaseFirst.resolve();
+  await scan;
+
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  assert.deepEqual(Object.keys(manifest.sessions), ['a-first']);
+  const status = JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8'));
+  assert.equal(status.status, 'waiting');
+  const pending = JSON.parse(await fs.readFile(paths.pendingSourcesPath, 'utf8'));
+  assert.equal(pending.pending.length, 1);
+  assert.equal(pending.pending[0].sourcePath, secondPath);
+  assert.equal(await fileExists(paths.auditStatePath), false);
+});
+
+test('stopped agent preserves its interruption epoch and rejects later audit work', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  let validations = 0;
+  const agent = new BackupAgent({
+    paths,
+    validateTarget: async () => { validations += 1; },
+  });
+
+  agent.stop();
+  const outcome = await agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001');
+
+  assert.deepEqual(outcome, { outcome: 'interrupted', checked: 0, repaired: 0 });
+  assert.equal(validations, 0);
+});
+
 test('queued incremental scan interrupts audit at a chunk boundary and catches up', async (t) => {
   const { paths } = await makeTestPaths(t);
   const now = new Date('2026-07-14T04:05:06.000Z');
@@ -1606,6 +1788,47 @@ test('queued incremental scan interrupts audit at a chunk boundary and catches u
   await scanPromise;
   assert.equal(interruptionSignals, interruptionSignalsBeforeQueuedScan + 1);
   assert.ok((await fs.readFile(paths.backupFilePath(sourcePath), 'utf8')).endsWith(appended));
+});
+
+test('stop interrupts an active audit at the next chunk boundary without waiting for completion', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-14T04:05:06.000Z');
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'audit-shutdown.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'bulk' }).repeat(50000)]);
+  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
+  const previousAudit = {
+    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  };
+  await fs.writeFile(paths.auditStatePath, JSON.stringify(previousAudit));
+  const readStarted = controlledPromise();
+  const releaseRead = controlledPromise();
+  let paused = false;
+  const auditor = new BackupIntegrityAuditor({
+    paths,
+    instrumentation: {
+      didReadChunk: async () => {
+        if (paused) return;
+        paused = true;
+        readStarted.resolve();
+        await releaseRead.promise;
+      },
+    },
+  });
+  const agent = new BackupAgent({
+    paths,
+    now: () => now,
+    integrityAuditorFactory: () => auditor,
+  });
+
+  const audit = agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001');
+  await readStarted.promise;
+  agent.stop();
+  releaseRead.resolve();
+
+  assert.deepEqual(await audit, { outcome: 'interrupted', checked: 0, repaired: 0 });
+  assert.deepEqual(JSON.parse(await fs.readFile(paths.auditStatePath, 'utf8')), previousAudit);
 });
 
 test('incremental scan recovers pending repair journal before appending', async (t) => {

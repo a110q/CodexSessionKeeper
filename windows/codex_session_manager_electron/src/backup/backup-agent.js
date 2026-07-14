@@ -24,9 +24,13 @@ class BackupAgent {
     now = () => new Date(),
     validateTarget = defaultValidateTarget,
     fileCommitter = createFileCommitter(),
+    initialStatus = null,
     onProgress = null,
+    onStatus = null,
     instrumentation = {},
     integrityAuditorFactory = (auditorPaths) => new BackupIntegrityAuditor({ paths: auditorPaths }),
+    scheduleInterval = setInterval,
+    cancelInterval = clearInterval,
   } = {}) {
     if (!paths) {
       throw new Error('BackupAgent requires paths.');
@@ -36,44 +40,83 @@ class BackupAgent {
     this.now = now;
     this.validateTarget = validateTarget;
     this.fileCommitter = fileCommitter;
+    this.cachedStatus = initialStatus ? { ...initialStatus } : null;
     this.onProgress = onProgress;
+    this.onStatus = onStatus;
     this.instrumentation = instrumentation;
     this.integrityAuditorFactory = integrityAuditorFactory;
+    this.scheduleInterval = scheduleInterval;
+    this.cancelInterval = cancelInterval;
     this.pollingTimer = null;
     this.pollingStartedAt = null;
+    this.pollingGeneration = 0;
     this.scanPromise = null;
     this.scanQueued = false;
     this.auditPromise = null;
     this.auditScanDeferred = null;
     this.auditInterruptionEpoch = 0;
     this.startupOrphanCleanupComplete = false;
+    this.stopped = false;
   }
 
-  startPolling(intervalMs = 10000) {
-    if (this.pollingTimer) {
+  startPolling(intervalMs = 30000) {
+    if (this.stopped || this.pollingTimer) {
       return;
     }
 
     this.pollingStartedAt = this.now();
-    const tick = () => this.performOneShotScan().catch(() => {});
-    this.pollingTimer = setInterval(tick, intervalMs);
+    this.pollingGeneration += 1;
+    const generation = this.pollingGeneration;
+    const tick = () => {
+      if (this.stopped || generation !== this.pollingGeneration) return Promise.resolve(null);
+      return this.requestImmediateScan('timer').catch(() => {});
+    };
+    this.pollingTimer = this.scheduleInterval(tick, intervalMs);
     this.pollingTimer.unref?.();
-    tick();
   }
 
   stopPolling() {
+    this.pollingGeneration += 1;
     if (this.pollingTimer) {
-      clearInterval(this.pollingTimer);
+      this.cancelInterval(this.pollingTimer);
       this.pollingTimer = null;
     }
   }
 
   stop() {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.scanQueued = false;
     this.requestAuditInterruption();
     this.stopPolling();
   }
 
+  async stopAndAwaitQuiescence(timeoutMs = 100) {
+    this.stop();
+    const active = [this.scanPromise, this.auditPromise].filter(Boolean);
+    if (active.length === 0) return true;
+    let timeout;
+    try {
+      return await Promise.race([
+        Promise.allSettled(active).then(() => true),
+        new Promise((resolve) => {
+          timeout = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+          timeout.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  requestImmediateScan(trigger) {
+    if (this.stopped) return Promise.resolve(null);
+    this.instrumentation.scanRequested?.(trigger);
+    return this.performOneShotScan();
+  }
+
   async performOneShotScan() {
+    if (this.stopped) return null;
     this.requestAuditInterruption();
     if (this.auditPromise) {
       if (!this.auditScanDeferred) this.auditScanDeferred = deferredPromise();
@@ -83,6 +126,7 @@ class BackupAgent {
   }
 
   async startOneShotScan() {
+    if (this.stopped) return null;
     if (this.scanPromise) {
       this.scanQueued = true;
       return this.scanPromise;
@@ -97,7 +141,9 @@ class BackupAgent {
   }
 
   async performIntegrityAuditIfDue(deviceId) {
+    if (this.stopped) return interruptedAuditOutcome();
     await this.performOneShotScan();
+    if (this.stopped) return interruptedAuditOutcome();
     if (this.auditPromise) return this.auditPromise;
     const baselineEpoch = this.auditInterruptionEpoch;
     this.auditPromise = this.performIntegrityAuditLocked(deviceId, baselineEpoch);
@@ -108,21 +154,29 @@ class BackupAgent {
       const deferred = this.auditScanDeferred;
       this.auditScanDeferred = null;
       if (deferred) {
-        this.startOneShotScan().then(deferred.resolve, deferred.reject);
+        if (this.stopped) deferred.resolve(null);
+        else this.startOneShotScan().then(deferred.resolve, deferred.reject);
       }
     }
   }
 
   async performIntegrityAuditLocked(deviceId, baselineEpoch) {
+    if (this.stopped || this.auditInterruptionEpoch !== baselineEpoch) {
+      return interruptedAuditOutcome();
+    }
     const cursorStore = new CursorStore({ paths: this.paths });
     await cursorStore.open();
     try {
-      return await this.integrityAuditorFactory(this.paths).runIfDue({
+      const outcome = await this.integrityAuditorFactory(this.paths).runIfDue({
         now: this.now(),
         deviceId,
         cursors: cursorStore.all(),
         interruptionRequested: () => this.auditInterruptionEpoch !== baselineEpoch,
       });
+      if (outcome?.outcome !== 'interrupted') {
+        await this.publishPersistedStatusIfAvailable();
+      }
+      return outcome;
     } catch (error) {
       await this.writeLocalErrorStatus(error).catch(() => {});
       throw error;
@@ -133,7 +187,7 @@ class BackupAgent {
 
   async drainScanQueue() {
     let result;
-    do {
+    for (let scanIndex = 0; scanIndex < 2 && !this.stopped; scanIndex += 1) {
       this.scanQueued = false;
       try {
         result = await this.performOneShotScanLocked();
@@ -141,7 +195,9 @@ class BackupAgent {
         await this.writeLocalErrorStatus(error).catch(() => {});
         throw error;
       }
-    } while (this.scanQueued);
+      if (!this.scanQueued || scanIndex === 1) break;
+    }
+    this.scanQueued = false;
     return result;
   }
 
@@ -190,7 +246,15 @@ class BackupAgent {
       const updatedCursors = [];
       const scanErrors = [];
       let completedFiles = 0;
-      for (const sourcePath of sources) {
+      let interrupted = false;
+      let remainingSources = [];
+      for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
+        if (this.stopped) {
+          interrupted = true;
+          remainingSources = sources.slice(sourceIndex);
+          break;
+        }
+        const sourcePath = sources[sourceIndex];
         const sessionId = sessionIdFromPath(sourcePath);
         if (!sessionId || processedSessionIds.has(sessionId)) {
           continue;
@@ -217,9 +281,14 @@ class BackupAgent {
         this.onProgress?.({
           totalFiles: sources.length,
           completedFiles,
-          pendingFiles: Math.max(1, sources.length - completedFiles),
+          pendingFiles: Math.max(0, sources.length - completedFiles),
           phase,
         });
+        if (this.stopped && sourceIndex + 1 < sources.length) {
+          interrupted = true;
+          remainingSources = sources.slice(sourceIndex + 1);
+          break;
+        }
       }
 
       if (manifestChanged) {
@@ -228,18 +297,31 @@ class BackupAgent {
       }
       await cursorStore.upsertMany(updatedCursors);
 
-      const lastError = scanErrors[0] || null;
-      await this.writeStatus(manifest, lastError ? 'error' : 'running', lastError, scanDate);
-      await replaceFileDurably(this.paths.pendingSourcesPath, jsonPayload({ pending: [] }));
-      if (scanErrors.length === 0) {
-        await integrityAuditor.recordInitialSeedCompleted(scanDate);
+      if (interrupted) {
+        const pending = await this.pendingRecordsForSources(remainingSources);
+        await replaceFileDurably(this.paths.pendingSourcesPath, jsonPayload({ pending }));
+        this.onProgress?.({
+          totalFiles: sources.length,
+          completedFiles,
+          pendingFiles: pending.length,
+          phase,
+        });
+        await this.writeStatus(manifest, 'waiting', null, scanDate);
+        return manifest;
       }
+
+      const lastError = scanErrors[0] || null;
       this.onProgress?.({
         totalFiles: sources.length,
         completedFiles: sources.length,
         pendingFiles: 0,
         phase,
       });
+      await this.writeStatus(manifest, lastError ? 'error' : 'running', lastError, scanDate);
+      await replaceFileDurably(this.paths.pendingSourcesPath, jsonPayload({ pending: [] }));
+      if (scanErrors.length === 0) {
+        await integrityAuditor.recordInitialSeedCompleted(scanDate);
+      }
       return manifest;
     } finally {
       await cursorStore.close();
@@ -270,6 +352,19 @@ class BackupAgent {
     return discovered
       .sort((lhs, rhs) => lhs.priority - rhs.priority || lhs.filePath.localeCompare(rhs.filePath))
       .map((entry) => entry.filePath);
+  }
+
+  async pendingRecordsForSources(sourcePaths) {
+    const pending = [];
+    for (const sourcePath of sourcePaths) {
+      const metadata = await trustedSourceMetadata(sourcePath);
+      pending.push({
+        sourcePath,
+        size: metadata.size,
+        modifiedAt: metadata.modifiedAt,
+      });
+    }
+    return pending;
   }
 
   async processSessionFile({ sourcePath, sessionId, scanDate, manifest, currentCursor, cursorMap }) {
@@ -460,7 +555,7 @@ class BackupAgent {
   }
 
   async writeStatus(manifest, status, lastError, date) {
-    const existingStatus = await loadStatus(this.paths.localStatusPath);
+    const existingStatus = this.cachedStatus || await loadStatus(this.paths.localStatusPath);
     const auditState = await loadStatus(this.paths.auditStatePath);
     const records = Object.values(manifest.sessions || {});
     const snapshot = {
@@ -487,12 +582,13 @@ class BackupAgent {
 
     await replaceFileDurably(this.paths.remoteStatusPath, jsonPayload(snapshot));
     await replaceFileDurably(this.paths.localStatusPath, jsonPayload(snapshot));
+    this.publishStatus(snapshot);
   }
 
   async writeLocalErrorStatus(error) {
     await this.ensureStateDirectories();
     const date = this.now();
-    const existing = await loadStatus(this.paths.localStatusPath);
+    const existing = this.cachedStatus || await loadStatus(this.paths.localStatusPath);
     const snapshot = {
       ...(existing || {}),
       agentVersion: AGENT_VERSION,
@@ -506,6 +602,18 @@ class BackupAgent {
       lastError: error?.message || String(error),
     };
     await replaceFileDurably(this.paths.localStatusPath, jsonPayload(snapshot));
+    this.publishStatus(snapshot);
+  }
+
+  publishStatus(status) {
+    const published = JSON.parse(JSON.stringify(status));
+    this.cachedStatus = published;
+    this.onStatus?.({ ...published });
+  }
+
+  async publishPersistedStatusIfAvailable() {
+    const status = await loadStatus(this.paths.localStatusPath);
+    if (status) this.publishStatus(status);
   }
 
   async pendingSessionCount() {
@@ -753,6 +861,10 @@ function deferredPromise() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function interruptedAuditOutcome() {
+  return { outcome: 'interrupted', checked: 0, repaired: 0 };
 }
 
 module.exports = {

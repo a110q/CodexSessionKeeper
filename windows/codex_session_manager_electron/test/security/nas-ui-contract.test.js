@@ -39,3 +39,30 @@ test('unconfigured NAS modal has no dismiss action and shows the fixed endpoint'
   assert.match(modal, /文件中转站/);
   assert.doesNotMatch(modal, /data-dismiss|nasSetupClose|关闭/);
 });
+
+test('Electron backup lifecycle uses cached status, resume wiring, and prompt shutdown', () => {
+  const mainPath = path.join(__dirname, '..', '..', 'src', 'main.js');
+  const main = fs.readFileSync(mainPath, 'utf8');
+  const statusGetter = main.slice(
+    main.indexOf('function readBackupStatus()'),
+    main.indexOf('function readLines('),
+  );
+  const readyBlock = main.slice(
+    main.indexOf('if (hasSingleInstanceLock)'),
+    main.indexOf("app.on('second-instance'"),
+  );
+
+  assert.match(statusGetter, /return nasRuntime\.backupStatus\(\)/);
+  assert.doesNotMatch(statusGetter, /status\.json|readText|readFile|exists\(/);
+  assert.doesNotMatch(main.split('\n')[0], /powerMonitor/);
+  assert.match(main, /const \{ powerMonitor \} = require\('electron'\)/);
+  assert.match(readyBlock, /await nasRuntime\.initialize\(\);[\s\S]*installBackupLifecycleListeners\(\)/);
+  assert.match(main, /const resumeHandler = \(\) => nasRuntime\.requestImmediateScan\('wake'\)/);
+  assert.match(main, /powerMonitor\.on\('resume', resumeHandler\)/);
+  assert.match(main, /powerMonitor\.removeListener\('resume'/);
+  assert.match(main, /app\.on\('activate',[\s\S]*requestImmediateScan\('activation'\)/);
+  assert.match(main, /let backupExitConfirmed = false/);
+  assert.match(main, /app\.on\('before-quit',[\s\S]*backupExitConfirmed[\s\S]*teardownBackupLifecycleListeners\(\)[\s\S]*nasRuntime\.stop\(\)/);
+  assert.match(main, /if \(result\.response === 1\) \{[\s\S]*backupExitConfirmed = true;[\s\S]*window\.close\(\)/);
+  assert.match(main, /installBackupExitGuard\(mainWindow\)/);
+});
