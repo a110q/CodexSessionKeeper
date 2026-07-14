@@ -194,6 +194,37 @@ struct NASBackupRuntimeTests {
     }
 
     @Test
+    func replacementDefersWhenOldWriterCannotQuiesceWithinBoundedWait() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        fixture.agentFactory.writerProbe = ReplacementWriterProbe()
+        _ = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        let oldAgent = try #require(fixture.agentFactory.agents.first)
+        oldAgent.replacementQuiescenceResult = false
+
+        let started = ContinuousClock.now
+        #expect(throws: (any Error).self) {
+            try runtime.retry()
+        }
+        let elapsed = started.duration(to: .now)
+
+        #expect(elapsed < .milliseconds(250))
+        #expect(fixture.agentFactory.agents.count == 1)
+        #expect(fixture.agentFactory.writerProbe?.maximumConcurrentWriters == 1)
+        #expect(fixture.scheduler.delays == [30])
+
+        oldAgent.finishCurrentAtomicFile()
+        oldAgent.replacementQuiescenceResult = true
+        fixture.scheduler.fireNext()
+
+        #expect(fixture.agentFactory.agents.count == 2)
+        #expect(fixture.agentFactory.writerProbe?.maximumConcurrentWriters == 1)
+        fixture.agentFactory.agents.last?.finishCurrentAtomicFile()
+    }
+
+    @Test
     func stoppedAgentStatusCallbackCannotOverwriteReplacementAgentSnapshot() async throws {
         let fixture = try NASRuntimeFixture()
         defer { fixture.cleanup() }
@@ -211,6 +242,34 @@ struct NASBackupRuntimeTests {
 
         #expect(runtime.setupSnapshot().state == .running)
         #expect(runtime.setupSnapshot().lastError == nil)
+    }
+
+    @Test
+    func olderProgressCallbackCannotOverwriteNewerErrorStatus() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        let deliveries = ControlledCallbackDeliveries()
+        let runtime = fixture.makeRuntime(callbackDelivery: { action in
+            deliveries.append(action)
+        })
+        try runtime.initialize()
+        let agent = try #require(fixture.agentFactory.agents.first)
+
+        agent.publishProgress(BackupProgress(
+            totalFiles: 2,
+            completedFiles: 1,
+            pendingFiles: 1,
+            phase: .scanning
+        ))
+        agent.publishStatus(fixture.status(health: .error, message: "newer final error"))
+        #expect(deliveries.count == 2)
+
+        deliveries.deliverLast()
+        deliveries.deliverLast()
+
+        #expect(runtime.setupSnapshot().state == .error)
+        #expect(runtime.setupSnapshot().lastError == "newer final error")
     }
 
     @Test
@@ -308,14 +367,17 @@ private final class NASRuntimeFixture {
         )
     }
 
-    func makeRuntime() -> NASBackupRuntime {
+    func makeRuntime(
+        callbackDelivery: (@Sendable (@escaping @MainActor @Sendable () -> Void) -> Void)? = nil
+    ) -> NASBackupRuntime {
         NASBackupRuntime(
             configurationService: service,
             codexRoot: codexRoot,
-            agentFactory: { paths, _, _, initialStatus, _, statusHandler in
+            agentFactory: { paths, _, _, initialStatus, progressHandler, statusHandler in
                 self.agentFactory.make(
                     paths: paths,
                     initialStatus: initialStatus,
+                    progressHandler: progressHandler,
                     statusHandler: statusHandler
                 )
             },
@@ -325,6 +387,9 @@ private final class NASRuntimeFixture {
                 let decoder = JSONDecoder()
                 decoder.dateDecodingStrategy = .iso8601
                 return try? decoder.decode(BackupStatus.self, from: data)
+            },
+            callbackDelivery: callbackDelivery ?? { action in
+                Task { @MainActor in action() }
             },
             scheduleRetry: { delay, action in self.scheduler.schedule(delay: delay, action: action) }
         )
@@ -431,15 +496,19 @@ private final class NASRuntimeConnectivity {
 @MainActor
 private final class RecordingNASAgentFactory {
     private(set) var agents: [RecordingNASAgent] = []
+    var writerProbe: ReplacementWriterProbe?
 
     func make(
         paths: BackupPaths,
         initialStatus: BackupStatus?,
+        progressHandler: @escaping (BackupProgress) -> Void,
         statusHandler: @escaping @Sendable (BackupStatus) -> Void
     ) -> RecordingNASAgent {
         let agent = RecordingNASAgent(
             paths: paths,
             initialStatus: initialStatus,
+            progressHandler: progressHandler,
+            writerProbe: writerProbe,
             statusHandler: statusHandler
         )
         agents.append(agent)
@@ -454,8 +523,13 @@ private final class RecordingNASAgent: NASBackupAgentControlling, @unchecked Sen
     private(set) var pollingIntervals: [UInt64] = []
     private(set) var triggers: [BackupScanTrigger] = []
     private(set) var pendingCallCount = 0
+    private(set) var quiescenceWaits: [TimeInterval] = []
+    var replacementQuiescenceResult = true
+    private let progressHandler: (BackupProgress) -> Void
+    private let writerProbe: ReplacementWriterProbe?
     private let statusHandler: @Sendable (BackupStatus) -> Void
     let initialStatus: BackupStatus?
+    private var ownsWriter = false
 
     var interactionCount: Int {
         startCount + stopCount + triggers.count + pendingCallCount
@@ -464,10 +538,14 @@ private final class RecordingNASAgent: NASBackupAgentControlling, @unchecked Sen
     init(
         paths: BackupPaths,
         initialStatus: BackupStatus?,
+        progressHandler: @escaping (BackupProgress) -> Void,
+        writerProbe: ReplacementWriterProbe?,
         statusHandler: @escaping @Sendable (BackupStatus) -> Void
     ) {
         self.paths = paths
         self.initialStatus = initialStatus
+        self.progressHandler = progressHandler
+        self.writerProbe = writerProbe
         self.statusHandler = statusHandler
     }
 
@@ -478,10 +556,23 @@ private final class RecordingNASAgent: NASBackupAgentControlling, @unchecked Sen
 
     func requestImmediateScan(_ trigger: BackupScanTrigger) {
         triggers.append(trigger)
+        if !ownsWriter {
+            ownsWriter = true
+            writerProbe?.enter()
+        }
     }
 
     func stop() {
         stopCount += 1
+    }
+
+    func stopAndAwaitQuiescence(timeout: TimeInterval) -> Bool {
+        quiescenceWaits.append(timeout)
+        stop()
+        if replacementQuiescenceResult {
+            finishCurrentAtomicFile()
+        }
+        return replacementQuiescenceResult
     }
 
     func pendingSessionCount() throws -> Int {
@@ -493,8 +584,58 @@ private final class RecordingNASAgent: NASBackupAgentControlling, @unchecked Sen
         statusHandler(status)
     }
 
+    func publishProgress(_ progress: BackupProgress) {
+        progressHandler(progress)
+    }
+
+    func finishCurrentAtomicFile() {
+        guard ownsWriter else { return }
+        ownsWriter = false
+        writerProbe?.leave()
+    }
+
     func resetInteractionCounts() {
         pendingCallCount = 0
+    }
+}
+
+private final class ReplacementWriterProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeWriters = 0
+    private var storedMaximumConcurrentWriters = 0
+
+    var maximumConcurrentWriters: Int {
+        lock.withLock { storedMaximumConcurrentWriters }
+    }
+
+    func enter() {
+        lock.withLock {
+            activeWriters += 1
+            storedMaximumConcurrentWriters = max(storedMaximumConcurrentWriters, activeWriters)
+        }
+    }
+
+    func leave() {
+        lock.withLock { activeWriters -= 1 }
+    }
+}
+
+private final class ControlledCallbackDeliveries: @unchecked Sendable {
+    private let lock = NSLock()
+    private var actions: [@MainActor @Sendable () -> Void] = []
+
+    var count: Int {
+        lock.withLock { actions.count }
+    }
+
+    func append(_ action: @escaping @MainActor @Sendable () -> Void) {
+        lock.withLock { actions.append(action) }
+    }
+
+    @MainActor
+    func deliverLast() {
+        let action = lock.withLock { actions.popLast() }
+        action?()
     }
 }
 

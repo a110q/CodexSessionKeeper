@@ -736,7 +736,7 @@ func persistedStatusIsPublishedThroughSendableCallback() throws {
 }
 
 @Test
-func concurrentTriggersAreSerializedAndCoalescedIntoOneFollowUpScan() throws {
+func concurrentTriggersAreSerializedAndOneDrainIsCappedAtTwoScans() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
     let barrier = ControlledScanBarrier()
@@ -757,12 +757,51 @@ func concurrentTriggersAreSerializedAndCoalescedIntoOneFollowUpScan() throws {
     agent.requestImmediateScan(.timer)
     barrier.releaseOne()
     #expect(barrier.waitForEntry() == .success)
+    agent.requestImmediateScan(.wake)
+    agent.requestImmediateScan(.reconnect)
+    agent.requestImmediateScan(.timer)
     barrier.releaseOne()
     #expect(published.wait(timeout: .now() + 5) == .success)
     #expect(published.wait(timeout: .now() + 5) == .success)
+    #expect(barrier.waitForEntry(timeout: 0.25) == .timedOut)
 
     #expect(barrier.scanCount == 2)
     #expect(barrier.maximumConcurrentScans == 1)
+}
+
+@Test
+func stopFinishesCurrentAtomicSessionAndSkipsRemainingSessions() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    try fixture.writeSession(
+        named: "01010101-0101-0101-0101-010101010101.jsonl",
+        contents: #"{"role":"user","content":"first"}"# + "\n"
+    )
+    try fixture.writeSession(
+        named: "02020202-0202-0202-0202-020202020202.jsonl",
+        contents: #"{"role":"user","content":"second"}"# + "\n"
+    )
+    let stepBarrier = ControlledSessionStepBarrier()
+    let published = DispatchSemaphore(value: 0)
+    let agent = fixture.makeAgent(
+        sessionStepBarrier: stepBarrier,
+        statusHandler: { _ in published.signal() }
+    )
+    defer {
+        stepBarrier.release()
+        agent.stop()
+    }
+
+    agent.requestImmediateScan(.startup)
+    #expect(stepBarrier.waitForFirstSession() == .success)
+    let started = ContinuousClock.now
+    #expect(agent.stopAndAwaitQuiescence(timeout: 0.05) == false)
+    #expect(started.duration(to: .now) < .milliseconds(250))
+    stepBarrier.release()
+    #expect(agent.stopAndAwaitQuiescence(timeout: 5))
+    #expect(published.wait(timeout: .now() + 5) == .success)
+
+    #expect(stepBarrier.visitedSessionCount == 1)
 }
 
 @Test
@@ -853,6 +892,134 @@ func stopCancelsScheduledAuditBeforeItStarts() throws {
 
     #expect(try fixture.loadAuditState().lastCompletedAt == previousAudit)
     #expect(try fixture.loadAuditState().lastResult == "previous")
+}
+
+@Test
+func stoppedAgentCannotEraseAuditInterruptionWhenAuditStartsLater() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000009a"))
+    let agent = fixture.makeAgent(deviceID: deviceID)
+
+    agent.stop()
+    let outcome = try agent.performIntegrityAuditIfDue(deviceID: deviceID)
+
+    #expect(outcome == .interrupted)
+    #expect(try fixture.loadAuditState().lastCompletedAt == previousAudit)
+}
+
+@Test
+func triggerAfterAuditSchedulingInterruptsThatAuditGeneration() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    var initialStatus = try fixture.loadStatus()
+    initialStatus.lastAuditAt = previousAudit
+    initialStatus.lastAuditResult = "previous"
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000009a"))
+    let timers = ControlledAuditTimerScheduler()
+    let auditGate = ControlledAuditStartBarrier()
+    let outcomes = LockedAuditOutcomeRecorder()
+    let agent = fixture.makeAgent(
+        deviceID: deviceID,
+        initialStatus: initialStatus,
+        auditDelayProvider: { _, _, _ in 0 },
+        auditTimerScheduler: { delay, action in timers.schedule(delay: delay, action: action) },
+        auditWillStart: { auditGate.enterAndWaitOnce() },
+        auditDidFinish: { outcomes.append($0) }
+    )
+    defer {
+        auditGate.release()
+        agent.stop()
+    }
+
+    agent.requestImmediateScan(.startup)
+    #expect(timers.waitForScheduledCount(1))
+    timers.fire(at: 0)
+    #expect(auditGate.waitForEntry() == .success)
+    agent.requestImmediateScan(.timer)
+    auditGate.release()
+
+    #expect(outcomes.waitForCount(1))
+    #expect(outcomes.values.first == .interrupted)
+}
+
+@Test
+func staleAuditTimerCannotClearOrFireInPlaceOfReplacementTimer() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    var initialStatus = try fixture.loadStatus()
+    initialStatus.lastAuditAt = previousAudit
+    initialStatus.lastAuditResult = "previous"
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000009a"))
+    let timers = ControlledAuditTimerScheduler()
+    let auditStarts = DispatchSemaphore(value: 0)
+    let agent = fixture.makeAgent(
+        deviceID: deviceID,
+        initialStatus: initialStatus,
+        auditDelayProvider: { _, _, _ in 0 },
+        auditTimerScheduler: { delay, action in timers.schedule(delay: delay, action: action) },
+        auditWillStart: { auditStarts.signal() }
+    )
+    defer { agent.stop() }
+
+    agent.requestImmediateScan(.startup)
+    #expect(timers.waitForScheduledCount(1))
+    agent.requestImmediateScan(.wake)
+    #expect(timers.waitForScheduledCount(2))
+
+    timers.fire(at: 0)
+    #expect(auditStarts.wait(timeout: .now() + 0.25) == .timedOut)
+    timers.fire(at: 1)
+    #expect(auditStarts.wait(timeout: .now() + 5) == .success)
+}
+
+@Test
+func stoppedAgentRejectsEvenManuallyFiredCurrentAuditTimer() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    var initialStatus = try fixture.loadStatus()
+    initialStatus.lastAuditAt = previousAudit
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000009a"))
+    let timers = ControlledAuditTimerScheduler()
+    let auditStarts = DispatchSemaphore(value: 0)
+    let agent = fixture.makeAgent(
+        deviceID: deviceID,
+        initialStatus: initialStatus,
+        auditDelayProvider: { _, _, _ in 0 },
+        auditTimerScheduler: { delay, action in timers.schedule(delay: delay, action: action) },
+        auditWillStart: { auditStarts.signal() }
+    )
+
+    agent.requestImmediateScan(.startup)
+    #expect(timers.waitForScheduledCount(1))
+    agent.stop()
+    timers.fire(at: 0)
+
+    #expect(auditStarts.wait(timeout: .now() + 0.25) == .timedOut)
 }
 
 @Test
@@ -1024,6 +1191,14 @@ private final class BackupAgentFixture {
         targetValidator: BackupTargetValidator? = nil,
         deviceID: UUID? = nil,
         initialStatus: BackupStatus? = nil,
+        sessionStepBarrier: ControlledSessionStepBarrier? = nil,
+        auditDelayProvider: (@Sendable (Date, Date?, UUID) -> TimeInterval)? = nil,
+        auditTimerScheduler: (@Sendable (
+            TimeInterval,
+            @escaping @Sendable () -> Void
+        ) -> Task<Void, Never>)? = nil,
+        auditWillStart: @escaping @Sendable () -> Void = {},
+        auditDidFinish: @escaping @Sendable (IntegrityAuditOutcome) -> Void = { _ in },
         statusHandler: (@Sendable (BackupStatus) -> Void)? = nil
     ) -> BackupAgent {
         BackupAgent(
@@ -1034,6 +1209,8 @@ private final class BackupAgentFixture {
             deviceID: deviceID,
             initialStatus: initialStatus,
             statusHandler: statusHandler,
+            auditDelayProvider: auditDelayProvider,
+            auditTimerScheduler: auditTimerScheduler,
             sessionBackupStreamer: SessionBackupStreamer(chunkSize: 1_048_576),
             cursorStoreFactory: { [weak self] databaseURL in
                 BackupCursorStore(databaseURL: databaseURL, sqliteRunner: { arguments, input in
@@ -1065,13 +1242,16 @@ private final class BackupAgentFixture {
                 sourceBodyRead: { [weak self] _, offset, length in
                     guard let self else { return }
                     self.sourceBodyReadRanges.append(offset..<(offset + length))
+                    sessionStepBarrier?.visitAndBlockFirstSession()
                 },
                 targetStat: { [weak self] _ in
                     self?.targetStatCount += 1
                 },
                 fullHash: { [weak self] _, _ in
                     self?.fullHashCount += 1
-                }
+                },
+                auditWillStart: auditWillStart,
+                auditDidFinish: auditDidFinish
             )
         )
     }
@@ -1230,8 +1410,8 @@ private final class ControlledScanBarrier: @unchecked Sendable {
         lock.withLock { activeScans -= 1 }
     }
 
-    func waitForEntry() -> DispatchTimeoutResult {
-        entered.wait(timeout: .now() + 5)
+    func waitForEntry(timeout: TimeInterval = 5) -> DispatchTimeoutResult {
+        entered.wait(timeout: .now() + timeout)
     }
 
     func releaseOne() {
@@ -1240,6 +1420,112 @@ private final class ControlledScanBarrier: @unchecked Sendable {
 
     func releaseAll() {
         for _ in 0..<8 { continuation.signal() }
+    }
+}
+
+private final class ControlledSessionStepBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let continuation = DispatchSemaphore(value: 0)
+    private var visits = 0
+
+    var visitedSessionCount: Int {
+        lock.withLock { visits }
+    }
+
+    func visitAndBlockFirstSession() {
+        let shouldBlock = lock.withLock { () -> Bool in
+            visits += 1
+            return visits == 1
+        }
+        guard shouldBlock else { return }
+        entered.signal()
+        continuation.wait()
+    }
+
+    func waitForFirstSession() -> DispatchTimeoutResult {
+        entered.wait(timeout: .now() + 5)
+    }
+
+    func release() {
+        continuation.signal()
+    }
+}
+
+private final class ControlledAuditStartBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let continuation = DispatchSemaphore(value: 0)
+    private var shouldBlock = true
+
+    func enterAndWaitOnce() {
+        let blocks = lock.withLock { () -> Bool in
+            guard shouldBlock else { return false }
+            shouldBlock = false
+            return true
+        }
+        guard blocks else { return }
+        entered.signal()
+        continuation.wait()
+    }
+
+    func waitForEntry() -> DispatchTimeoutResult {
+        entered.wait(timeout: .now() + 5)
+    }
+
+    func release() {
+        continuation.signal()
+    }
+}
+
+private final class LockedAuditOutcomeRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [IntegrityAuditOutcome] = []
+
+    var values: [IntegrityAuditOutcome] {
+        lock.withLock { storage }
+    }
+
+    func append(_ outcome: IntegrityAuditOutcome) {
+        lock.withLock { storage.append(outcome) }
+    }
+
+    func waitForCount(_ count: Int, timeout: TimeInterval = 5) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if lock.withLock({ storage.count >= count }) { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return lock.withLock { storage.count >= count }
+    }
+}
+
+private final class ControlledAuditTimerScheduler: @unchecked Sendable {
+    private let lock = NSLock()
+    private let scheduled = DispatchSemaphore(value: 0)
+    private var actions: [@Sendable () -> Void] = []
+
+    func schedule(
+        delay: TimeInterval,
+        action: @escaping @Sendable () -> Void
+    ) -> Task<Void, Never> {
+        lock.withLock { actions.append(action) }
+        scheduled.signal()
+        return Task.detached {}
+    }
+
+    func waitForScheduledCount(_ count: Int, timeout: TimeInterval = 5) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if lock.withLock({ actions.count >= count }) { return true }
+            _ = scheduled.wait(timeout: .now() + 0.01)
+        }
+        return lock.withLock { actions.count >= count }
+    }
+
+    func fire(at index: Int) {
+        let action = lock.withLock { actions[index] }
+        action()
     }
 }
 

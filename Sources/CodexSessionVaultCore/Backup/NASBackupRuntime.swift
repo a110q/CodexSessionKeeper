@@ -65,9 +65,33 @@ public protocol NASBackupAgentControlling: AnyObject {
     func startPolling(intervalSeconds: UInt64)
     func requestImmediateScan(_ trigger: BackupScanTrigger)
     func stop()
+    func stopAndAwaitQuiescence(timeout: TimeInterval) -> Bool
 }
 
 extension BackupAgent: NASBackupAgentControlling {}
+
+public enum NASBackupRuntimeError: LocalizedError, Sendable {
+    case replacementQuiescenceTimedOut
+
+    public var errorDescription: String? {
+        switch self {
+        case .replacementQuiescenceTimedOut:
+            return "The previous backup writer is still finishing its current file; replacement was deferred."
+        }
+    }
+}
+
+private final class BackupCallbackSequencer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sequence: UInt64 = 0
+
+    func next() -> UInt64 {
+        lock.withLock {
+            sequence &+= 1
+            return sequence
+        }
+    }
+}
 
 @MainActor
 public final class NASBackupRuntime {
@@ -80,6 +104,9 @@ public final class NASBackupRuntime {
         @escaping @Sendable (BackupStatus) -> Void
     ) -> any NASBackupAgentControlling
     public typealias StatusLoader = @MainActor (URL) -> BackupStatus?
+    public typealias CallbackDelivery = @Sendable (
+        @escaping @MainActor @Sendable () -> Void
+    ) -> Void
     public typealias RetryScheduler = (
         TimeInterval,
         @escaping @MainActor @Sendable () -> Void
@@ -89,14 +116,17 @@ public final class NASBackupRuntime {
     private let codexRoot: URL
     private let agentFactory: AgentFactory
     private let loadStatus: StatusLoader
+    private let callbackDelivery: CallbackDelivery
     private let scheduleRetry: RetryScheduler
     private let retryDelay: TimeInterval
+    private let replacementQuiescenceTimeout: TimeInterval
     private var agent: (any NASBackupAgentControlling)?
     private var activeTarget: NASBackupTarget?
     private var snapshot = NASSetupSnapshot.unconfigured
     private var retryScheduled = false
     private var stopped = false
     private var agentGeneration: UInt64 = 0
+    private var lastAppliedCallbackSequence: UInt64 = 0
 
     public init(
         configurationService: NASConfigurationService,
@@ -117,7 +147,11 @@ public final class NASBackupRuntime {
             decoder.dateDecodingStrategy = .iso8601
             return try? decoder.decode(BackupStatus.self, from: data)
         },
+        callbackDelivery: @escaping CallbackDelivery = { action in
+            Task { @MainActor in action() }
+        },
         retryDelay: TimeInterval = 30,
+        replacementQuiescenceTimeout: TimeInterval = 0.1,
         scheduleRetry: @escaping RetryScheduler = { delay, action in
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(delay))
@@ -129,7 +163,9 @@ public final class NASBackupRuntime {
         self.codexRoot = codexRoot
         self.agentFactory = agentFactory
         self.loadStatus = loadStatus
+        self.callbackDelivery = callbackDelivery
         self.retryDelay = retryDelay
+        self.replacementQuiescenceTimeout = replacementQuiescenceTimeout
         self.scheduleRetry = scheduleRetry
     }
 
@@ -153,7 +189,11 @@ public final class NASBackupRuntime {
     @discardableResult
     public func activate(department: String, employee: String) throws -> NASBackupTarget {
         stopped = false
-        stopAgent()
+        guard stopAgentForReplacement() else {
+            let error = NASBackupRuntimeError.replacementQuiescenceTimedOut
+            markReplacementDeferred(error)
+            throw error
+        }
         snapshot = NASSetupSnapshot(state: .validating)
         do {
             let target = try configurationService.activate(department: department, employee: employee)
@@ -173,7 +213,11 @@ public final class NASBackupRuntime {
         guard !stopped else { return }
         let trigger: BackupScanTrigger = snapshot.state == .disconnected ? .reconnect : .activation
         retryScheduled = false
-        stopAgent()
+        guard stopAgentForReplacement() else {
+            let error = NASBackupRuntimeError.replacementQuiescenceTimedOut
+            markReplacementDeferred(error)
+            throw error
+        }
         snapshot = NASSetupSnapshot(state: .validating, configuration: snapshot.configuration)
         do {
             let target = try configurationService.resolveActiveTarget()
@@ -187,7 +231,7 @@ public final class NASBackupRuntime {
     public func stop() {
         stopped = true
         retryScheduled = false
-        stopAgent()
+        stopAgentImmediately()
     }
 
     public func setupSnapshot() -> NASSetupSnapshot {
@@ -227,6 +271,8 @@ public final class NASBackupRuntime {
         let initialStatus = loadStatus(paths.localStatusURL)
         agentGeneration &+= 1
         let generation = agentGeneration
+        let callbackSequencer = BackupCallbackSequencer()
+        lastAppliedCallbackSequence = 0
         activeTarget = target
         snapshot = snapshot(
             state: initialStatus?.status == .error ? .error : .running,
@@ -238,14 +284,26 @@ public final class NASBackupRuntime {
             target.configuration.deviceID,
             validator,
             initialStatus,
-            { [weak self] progress in
-                Task { @MainActor in
-                    self?.record(progress, for: target.configuration, generation: generation)
+            { [weak self, callbackDelivery] progress in
+                let sequence = callbackSequencer.next()
+                callbackDelivery { @MainActor [weak self] in
+                    self?.record(
+                        progress,
+                        for: target.configuration,
+                        generation: generation,
+                        sequence: sequence
+                    )
                 }
             },
-            { [weak self] status in
-                Task { @MainActor in
-                    self?.record(status, for: target.configuration, generation: generation)
+            { [weak self, callbackDelivery] status in
+                let sequence = callbackSequencer.next()
+                callbackDelivery { @MainActor [weak self] in
+                    self?.record(
+                        status,
+                        for: target.configuration,
+                        generation: generation,
+                        sequence: sequence
+                    )
                 }
             }
         )
@@ -255,8 +313,24 @@ public final class NASBackupRuntime {
         createdAgent.requestImmediateScan(trigger)
     }
 
-    private func stopAgent() {
+    private func stopAgentForReplacement() -> Bool {
         agentGeneration &+= 1
+        lastAppliedCallbackSequence = 0
+        guard let agent else {
+            activeTarget = nil
+            return true
+        }
+        guard agent.stopAndAwaitQuiescence(timeout: replacementQuiescenceTimeout) else {
+            return false
+        }
+        self.agent = nil
+        activeTarget = nil
+        return true
+    }
+
+    private func stopAgentImmediately() {
+        agentGeneration &+= 1
+        lastAppliedCallbackSequence = 0
         agent?.stop()
         agent = nil
         activeTarget = nil
@@ -265,9 +339,14 @@ public final class NASBackupRuntime {
     private func record(
         _ progress: BackupProgress,
         for configuration: NASBackupConfiguration,
-        generation: UInt64
+        generation: UInt64,
+        sequence: UInt64
     ) {
-        guard agentGeneration == generation, activeTarget?.configuration == configuration else { return }
+        guard shouldApplyCallback(
+            configuration: configuration,
+            generation: generation,
+            sequence: sequence
+        ) else { return }
         let state: NASSetupState = progress.pendingFiles > 0
             ? (progress.phase == .seeding ? .seeding : .pending)
             : .running
@@ -289,9 +368,14 @@ public final class NASBackupRuntime {
     private func record(
         _ status: BackupStatus,
         for configuration: NASBackupConfiguration,
-        generation: UInt64
+        generation: UInt64,
+        sequence: UInt64
     ) {
-        guard agentGeneration == generation, activeTarget?.configuration == configuration else { return }
+        guard shouldApplyCallback(
+            configuration: configuration,
+            generation: generation,
+            sequence: sequence
+        ) else { return }
         let state: NASSetupState
         if status.status == .error {
             state = .error
@@ -304,7 +388,17 @@ public final class NASBackupRuntime {
     }
 
     private func markDisconnected(_ error: Error) {
-        stopAgent()
+        stopAgentImmediately()
+        updateDisconnectedSnapshot(error)
+        scheduleReconnectRetryIfNeeded()
+    }
+
+    private func markReplacementDeferred(_ error: Error) {
+        updateDisconnectedSnapshot(error)
+        scheduleReconnectRetryIfNeeded()
+    }
+
+    private func updateDisconnectedSnapshot(_ error: Error) {
         snapshot = NASSetupSnapshot(
             state: .disconnected,
             configuration: snapshot.configuration,
@@ -318,13 +412,30 @@ public final class NASBackupRuntime {
             lastRepairAt: snapshot.lastRepairAt,
             repairCount: snapshot.repairCount
         )
+    }
+
+    private func scheduleReconnectRetryIfNeeded() {
         guard !retryScheduled, !stopped else { return }
         retryScheduled = true
         scheduleRetry(retryDelay) { [weak self] in
-            guard let self, !self.stopped, self.agent == nil else { return }
+            guard let self, !self.stopped else { return }
             self.retryScheduled = false
             try? self.retry()
         }
+    }
+
+    private func shouldApplyCallback(
+        configuration: NASBackupConfiguration,
+        generation: UInt64,
+        sequence: UInt64
+    ) -> Bool {
+        guard agentGeneration == generation,
+              activeTarget?.configuration == configuration,
+              sequence > lastAppliedCallbackSequence else {
+            return false
+        }
+        lastAppliedCallbackSequence = sequence
+        return true
     }
 
     private func snapshot(

@@ -17,17 +17,23 @@ struct BackupAgentInstrumentation {
     let targetStat: (URL) -> Void
     let fullHash: (URL, Int64) -> Void
     let auditInterruptionSet: () -> Void
+    let auditWillStart: @Sendable () -> Void
+    let auditDidFinish: @Sendable (IntegrityAuditOutcome) -> Void
 
     init(
         sourceBodyRead: @escaping (URL, Int64, Int64) -> Void = { _, _, _ in },
         targetStat: @escaping (URL) -> Void = { _ in },
         fullHash: @escaping (URL, Int64) -> Void = { _, _ in },
-        auditInterruptionSet: @escaping () -> Void = {}
+        auditInterruptionSet: @escaping () -> Void = {},
+        auditWillStart: @escaping @Sendable () -> Void = {},
+        auditDidFinish: @escaping @Sendable (IntegrityAuditOutcome) -> Void = { _ in }
     ) {
         self.sourceBodyRead = sourceBodyRead
         self.targetStat = targetStat
         self.fullHash = fullHash
         self.auditInterruptionSet = auditInterruptionSet
+        self.auditWillStart = auditWillStart
+        self.auditDidFinish = auditDidFinish
     }
 }
 
@@ -50,25 +56,31 @@ public final class BackupAgent: @unchecked Sendable {
     private let manifestStoreFactory: (URL) -> BackupManifestStore
     private let instrumentation: BackupAgentInstrumentation
     private let integrityAuditorFactory: (BackupPaths) -> BackupIntegrityAuditor
+    private let auditDelayProvider: @Sendable (Date, Date?, UUID) -> TimeInterval
+    private let auditTimerScheduler: @Sendable (
+        TimeInterval,
+        @escaping @Sendable () -> Void
+    ) -> Task<Void, Never>
     private let scanLock = NSLock()
-    private let stateLock = NSLock()
+    private let stateLock = NSCondition()
     private var pollingTask: Task<Void, Never>?
     private var auditTimerTask: Task<Void, Never>?
     private var workerTask: Task<Void, Never>?
     private var pollingStartedAt: Date?
     private var lastKnownProgress: BackupProgress?
     private var cachedStatus: BackupStatus?
-    private var auditInterruptionRequested = false
+    private var auditInterruptionEpoch: UInt64 = 0
+    private var auditTimerGeneration: UInt64 = 0
     private var workerActive = false
     private var isScanning = false
     private var isAuditing = false
     private var rescanQueued = false
-    private var auditQueued = false
+    private var pendingAuditBaselineEpoch: UInt64?
     private var stopped = false
 
     private enum BackgroundWork {
         case scan(BackupScanTrigger)
-        case audit
+        case audit(baselineEpoch: UInt64)
     }
 
     private struct ProcessSessionFileResult {
@@ -102,6 +114,8 @@ public final class BackupAgent: @unchecked Sendable {
             progressHandler: progressHandler,
             statusHandler: statusHandler,
             remoteStatusWriter: remoteStatusWriter,
+            auditDelayProvider: nil,
+            auditTimerScheduler: nil,
             sessionBackupStreamer: SessionBackupStreamer(),
             cursorStoreFactory: { BackupCursorStore(databaseURL: $0) },
             manifestStoreFactory: {
@@ -124,6 +138,11 @@ public final class BackupAgent: @unchecked Sendable {
         progressHandler: ((BackupProgress) -> Void)? = nil,
         statusHandler: (@Sendable (BackupStatus) -> Void)? = nil,
         remoteStatusWriter: ((Data, URL) throws -> Void)? = nil,
+        auditDelayProvider: (@Sendable (Date, Date?, UUID) -> TimeInterval)? = nil,
+        auditTimerScheduler: (@Sendable (
+            TimeInterval,
+            @escaping @Sendable () -> Void
+        ) -> Task<Void, Never>)? = nil,
         sessionBackupStreamer: SessionBackupStreamer,
         cursorStoreFactory: @escaping (URL) -> BackupCursorStore,
         manifestStoreFactory: @escaping (URL) -> BackupManifestStore,
@@ -146,6 +165,20 @@ public final class BackupAgent: @unchecked Sendable {
         self.manifestStoreFactory = manifestStoreFactory
         self.instrumentation = instrumentation
         self.integrityAuditorFactory = integrityAuditorFactory
+        self.auditDelayProvider = auditDelayProvider ?? { now, lastAuditAt, deviceID in
+            Self.auditDelay(now: now, lastAuditAt: lastAuditAt, deviceID: deviceID)
+        }
+        self.auditTimerScheduler = auditTimerScheduler ?? { delay, action in
+            Task.detached(priority: .background) {
+                do {
+                    try await Task.sleep(nanoseconds: Self.nanoseconds(fromTimeInterval: delay))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                action()
+            }
+        }
         self.cachedStatus = initialStatus ?? Self.loadPersistedStatus(at: paths.localStatusURL)
         self.remoteStatusWriter = remoteStatusWriter ?? { data, url in
             try DurableAtomicWriter().write(data, to: url, createParentDirectories: false)
@@ -160,7 +193,6 @@ public final class BackupAgent: @unchecked Sendable {
         requestAuditInterruption()
         scanLock.lock()
         defer { scanLock.unlock() }
-        clearAuditInterruption()
         do {
             try performOneShotScanLocked()
         } catch {
@@ -170,11 +202,22 @@ public final class BackupAgent: @unchecked Sendable {
     }
 
     public func performIntegrityAuditIfDue(deviceID: UUID) throws -> IntegrityAuditOutcome {
+        try performIntegrityAuditIfDue(
+            deviceID: deviceID,
+            baselineEpoch: currentAuditInterruptionEpoch()
+        )
+    }
+
+    private func performIntegrityAuditIfDue(
+        deviceID: UUID,
+        baselineEpoch: UInt64
+    ) throws -> IntegrityAuditOutcome {
         scanLock.lock()
         defer { scanLock.unlock() }
-        clearAuditInterruption()
+        guard !auditWasInterrupted(since: baselineEpoch) else { return .interrupted }
         do {
             try performOneShotScanLocked()
+            guard !auditWasInterrupted(since: baselineEpoch) else { return .interrupted }
             let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
             try cursorStore.open()
             let cursors = try cursorStore.loadAll()
@@ -183,7 +226,7 @@ public final class BackupAgent: @unchecked Sendable {
                 deviceID: deviceID,
                 cursors: cursors,
                 interruptionRequested: { [weak self] in
-                    self?.isAuditInterruptionRequested() ?? true
+                    self?.auditWasInterrupted(since: baselineEpoch) ?? true
                 }
             )
             if outcome != .interrupted {
@@ -247,6 +290,9 @@ public final class BackupAgent: @unchecked Sendable {
             phase: phase
         )
         for sourceURL in sources {
+            if shouldStopBetweenSessionAtomicSteps() {
+                break
+            }
             guard let sessionID = SessionIdentity.sessionID(from: sourceURL),
                   processedSessionIDs.insert(sessionID).inserted else {
                 continue
@@ -325,12 +371,9 @@ public final class BackupAgent: @unchecked Sendable {
             stateLock.unlock()
             return
         }
-        auditInterruptionRequested = true
+        auditInterruptionEpoch &+= 1
         if workerActive {
             rescanQueued = true
-            if isAuditing {
-                auditQueued = true
-            }
         } else {
             startWorkerLocked(with: .scan(trigger))
         }
@@ -348,9 +391,10 @@ public final class BackupAgent: @unchecked Sendable {
             return
         }
         stopped = true
-        auditInterruptionRequested = true
+        auditInterruptionEpoch &+= 1
+        auditTimerGeneration &+= 1
         rescanQueued = false
-        auditQueued = false
+        pendingAuditBaselineEpoch = nil
         let polling = pollingTask
         let auditTimer = auditTimerTask
         let worker = workerTask
@@ -363,6 +407,17 @@ public final class BackupAgent: @unchecked Sendable {
         worker?.cancel()
     }
 
+    public func stopAndAwaitQuiescence(timeout: TimeInterval) -> Bool {
+        stop()
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        while workerActive {
+            guard stateLock.wait(until: deadline) else { return false }
+        }
+        return true
+    }
+
     private func startWorkerLocked(with initialWork: BackgroundWork) {
         workerActive = true
         workerTask = Task.detached(priority: .utility) { [weak self] in
@@ -372,6 +427,9 @@ public final class BackupAgent: @unchecked Sendable {
 
     private func drainBackgroundWork(startingWith initialWork: BackgroundWork) {
         var work = initialWork
+        var scanCount = 0
+        var auditCount = 0
+        var rescheduleAuditAfterDrain = false
         while true {
             guard !backgroundWorkShouldStop() else {
                 finishBackgroundWorker()
@@ -381,46 +439,64 @@ public final class BackupAgent: @unchecked Sendable {
             var interruptedAudit = false
             switch work {
             case .scan:
+                scanCount += 1
                 setBackgroundPhase(scanning: true, auditing: false)
                 try? performOneShotScan()
                 setBackgroundPhase(scanning: false, auditing: false)
                 ensureAuditScheduled()
-            case .audit:
+            case let .audit(baselineEpoch):
+                auditCount += 1
                 setBackgroundPhase(scanning: false, auditing: true)
+                instrumentation.auditWillStart()
                 if let deviceID {
-                    interruptedAudit = (try? performIntegrityAuditIfDue(deviceID: deviceID)) == .interrupted
+                    let outcome = try? performIntegrityAuditIfDue(
+                        deviceID: deviceID,
+                        baselineEpoch: baselineEpoch
+                    )
+                    if let outcome {
+                        instrumentation.auditDidFinish(outcome)
+                    }
+                    interruptedAudit = outcome == .interrupted
                 }
                 setBackgroundPhase(scanning: false, auditing: false)
                 if !interruptedAudit {
                     scheduleAudit(replacingExisting: true)
+                } else {
+                    rescheduleAuditAfterDrain = true
                 }
             }
 
             stateLock.lock()
             if stopped {
-                workerActive = false
-                workerTask = nil
                 stateLock.unlock()
+                finishBackgroundWorker()
                 return
-            }
-            if interruptedAudit {
-                auditQueued = true
             }
             if rescanQueued {
                 rescanQueued = false
-                work = .scan(.queued)
+                if scanCount < 2 {
+                    work = .scan(.queued)
+                    stateLock.unlock()
+                    continue
+                }
+            }
+            if let baselineEpoch = pendingAuditBaselineEpoch, auditCount == 0 {
+                pendingAuditBaselineEpoch = nil
+                work = .audit(baselineEpoch: baselineEpoch)
                 stateLock.unlock()
                 continue
             }
-            if auditQueued {
-                auditQueued = false
-                work = .audit
-                stateLock.unlock()
-                continue
+            if pendingAuditBaselineEpoch != nil {
+                pendingAuditBaselineEpoch = nil
+                rescheduleAuditAfterDrain = true
             }
             workerActive = false
             workerTask = nil
+            stateLock.broadcast()
             stateLock.unlock()
+            if rescheduleAuditAfterDrain {
+                scheduleAudit(replacingExisting: true)
+            }
             return
         }
     }
@@ -444,20 +520,28 @@ public final class BackupAgent: @unchecked Sendable {
         isScanning = false
         isAuditing = false
         workerTask = nil
+        stateLock.broadcast()
         stateLock.unlock()
     }
 
-    private func requestScheduledAudit() {
+    private func requestScheduledAudit(
+        timerGeneration: UInt64,
+        baselineEpoch: UInt64
+    ) {
         stateLock.lock()
+        guard timerGeneration == auditTimerGeneration else {
+            stateLock.unlock()
+            return
+        }
         auditTimerTask = nil
         guard !stopped else {
             stateLock.unlock()
             return
         }
         if workerActive {
-            auditQueued = true
+            pendingAuditBaselineEpoch = baselineEpoch
         } else {
-            startWorkerLocked(with: .audit)
+            startWorkerLocked(with: .audit(baselineEpoch: baselineEpoch))
         }
         stateLock.unlock()
     }
@@ -467,7 +551,7 @@ public final class BackupAgent: @unchecked Sendable {
         let shouldSchedule = !stopped
             && deviceID != nil
             && auditTimerTask == nil
-            && !auditQueued
+            && pendingAuditBaselineEpoch == nil
             && !isAuditing
         stateLock.unlock()
         if shouldSchedule {
@@ -488,21 +572,16 @@ public final class BackupAgent: @unchecked Sendable {
         }
         let existingTask = auditTimerTask
         auditTimerTask = nil
+        auditTimerGeneration &+= 1
+        let timerGeneration = auditTimerGeneration
+        let baselineEpoch = auditInterruptionEpoch
         let currentDate = now()
-        let delay = Self.auditDelay(
-            now: currentDate,
-            lastAuditAt: cachedStatus?.lastAuditAt,
-            deviceID: deviceID
-        )
-        let delayNanoseconds = Self.nanoseconds(fromTimeInterval: delay)
-        auditTimerTask = Task.detached(priority: .background) { [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: delayNanoseconds)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            self?.requestScheduledAudit()
+        let delay = auditDelayProvider(currentDate, cachedStatus?.lastAuditAt, deviceID)
+        auditTimerTask = auditTimerScheduler(delay) { [weak self] in
+            self?.requestScheduledAudit(
+                timerGeneration: timerGeneration,
+                baselineEpoch: baselineEpoch
+            )
         }
         stateLock.unlock()
         existingTask?.cancel()
@@ -925,21 +1004,27 @@ public final class BackupAgent: @unchecked Sendable {
 
     private func requestAuditInterruption() {
         stateLock.lock()
-        auditInterruptionRequested = true
+        auditInterruptionEpoch &+= 1
         stateLock.unlock()
         instrumentation.auditInterruptionSet()
     }
 
-    private func clearAuditInterruption() {
-        stateLock.lock()
-        auditInterruptionRequested = false
-        stateLock.unlock()
-    }
-
-    private func isAuditInterruptionRequested() -> Bool {
+    private func currentAuditInterruptionEpoch() -> UInt64 {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return auditInterruptionRequested
+        return auditInterruptionEpoch
+    }
+
+    private func auditWasInterrupted(since baselineEpoch: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped || auditInterruptionEpoch != baselineEpoch || Task.isCancelled
+    }
+
+    private func shouldStopBetweenSessionAtomicSteps() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped || Task.isCancelled
     }
 
     private func writePendingSources(_ records: [PendingSourceRecord]) throws {
