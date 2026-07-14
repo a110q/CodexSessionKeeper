@@ -111,6 +111,65 @@ struct BackupAgentNASTests {
     }
 
     @Test
+    func queuedIncrementalScanInterruptsRepairTemporaryStreamAndThenCatchesUp() throws {
+        let fixture = try DirectNASBackupFixture()
+        defer { fixture.cleanup() }
+        let initial = String(repeating: fixture.line("bulk"), count: 45_000)
+        let source = try fixture.writeActiveSession(name: "repair-priority.jsonl", contents: initial)
+        try fixture.makeAgent().performOneShotScan()
+        try fixture.writeAuditState(IntegrityAuditState(
+            lastCompletedAt: fixture.now.addingTimeInterval(-86_401),
+            lastResult: "previous",
+            repairedCount: 0
+        ))
+        let target = try fixture.paths.backupFileURL(for: source)
+        var corrupted = try Data(contentsOf: target)
+        corrupted[corrupted.startIndex] ^= 0x01
+        try corrupted.write(to: target)
+
+        let gate = AuditReadGate()
+        let interruptionWasSet = DispatchSemaphore(value: 0)
+        let auditor = BackupIntegrityAuditor(
+            paths: fixture.paths,
+            chunkSize: 1_048_576,
+            instrumentation: IntegrityAuditInstrumentation(didStreamChunk: { phase, _, _, _ in
+                if phase == .repairTemporary { gate.pauseFirstChunk() }
+            })
+        )
+        let agent = fixture.makeAgent(
+            instrumentation: BackupAgentInstrumentation(auditInterruptionSet: {
+                interruptionWasSet.signal()
+            }),
+            integrityAuditorFactory: { _ in auditor }
+        )
+        let auditResult = ThreadResultBox<IntegrityAuditOutcome>()
+        let scanResult = ThreadResultBox<Void>()
+        let auditDone = DispatchSemaphore(value: 0)
+        let scanDone = DispatchSemaphore(value: 0)
+        let deviceID = fixture.deviceID
+        DispatchQueue.global().async {
+            defer { auditDone.signal() }
+            auditResult.capture { try agent.performIntegrityAuditIfDue(deviceID: deviceID) }
+        }
+        #expect(gate.waitUntilPaused() == .success)
+        try fixture.append(fixture.line("new"), to: source)
+        DispatchQueue.global().async {
+            defer { scanDone.signal() }
+            scanResult.capture { try agent.performOneShotScan() }
+        }
+        #expect(interruptionWasSet.wait(timeout: .now() + 5) == .success)
+        gate.resume()
+        #expect(auditDone.wait(timeout: .now() + 10) == .success)
+        #expect(scanDone.wait(timeout: .now() + 10) == .success)
+
+        #expect(try auditResult.get() == .interrupted)
+        _ = try scanResult.get()
+        #expect(try String(contentsOf: target, encoding: .utf8).hasSuffix(fixture.line("new")))
+        let expectedByteCount = Int64((initial + fixture.line("new")).utf8.count)
+        #expect(try fixture.loadCursor(sourcePath: source.path)?.lastByteOffset == expectedByteCount)
+    }
+
+    @Test
     func missingTargetRootIsNotRecreatedLocallyAndWritesLocalErrorStatus() throws {
         let fixture = try DirectNASBackupFixture(createBackupRoot: false)
         defer { fixture.cleanup() }
