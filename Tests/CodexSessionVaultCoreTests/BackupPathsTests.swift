@@ -30,12 +30,14 @@ func explicitNASLayoutSeparatesRemoteContentFromLocalControlState() {
     )
 
     #expect(paths.cursorDatabaseURL.path == stateRoot.appendingPathComponent("cursors.sqlite").path)
+    #expect(paths.auditStateURL.path == stateRoot.appendingPathComponent("integrity-audit.json").path)
     #expect(paths.localStatusURL.path == stateRoot.appendingPathComponent("status.json").path)
     #expect(paths.logURL.path == stateRoot.appendingPathComponent("logs/backup-agent.log").path)
     #expect(paths.manifestURL.path == backupRoot.appendingPathComponent("manifest.json").path)
     #expect(paths.remoteStatusURL.path == backupRoot.appendingPathComponent("status.json").path)
     #expect(paths.sessionsRoot.path == backupRoot.appendingPathComponent("sessions").path)
     #expect(paths.archivedSessionsRoot.path == backupRoot.appendingPathComponent("archived_sessions").path)
+    #expect(paths.repairQuarantineRoot.path == backupRoot.appendingPathComponent("repair-quarantine").path)
 }
 
 @Test
@@ -173,7 +175,11 @@ func backupModelsRoundTripThroughCodable() throws {
         lineCount: record.lineCount,
         bytesBackedUp: record.bytesBackedUp,
         autoStartEnabled: true,
-        lastError: nil
+        lastError: nil,
+        lastAuditAt: lastBackedUpAt,
+        lastAuditResult: "completed",
+        lastRepairAt: lastBackedUpAt,
+        repairCount: 2
     )
 
     let encoder = JSONEncoder()
@@ -184,4 +190,34 @@ func backupModelsRoundTripThroughCodable() throws {
 
     #expect(decodedManifest == manifest)
     #expect(decodedStatus == status)
+}
+
+@Test
+func backupStatusDecodesOlderPayloadWithoutAuditFields() throws {
+    let data = Data("""
+    {
+      "agentVersion":"1.0.0",
+      "enabled":true,
+      "status":"running",
+      "mode":"polling",
+      "codexRoot":"/Users/alice/.codex",
+      "backupRoot":"/Volumes/nas/backups",
+      "firstRunAt":"2026-07-04T10:00:00Z",
+      "lastStartedAt":"2026-07-04T10:00:00Z",
+      "lastHeartbeatAt":"2026-07-04T10:01:00Z",
+      "sessionCount":1,
+      "lineCount":2,
+      "bytesBackedUp":42,
+      "autoStartEnabled":true
+    }
+    """.utf8)
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+
+    let status = try decoder.decode(BackupStatus.self, from: data)
+
+    #expect(status.lastAuditAt == nil)
+    #expect(status.lastAuditResult == nil)
+    #expect(status.lastRepairAt == nil)
+    #expect(status.repairCount == nil)
 }

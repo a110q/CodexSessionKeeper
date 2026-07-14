@@ -16,15 +16,18 @@ struct BackupAgentInstrumentation {
     let sourceBodyRead: (URL, Int64, Int64) -> Void
     let targetStat: (URL) -> Void
     let fullHash: (URL, Int64) -> Void
+    let auditInterruptionSet: () -> Void
 
     init(
         sourceBodyRead: @escaping (URL, Int64, Int64) -> Void = { _, _, _ in },
         targetStat: @escaping (URL) -> Void = { _ in },
-        fullHash: @escaping (URL, Int64) -> Void = { _, _ in }
+        fullHash: @escaping (URL, Int64) -> Void = { _, _ in },
+        auditInterruptionSet: @escaping () -> Void = {}
     ) {
         self.sourceBodyRead = sourceBodyRead
         self.targetStat = targetStat
         self.fullHash = fullHash
+        self.auditInterruptionSet = auditInterruptionSet
     }
 }
 
@@ -44,11 +47,14 @@ public final class BackupAgent: @unchecked Sendable {
     private let cursorStoreFactory: (URL) -> BackupCursorStore
     private let manifestStoreFactory: (URL) -> BackupManifestStore
     private let instrumentation: BackupAgentInstrumentation
+    private let integrityAuditorFactory: (BackupPaths) -> BackupIntegrityAuditor
     private let scanLock = NSLock()
+    private let auditInterruptionLock = NSLock()
     private let taskLock = NSLock()
     private var pollingTask: Task<Void, Never>?
     private var pollingStartedAt: Date?
     private var lastKnownProgress: BackupProgress?
+    private var auditInterruptionRequested = false
 
     private struct ProcessSessionFileResult {
         var manifestChanged: Bool
@@ -80,7 +86,8 @@ public final class BackupAgent: @unchecked Sendable {
             manifestStoreFactory: {
                 BackupManifestStore(manifestURL: $0, createParentDirectories: false)
             },
-            instrumentation: BackupAgentInstrumentation()
+            instrumentation: BackupAgentInstrumentation(),
+            integrityAuditorFactory: { BackupIntegrityAuditor(paths: $0) }
         )
     }
 
@@ -96,7 +103,10 @@ public final class BackupAgent: @unchecked Sendable {
         sessionBackupStreamer: SessionBackupStreamer,
         cursorStoreFactory: @escaping (URL) -> BackupCursorStore,
         manifestStoreFactory: @escaping (URL) -> BackupManifestStore,
-        instrumentation: BackupAgentInstrumentation
+        instrumentation: BackupAgentInstrumentation,
+        integrityAuditorFactory: @escaping (BackupPaths) -> BackupIntegrityAuditor = {
+            BackupIntegrityAuditor(paths: $0)
+        }
     ) {
         self.paths = paths
         self.now = now
@@ -109,6 +119,7 @@ public final class BackupAgent: @unchecked Sendable {
         self.cursorStoreFactory = cursorStoreFactory
         self.manifestStoreFactory = manifestStoreFactory
         self.instrumentation = instrumentation
+        self.integrityAuditorFactory = integrityAuditorFactory
         self.remoteStatusWriter = remoteStatusWriter ?? { data, url in
             try DurableAtomicWriter().write(data, to: url, createParentDirectories: false)
         }
@@ -119,10 +130,35 @@ public final class BackupAgent: @unchecked Sendable {
     }
 
     public func performOneShotScan() throws {
+        requestAuditInterruption()
         scanLock.lock()
         defer { scanLock.unlock() }
+        clearAuditInterruption()
         do {
             try performOneShotScanLocked()
+        } catch {
+            try? writeErrorStatus(error)
+            throw error
+        }
+    }
+
+    public func performIntegrityAuditIfDue(deviceID: UUID) throws -> IntegrityAuditOutcome {
+        scanLock.lock()
+        defer { scanLock.unlock() }
+        clearAuditInterruption()
+        do {
+            try performOneShotScanLocked()
+            let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
+            try cursorStore.open()
+            let cursors = try cursorStore.loadAll()
+            return try integrityAuditorFactory(paths).runIfDue(
+                now: now(),
+                deviceID: deviceID,
+                cursors: cursors,
+                interruptionRequested: { [weak self] in
+                    self?.isAuditInterruptionRequested() ?? true
+                }
+            )
         } catch {
             try? writeErrorStatus(error)
             throw error
@@ -206,6 +242,9 @@ public final class BackupAgent: @unchecked Sendable {
         }
         if !updatedCursors.isEmpty {
             try cursorStore.upsertMany(updatedCursors)
+        }
+        if !manifestExisted, scanErrors.isEmpty {
+            try integrityAuditorFactory(paths).recordInitialSeedCompleted(at: scanDate)
         }
 
         try writeStatus(
@@ -557,6 +596,7 @@ public final class BackupAgent: @unchecked Sendable {
         includeRemote: Bool
     ) throws {
         let existingStatus = try? loadLocalStatus()
+        let auditState = try? loadIntegrityAuditState()
         let records = Array(manifest.sessions.values)
         let snapshot = BackupStatus(
             agentVersion: Self.agentVersion,
@@ -573,7 +613,11 @@ public final class BackupAgent: @unchecked Sendable {
             lineCount: records.reduce(0) { $0 + $1.lineCount },
             bytesBackedUp: records.reduce(Int64(0)) { $0 + $1.bytesBackedUp },
             autoStartEnabled: false,
-            lastError: lastError
+            lastError: lastError,
+            lastAuditAt: auditState?.lastCompletedAt ?? existingStatus?.lastAuditAt,
+            lastAuditResult: auditState?.lastResult ?? existingStatus?.lastAuditResult,
+            lastRepairAt: existingStatus?.lastRepairAt,
+            repairCount: auditState?.repairedCount ?? existingStatus?.repairCount
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -619,6 +663,34 @@ public final class BackupAgent: @unchecked Sendable {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(BackupStatus.self, from: Data(contentsOf: paths.localStatusURL))
+    }
+
+    private func loadIntegrityAuditState() throws -> IntegrityAuditState {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(
+            IntegrityAuditState.self,
+            from: Data(contentsOf: paths.auditStateURL)
+        )
+    }
+
+    private func requestAuditInterruption() {
+        auditInterruptionLock.lock()
+        auditInterruptionRequested = true
+        auditInterruptionLock.unlock()
+        instrumentation.auditInterruptionSet()
+    }
+
+    private func clearAuditInterruption() {
+        auditInterruptionLock.lock()
+        auditInterruptionRequested = false
+        auditInterruptionLock.unlock()
+    }
+
+    private func isAuditInterruptionRequested() -> Bool {
+        auditInterruptionLock.lock()
+        defer { auditInterruptionLock.unlock() }
+        return auditInterruptionRequested
     }
 
     private func writePendingSources(_ records: [PendingSourceRecord]) throws {

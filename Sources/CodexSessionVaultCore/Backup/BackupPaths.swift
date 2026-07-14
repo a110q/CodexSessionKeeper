@@ -38,6 +38,14 @@ public struct BackupPaths: Sendable {
         stateRoot.appendingPathComponent("cursors.sqlite", isDirectory: false)
     }
 
+    public var auditStateURL: URL {
+        stateRoot.appendingPathComponent("integrity-audit.json", isDirectory: false)
+    }
+
+    public var repairQuarantineRoot: URL {
+        backupRoot.appendingPathComponent("repair-quarantine", isDirectory: true)
+    }
+
     public var remoteStatusURL: URL {
         backupRoot.appendingPathComponent("status.json", isDirectory: false)
     }

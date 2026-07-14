@@ -5,6 +5,112 @@ import Testing
 @Suite(.serialized)
 struct BackupAgentNASTests {
     @Test
+    func successfulInitialSeedInitializesAuditStateAndPreventsImmediateAudit() throws {
+        let fixture = try DirectNASBackupFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.writeActiveSession(name: "initial-seed.jsonl", contents: fixture.line("one"))
+        let agent = fixture.makeAgent()
+
+        try agent.performOneShotScan()
+
+        let state = try fixture.loadAuditState()
+        #expect(state.lastCompletedAt == fixture.now)
+        #expect(state.lastResult == "seeded")
+        #expect(try agent.performIntegrityAuditIfDue(deviceID: fixture.deviceID) == .notDue)
+    }
+
+    @Test
+    func blockedInitialSeedDoesNotInitializeAuditCompletion() throws {
+        let fixture = try DirectNASBackupFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.writeActiveSession(name: "blocked-seed.jsonl", contents: fixture.line("one"))
+        let agent = fixture.makeAgent(
+            sessionBackupStreamer: SessionBackupStreamer(maxLineBytes: 0)
+        )
+
+        try agent.performOneShotScan()
+
+        #expect(FileManager.default.fileExists(atPath: fixture.paths.auditStateURL.path) == false)
+        #expect(try fixture.loadLocalStatus().status == .error)
+    }
+
+    @Test
+    func integrityAuditRunsOnlyAfterIncrementalCatchup() throws {
+        let fixture = try DirectNASBackupFixture()
+        defer { fixture.cleanup() }
+        let source = try fixture.writeActiveSession(name: "audit-catchup.jsonl", contents: fixture.line("one"))
+        let agent = fixture.makeAgent()
+        try agent.performOneShotScan()
+        try fixture.writeAuditState(IntegrityAuditState(
+            lastCompletedAt: fixture.now.addingTimeInterval(-86_401),
+            lastResult: "previous",
+            repairedCount: 0
+        ))
+        try fixture.append(fixture.line("two"), to: source)
+
+        let outcome = try agent.performIntegrityAuditIfDue(deviceID: fixture.deviceID)
+
+        #expect(outcome == .completed(checked: 1, repaired: 0))
+        let target = try fixture.paths.backupFileURL(for: source)
+        #expect(try String(contentsOf: target, encoding: .utf8) == fixture.line("one") + fixture.line("two"))
+        #expect(try fixture.loadManifest().sessions["audit-catchup"]?.contentHash?.isEmpty == false)
+    }
+
+    @Test
+    func queuedIncrementalScanInterruptsAuditAtChunkBoundaryAndThenCatchesUp() throws {
+        let fixture = try DirectNASBackupFixture()
+        defer { fixture.cleanup() }
+        let initial = String(repeating: fixture.line("bulk"), count: 45_000)
+        let source = try fixture.writeActiveSession(name: "audit-priority.jsonl", contents: initial)
+        try fixture.makeAgent().performOneShotScan()
+        try fixture.writeAuditState(IntegrityAuditState(
+            lastCompletedAt: fixture.now.addingTimeInterval(-86_401),
+            lastResult: "previous",
+            repairedCount: 0
+        ))
+
+        let gate = AuditReadGate()
+        let interruptionWasSet = DispatchSemaphore(value: 0)
+        let auditor = BackupIntegrityAuditor(
+            paths: fixture.paths,
+            chunkSize: 1_048_576,
+            instrumentation: IntegrityAuditInstrumentation(didReadChunk: { _, _, _ in
+                gate.pauseFirstChunk()
+            })
+        )
+        let agent = fixture.makeAgent(
+            instrumentation: BackupAgentInstrumentation(auditInterruptionSet: {
+                interruptionWasSet.signal()
+            }),
+            integrityAuditorFactory: { _ in auditor }
+        )
+        let auditResult = ThreadResultBox<IntegrityAuditOutcome>()
+        let scanResult = ThreadResultBox<Void>()
+        let auditDone = DispatchSemaphore(value: 0)
+        let scanDone = DispatchSemaphore(value: 0)
+        let deviceID = fixture.deviceID
+        DispatchQueue.global().async {
+            defer { auditDone.signal() }
+            auditResult.capture { try agent.performIntegrityAuditIfDue(deviceID: deviceID) }
+        }
+        #expect(gate.waitUntilPaused() == .success)
+        try fixture.append(fixture.line("new"), to: source)
+        DispatchQueue.global().async {
+            defer { scanDone.signal() }
+            scanResult.capture { try agent.performOneShotScan() }
+        }
+        #expect(interruptionWasSet.wait(timeout: .now() + 5) == .success)
+        gate.resume()
+        #expect(auditDone.wait(timeout: .now() + 10) == .success)
+        #expect(scanDone.wait(timeout: .now() + 10) == .success)
+
+        #expect(try auditResult.get() == .interrupted)
+        _ = try scanResult.get()
+        let target = try fixture.paths.backupFileURL(for: source)
+        #expect(try String(contentsOf: target, encoding: .utf8).hasSuffix(fixture.line("new")))
+    }
+
+    @Test
     func missingTargetRootIsNotRecreatedLocallyAndWritesLocalErrorStatus() throws {
         let fixture = try DirectNASBackupFixture(createBackupRoot: false)
         defer { fixture.cleanup() }
@@ -223,6 +329,7 @@ private final class DirectNASBackupFixture {
     let root: URL
     let paths: BackupPaths
     let now = Date(timeIntervalSince1970: 1_783_824_000)
+    let deviceID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
     init(createBackupRoot: Bool = true) throws {
         root = FileManager.default.temporaryDirectory
@@ -252,14 +359,33 @@ private final class DirectNASBackupFixture {
     func makeAgent(
         targetValidator: BackupTargetValidator? = nil,
         fileCommitter: BackupFileCommitter = BackupFileCommitter(),
-        remoteStatusWriter: ((Data, URL) throws -> Void)? = nil
+        remoteStatusWriter: ((Data, URL) throws -> Void)? = nil,
+        instrumentation: BackupAgentInstrumentation = BackupAgentInstrumentation(),
+        integrityAuditorFactory: ((BackupPaths) -> BackupIntegrityAuditor)? = nil,
+        sessionBackupStreamer: SessionBackupStreamer? = nil
     ) -> BackupAgent {
-        BackupAgent(
+        guard integrityAuditorFactory != nil || sessionBackupStreamer != nil else {
+            return BackupAgent(
+                paths: paths,
+                now: { self.now },
+                targetValidator: targetValidator ?? BackupTargetValidator(backupRoot: paths.backupRoot),
+                fileCommitter: fileCommitter,
+                remoteStatusWriter: remoteStatusWriter
+            )
+        }
+        return BackupAgent(
             paths: paths,
             now: { self.now },
             targetValidator: targetValidator ?? BackupTargetValidator(backupRoot: paths.backupRoot),
             fileCommitter: fileCommitter,
-            remoteStatusWriter: remoteStatusWriter
+            remoteStatusWriter: remoteStatusWriter,
+            sessionBackupStreamer: sessionBackupStreamer ?? SessionBackupStreamer(),
+            cursorStoreFactory: { BackupCursorStore(databaseURL: $0) },
+            manifestStoreFactory: {
+                BackupManifestStore(manifestURL: $0, createParentDirectories: false)
+            },
+            instrumentation: instrumentation,
+            integrityAuditorFactory: integrityAuditorFactory ?? { BackupIntegrityAuditor(paths: $0) }
         )
     }
 
@@ -302,6 +428,23 @@ private final class DirectNASBackupFixture {
         return try decoder.decode(BackupStatus.self, from: Data(contentsOf: paths.localStatusURL))
     }
 
+    func writeAuditState(_ state: IntegrityAuditState) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try DurableAtomicWriter().write(
+            try encoder.encode(state),
+            to: paths.auditStateURL,
+            createParentDirectories: true
+        )
+    }
+
+    func loadAuditState() throws -> IntegrityAuditState {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(IntegrityAuditState.self, from: Data(contentsOf: paths.auditStateURL))
+    }
+
     func temporaryFiles(beside target: URL) throws -> [String] {
         let names = try FileManager.default.contentsOfDirectory(atPath: target.deletingLastPathComponent().path)
         return names.filter { $0.contains(".tmp-") }
@@ -312,5 +455,47 @@ private final class DirectNASBackupFixture {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(contents.utf8).write(to: url)
         return url
+    }
+}
+
+private final class AuditReadGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didPause = false
+    private let paused = DispatchSemaphore(value: 0)
+    private let continuation = DispatchSemaphore(value: 0)
+
+    func pauseFirstChunk() {
+        let shouldPause = lock.withLock {
+            guard !didPause else { return false }
+            didPause = true
+            return true
+        }
+        guard shouldPause else { return }
+        paused.signal()
+        continuation.wait()
+    }
+
+    func waitUntilPaused() -> DispatchTimeoutResult {
+        paused.wait(timeout: .now() + 5)
+    }
+
+    func resume() {
+        continuation.signal()
+    }
+}
+
+private final class ThreadResultBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Value, Error>?
+
+    func capture(_ operation: () throws -> Value) {
+        let captured = Result { try operation() }
+        lock.withLock { result = captured }
+    }
+
+    func get() throws -> Value {
+        try lock.withLock {
+            try #require(result).get()
+        }
     }
 }
