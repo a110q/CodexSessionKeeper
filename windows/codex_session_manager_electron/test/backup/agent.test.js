@@ -76,6 +76,42 @@ async function withoutJsonlReadFile(operation) {
   }
 }
 
+async function withTrackedReadRanges(filePaths, operation) {
+  const originalOpen = fs.open;
+  const tracked = new Map(filePaths.map((filePath) => [path.resolve(filePath), []]));
+  fs.open = async (filePath, ...args) => {
+    const handle = await originalOpen.call(fs, filePath, ...args);
+    const ranges = tracked.get(path.resolve(String(filePath)));
+    if (ranges) {
+      const originalRead = handle.read.bind(handle);
+      handle.read = async (buffer, offset, length, position) => {
+        const result = await originalRead(buffer, offset, length, position);
+        if (result.bytesRead > 0) {
+          ranges.push({ start: position, end: position + result.bytesRead, requested: length });
+        }
+        return result;
+      };
+    }
+    return handle;
+  };
+  try {
+    await operation();
+  } finally {
+    fs.open = originalOpen;
+  }
+  return new Map(filePaths.map((filePath) => [filePath, tracked.get(path.resolve(filePath))]));
+}
+
+async function loadCursor(paths, sourcePath) {
+  const store = new CursorStore({ paths });
+  await store.open();
+  try {
+    return await store.get(sourcePath);
+  } finally {
+    await store.close();
+  }
+}
+
 function cursorFor(paths, sourceName, overrides = {}) {
   const sourcePath = path.join(paths.codexRoot, 'sessions', sourceName);
   return {
@@ -186,27 +222,49 @@ test('second scan appends only new completed lines and repeated scan has no dupl
   assert.equal(manifest.sessions.append.lineCount, 2);
 });
 
-test('steady-state scan reads new source bytes from the committed cursor', async (t) => {
+test('steady-state scan reads new source bytes with the real bounded streamer', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'cursor-offset.jsonl');
   const first = jsonLine({ role: 'user', content: 'one' });
   const second = jsonLine({ role: 'assistant', content: 'two' });
   await writeSessionFile(sourcePath, [first]);
-  const offsets = [];
+  const agent = new BackupAgent({ paths });
+
+  const initialRanges = await withTrackedReadRanges(
+    [sourcePath],
+    () => agent.performOneShotScan(),
+  );
+  await fs.appendFile(sourcePath, second);
+  const appendedRanges = await withTrackedReadRanges(
+    [sourcePath],
+    () => agent.performOneShotScan(),
+  );
+
+  const oldOffset = Buffer.byteLength(first);
+  const newOffset = oldOffset + Buffer.byteLength(second);
+  assert.equal(initialRanges.get(sourcePath)[0].start, 0);
+  assert.ok(appendedRanges.get(sourcePath).every(({ start, end }) => (
+    start >= oldOffset && end <= newOffset
+  )));
+  assert.equal(await fs.readFile(paths.backupFilePath(sourcePath), 'utf8'), first + second);
+});
+
+test('backup agent does not execute the discarded legacy tailer side channel', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'no-tailer-side-channel.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'bounded' })]);
+  let tailerCalls = 0;
   const agent = new BackupAgent({
     paths,
-    tailer: (filePath, offset) => {
-      offsets.push(offset);
-      return readNewCompleteLines(filePath, offset);
+    tailer: () => {
+      tailerCalls += 1;
+      return { lines: [] };
     },
   });
 
   await agent.performOneShotScan();
-  await fs.appendFile(sourcePath, second);
-  await agent.performOneShotScan();
 
-  assert.deepEqual(offsets, [0, Buffer.byteLength(first)]);
-  assert.equal(await fs.readFile(paths.backupFilePath(sourcePath), 'utf8'), first + second);
+  assert.equal(tailerCalls, 0);
 });
 
 test('first scan reconciles existing backup file without duplicate append', async (t) => {
@@ -664,6 +722,65 @@ test('matching interrupted append is adopted without duplication', async (t) => 
   assert.equal(JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions.interrupted.lineCount, 2);
 });
 
+test('retry syncs an adopted ahead target before advancing metadata', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'sync-ahead-retry.jsonl');
+  const first = jsonLine({ role: 'user', content: 'first' });
+  const second = jsonLine({ role: 'assistant', content: 'second' });
+  await writeSessionFile(sourcePath, [first]);
+  await new BackupAgent({ paths }).performOneShotScan();
+  const targetPath = paths.backupFilePath(sourcePath);
+  const baselineRecord = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'))
+    .sessions['sync-ahead-retry'];
+  const baselineCursor = await loadCursor(paths, sourcePath);
+  await fs.appendFile(sourcePath, second);
+
+  let syncCalls = 0;
+  const retryAgent = new BackupAgent({
+    paths,
+    fileCommitter: createFileCommitter({
+      sync: async (handle) => {
+        syncCalls += 1;
+        if (syncCalls <= 2) throw new Error(`injected sync failure ${syncCalls}`);
+        await handle.sync();
+      },
+    }),
+  });
+
+  await assert.rejects(retryAgent.performOneShotScan(), /injected sync failure 1/);
+  assert.equal(syncCalls, 1);
+  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
+  assert.deepEqual(
+    JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions['sync-ahead-retry'],
+    baselineRecord,
+  );
+  assert.deepEqual(await loadCursor(paths, sourcePath), baselineCursor);
+
+  await assert.rejects(retryAgent.performOneShotScan(), /injected sync failure 2/);
+  assert.equal(syncCalls, 2);
+  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
+  assert.deepEqual(
+    JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions['sync-ahead-retry'],
+    baselineRecord,
+  );
+  assert.deepEqual(await loadCursor(paths, sourcePath), baselineCursor);
+
+  await retryAgent.performOneShotScan();
+  assert.equal(syncCalls, 3);
+  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
+  const updatedRecord = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'))
+    .sessions['sync-ahead-retry'];
+  const updatedCursor = await loadCursor(paths, sourcePath);
+  assert.equal(updatedRecord.lineCount, 2);
+  assert.equal(updatedRecord.bytesBackedUp, Buffer.byteLength(first + second));
+  assert.equal(updatedRecord.contentHash, null);
+  assert.equal(updatedCursor.lastByteOffset, Buffer.byteLength(first + second));
+
+  await retryAgent.performOneShotScan();
+  assert.equal(syncCalls, 3);
+  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
+});
+
 test('fresh large scan never uses whole-file JSONL reads for rebuild or stats', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'large-streamed.jsonl');
@@ -691,6 +808,55 @@ test('fresh cursor reconciliation compares an existing target prefix without who
   await withoutJsonlReadFile(() => new BackupAgent({ paths }).performOneShotScan());
 
   assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
+});
+
+test('initial matching target reconciliation derives title, line count, and full hash in one bounded pass', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'existing-seed-hash.jsonl');
+  const assistant = jsonLine({ role: 'assistant', content: 'x'.repeat(3 * 1024 * 1024 + 17) });
+  const user = jsonLine({ role: 'user', content: 'title beyond the first chunk' });
+  const contents = assistant + user;
+  await writeSessionFile(sourcePath, [contents]);
+  const targetPath = paths.backupFilePath(sourcePath);
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, contents);
+
+  const ranges = await withTrackedReadRanges(
+    [sourcePath, targetPath],
+    () => withoutJsonlReadFile(() => new BackupAgent({ paths }).performOneShotScan()),
+  );
+
+  const record = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'))
+    .sessions['existing-seed-hash'];
+  assert.equal(record.title, 'title beyond the first chunk');
+  assert.equal(record.lineCount, 2);
+  assert.equal(record.contentHash, crypto.createHash('sha256').update(contents).digest('hex'));
+  assert.equal(
+    ranges.get(sourcePath).reduce((total, range) => total + range.end - range.start, 0),
+    Buffer.byteLength(contents),
+  );
+  assert.equal(
+    ranges.get(targetPath).reduce((total, range) => total + range.end - range.start, 0),
+    Buffer.byteLength(contents),
+  );
+  assert.ok([...ranges.values()].flat().every(({ requested }) => requested <= 1024 * 1024));
+});
+
+test('initial matching empty target reconciliation stores the canonical empty hash', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'existing-empty-seed.jsonl');
+  await writeSessionFile(sourcePath, []);
+  const targetPath = paths.backupFilePath(sourcePath);
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, '');
+
+  await withoutJsonlReadFile(() => new BackupAgent({ paths }).performOneShotScan());
+
+  const record = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'))
+    .sessions['existing-empty-seed'];
+  assert.equal(record.lineCount, 0);
+  assert.equal(record.bytesBackedUp, 0);
+  assert.equal(record.contentHash, crypto.createHash('sha256').update('').digest('hex'));
 });
 
 test('unchanged scan stops before target, body, hash, manifest, cursor, and export work', async (t) => {
@@ -803,6 +969,34 @@ test('append reads only the new committed range and clears the optional full has
   const record = manifest.sessions['range-append'];
   assert.equal(record.bytesBackedUp, newOffset);
   assert.equal(record.contentHash, null);
+});
+
+test('untitled append never reopens the large target prefix for a title', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'append-title-range.jsonl');
+  const prefix = jsonLine({ role: 'assistant', content: 'x'.repeat(3 * 1024 * 1024 + 17) });
+  const appended = jsonLine({ role: 'assistant', content: 'still untitled' });
+  await writeSessionFile(sourcePath, [prefix]);
+  const agent = new BackupAgent({ paths });
+  await agent.performOneShotScan();
+  const targetPath = paths.backupFilePath(sourcePath);
+  const oldOffset = Buffer.byteLength(prefix);
+  await fs.appendFile(sourcePath, appended);
+  const newOffset = oldOffset + Buffer.byteLength(appended);
+
+  const ranges = await withTrackedReadRanges(
+    [sourcePath, targetPath],
+    () => agent.performOneShotScan(),
+  );
+
+  assert.ok(ranges.get(sourcePath).length > 0);
+  assert.ok(ranges.get(targetPath).length > 0);
+  assert.ok([...ranges.values()].flat().every(({ start, end, requested }) => (
+    start >= oldOffset && end <= newOffset && requested <= 1024 * 1024
+  )));
+  const record = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'))
+    .sessions['append-title-range'];
+  assert.equal(record.title, null);
 });
 
 test('empty seed and empty rebuild store the canonical full hash', async (t) => {

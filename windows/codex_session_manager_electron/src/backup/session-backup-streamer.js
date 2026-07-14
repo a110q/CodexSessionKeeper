@@ -289,50 +289,87 @@ async function rangesMatch({
   }
 }
 
-async function streamStats(filePath, chunkSize = DEFAULT_CHUNK_SIZE) {
-  const boundedChunkSize = normalizedChunkSize(chunkSize);
-  const handle = await fsp.open(filePath, 'r');
-  const buffer = Buffer.allocUnsafe(boundedChunkSize);
-  let byteCount = 0;
-  let lineCount = 0;
-  try {
-    while (true) {
-      const { bytesRead } = await handle.read(buffer, 0, boundedChunkSize, byteCount);
-      if (bytesRead === 0) break;
-      for (let index = 0; index < bytesRead; index += 1) {
-        if (buffer[index] === NEWLINE_BYTE) lineCount += 1;
-      }
-      byteCount += bytesRead;
-    }
-  } finally {
-    await handle.close();
-  }
-  return { byteCount, lineCount };
-}
-
-async function targetIsCompletePrefix({
+async function verifyCompletePrefix({
   sourcePath,
   targetPath,
   targetByteCount,
   chunkSize = DEFAULT_CHUNK_SIZE,
+  maxLineBytes = DEFAULT_MAX_LINE_BYTES,
 }) {
-  if (targetByteCount === 0) return true;
-  if (!await rangesMatch({
-    sourcePath,
-    sourceOffset: 0,
-    targetPath,
-    targetOffset: 0,
-    length: targetByteCount,
-    chunkSize,
-  })) {
-    return false;
+  if (!Number.isSafeInteger(targetByteCount) || targetByteCount < 0) {
+    throw new Error(`Invalid target byte count: ${targetByteCount}`);
   }
-  const handle = await fsp.open(targetPath, 'r');
+  if (targetByteCount === 0) {
+    return {
+      matches: true,
+      byteCount: 0,
+      lineCount: 0,
+      contentHash: crypto.createHash('sha256').digest('hex'),
+      firstTitle: null,
+    };
+  }
+
+  const boundedChunkSize = normalizedChunkSize(chunkSize);
+  const lineLimit = normalizedLineLimit(maxLineBytes);
+  const digest = crypto.createHash('sha256');
+  const sourceHandle = await fsp.open(sourcePath, 'r');
+  let targetHandle;
+  let compared = 0;
+  let lineCount = 0;
+  let pendingChunks = [];
+  let pendingLength = 0;
+  let firstTitle = null;
   try {
-    const lastByte = await readExactly(handle, targetByteCount - 1, 1);
-    return lastByte.length === 1 && lastByte[0] === NEWLINE_BYTE;
+    targetHandle = await fsp.open(targetPath, 'r');
+    while (compared < targetByteCount) {
+      const requested = Math.min(boundedChunkSize, targetByteCount - compared);
+      const [source, target] = await Promise.all([
+        readExactly(sourceHandle, compared, requested),
+        readExactly(targetHandle, compared, requested),
+      ]);
+      if (source.length !== requested || target.length !== requested || !source.equals(target)) {
+        return { matches: false };
+      }
+      digest.update(target);
+
+      let segmentStart = 0;
+      for (let index = 0; index < target.length; index += 1) {
+        if (target[index] !== NEWLINE_BYTE) continue;
+        if (segmentStart < index) {
+          const segment = target.subarray(segmentStart, index);
+          pendingChunks.push(segment);
+          pendingLength += segment.length;
+        }
+        if (pendingLength > lineLimit) return { matches: false };
+        const line = pendingLength === 0
+          ? Buffer.alloc(0)
+          : Buffer.concat(pendingChunks, pendingLength);
+        if (firstTitle === null) firstTitle = titleFromJsonLine(line.toString('utf8'));
+        lineCount += 1;
+        pendingChunks = [];
+        pendingLength = 0;
+        segmentStart = index + 1;
+      }
+      if (segmentStart < target.length) {
+        const segment = target.subarray(segmentStart);
+        pendingChunks.push(segment);
+        pendingLength += segment.length;
+        if (pendingLength > lineLimit) return { matches: false };
+      }
+      compared += requested;
+    }
+
+    if (pendingLength !== 0) return { matches: false };
+    return {
+      matches: true,
+      byteCount: targetByteCount,
+      lineCount,
+      contentHash: digest.digest('hex'),
+      firstTitle,
+    };
   } finally {
-    await handle.close();
+    await targetHandle?.close().catch(() => {});
+    await sourceHandle.close();
   }
 }
 
@@ -345,6 +382,5 @@ module.exports = {
   rebuildCompleteLines,
   rebuildSessionCompleteLines,
   rangesMatch,
-  streamStats,
-  targetIsCompletePrefix,
+  verifyCompletePrefix,
 };

@@ -7,13 +7,12 @@ const { CursorStore } = require('./cursor-store');
 const { replaceFileDurably } = require('./durable-write');
 const { AGENT_VERSION, MANIFEST_VERSION } = require('./models');
 const { loadOrCreateManifest, saveManifest } = require('./manifest-store');
-const { sessionIdFromPath, titleFromJsonLine } = require('./session-identity');
+const { sessionIdFromPath } = require('./session-identity');
 const {
   appendCompleteLines,
   rangesMatch,
   rebuildSessionCompleteLines,
-  streamStats,
-  targetIsCompletePrefix,
+  verifyCompletePrefix,
 } = require('./session-backup-streamer');
 
 const ACTIVE_STATUS = 'active';
@@ -22,7 +21,6 @@ class BackupAgent {
   constructor({
     paths,
     now = () => new Date(),
-    tailer,
     validateTarget = defaultValidateTarget,
     fileCommitter = createFileCommitter(),
     onProgress = null,
@@ -33,7 +31,6 @@ class BackupAgent {
 
     this.paths = paths;
     this.now = now;
-    this.tailer = tailer || null;
     this.validateTarget = validateTarget;
     this.fileCommitter = fileCommitter;
     this.onProgress = onProgress;
@@ -251,6 +248,8 @@ class BackupAgent {
     let rebuild = !targetState.exists;
     let readOffset = recordedOffset;
     let baseLineCount = recordedLines;
+    let adoptedPrefix = null;
+    const freshPrefixSeed = !baselineCursor && !existingRecord;
 
     if (targetState.exists) {
       if (metadataAgrees && pathAgrees && targetState.byteCount === recordedOffset) {
@@ -258,22 +257,25 @@ class BackupAgent {
       } else {
         const canAdoptPrefix = targetState.byteCount <= sourceStats.size
           && ((!baselineCursor && !existingRecord) || targetState.byteCount > recordedOffset);
-        if (canAdoptPrefix && await this.fileCommitter.targetIsCompletePrefix(
-          backupPath,
-          sourcePath,
-          targetState.byteCount,
-        )) {
+        const prefix = canAdoptPrefix
+          ? await this.fileCommitter.verifyCompletePrefix(
+            backupPath,
+            sourcePath,
+            targetState.byteCount,
+          )
+          : null;
+        if (prefix?.matches) {
+          if (targetState.byteCount > recordedOffset) {
+            await this.fileCommitter.synchronizeTarget(backupPath, this.paths.backupRoot);
+          }
           rebuild = false;
+          adoptedPrefix = prefix;
           readOffset = targetState.byteCount;
-          baseLineCount = (await this.fileCommitter.stats(backupPath)).lineCount;
+          baseLineCount = prefix.lineCount;
         } else {
           rebuild = true;
         }
       }
-    }
-
-    if (this.tailer) {
-      await this.readTail(sourcePath, rebuild ? 0 : readOffset);
     }
 
     let streamed;
@@ -313,13 +315,23 @@ class BackupAgent {
         lineCount: baseLineCount + streamed.lineCount,
       };
       wroteData = streamed.appendedByteCount > 0 || readOffset !== recordedOffset;
-      contentHash = finalOffset > recordedOffset ? null : existingRecord?.contentHash ?? null;
+      const adoptedCompleteSeed = freshPrefixSeed
+        && adoptedPrefix
+        && streamed.appendedByteCount === 0
+        && finalOffset === adoptedPrefix.byteCount;
+      if (adoptedCompleteSeed) {
+        contentHash = adoptedPrefix.contentHash;
+      } else {
+        contentHash = finalOffset > recordedOffset ? null : existingRecord?.contentHash ?? null;
+      }
     }
 
     const firstSeenAt = existingRecord?.firstSeenAt || scanDate.toISOString();
+    const streamedTitle = freshPrefixSeed
+      ? adoptedPrefix?.firstTitle || streamed.firstTitle
+      : streamed.firstTitle;
     const title = existingRecord?.title
-      || streamed.firstTitle
-      || await firstTitleInBackup(backupPath);
+      || streamedTitle;
     const updatedRecord = {
       sessionId,
       sourcePath,
@@ -383,13 +395,6 @@ class BackupAgent {
       throw new Error(`Backup path is outside backup root: ${backupPath} is not contained in ${this.paths.backupRoot}.`);
     }
     return relative;
-  }
-
-  async readTail(sourcePath, offset) {
-    if (typeof this.tailer === 'function') {
-      return this.tailer(sourcePath, offset);
-    }
-    return this.tailer.readNewCompleteLines(sourcePath, offset);
   }
 
   async writeStatus(manifest, status, lastError, date) {
@@ -472,12 +477,18 @@ function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
       }
     },
 
-    async targetIsCompletePrefix(targetPath, sourcePath, targetByteCount) {
-      return targetIsCompletePrefix({ sourcePath, targetPath, targetByteCount });
+    async verifyCompletePrefix(targetPath, sourcePath, targetByteCount) {
+      return verifyCompletePrefix({ sourcePath, targetPath, targetByteCount });
     },
 
-    async stats(targetPath) {
-      return streamStats(targetPath);
+    async synchronizeTarget(targetPath, backupRoot) {
+      await assertContainedTarget(backupRoot, targetPath);
+      const handle = await fsp.open(targetPath, 'r+');
+      try {
+        await sync(handle);
+      } finally {
+        await handle.close();
+      }
     },
 
     async rangesMatch(sourcePath, sourceOffset, targetPath, targetOffset, length) {
@@ -585,40 +596,6 @@ async function trustedSourceMetadata(sourcePath) {
     throw new Error(`Session source is not a trusted regular file: ${sourcePath}`);
   }
   return { modifiedAt: stats.mtimeMs / 1000, size: stats.size };
-}
-
-async function firstTitleInBackup(filePath) {
-  try {
-    const content = await readPrefix(filePath, 256 * 1024);
-    for (const line of content.toString('utf8').split('\n')) {
-      const title = titleFromJsonLine(line);
-      if (title) return title;
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-  return null;
-}
-
-async function readPrefix(filePath, byteCount) {
-  return readRange(filePath, 0, byteCount);
-}
-
-async function readRange(filePath, position, byteCount) {
-  if (byteCount <= 0) return Buffer.alloc(0);
-  const handle = await fsp.open(filePath, 'r');
-  const buffer = Buffer.allocUnsafe(byteCount);
-  let offset = 0;
-  try {
-    while (offset < byteCount) {
-      const { bytesRead } = await handle.read(buffer, offset, byteCount - offset, position + offset);
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-    }
-  } finally {
-    await handle.close();
-  }
-  return buffer.subarray(0, offset);
 }
 
 function scanIsStrictlyUnchanged({
