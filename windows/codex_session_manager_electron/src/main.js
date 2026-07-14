@@ -54,8 +54,9 @@ const nasRuntime = createNasRuntime({
   settingsStore,
   homeDir: os.homedir(),
   pathsFactory: ({ target }) => pathsForNasTarget(target),
-  agentFactory: ({ paths: selectedPaths, validateTarget, initialStatus, onProgress, onStatus }) => new BackupAgent({
+  agentFactory: ({ paths: selectedPaths, target, validateTarget, initialStatus, onProgress, onStatus }) => new BackupAgent({
     paths: selectedPaths,
+    deviceId: target.configuration.deviceId,
     validateTarget,
     initialStatus,
     onProgress,

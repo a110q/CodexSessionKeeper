@@ -5,11 +5,17 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { BackupAgent, createFileCommitter } = require('../../src/backup/backup-agent');
+const {
+  BackupAgent,
+  auditDelayMilliseconds,
+  createFileCommitter,
+} = require('../../src/backup/backup-agent');
 const { CursorStore } = require('../../src/backup/cursor-store');
 const { BackupIntegrityAuditor } = require('../../src/backup/integrity-auditor');
 const { backupPaths } = require('../../src/backup/paths');
 const { readNewCompleteLines } = require('../../src/backup/session-tailer');
+
+const DEVICE_ID = '00000000-0000-0000-0000-000000000001';
 
 async function makeTestPaths(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-backup-agent-'));
@@ -1584,6 +1590,194 @@ test('persisted status is published through the agent status callback', async (t
 
   const persisted = JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8'));
   assert.deepEqual(statuses, [persisted]);
+});
+
+test('audit delay uses overdue jitter and a stable per-device daily window', () => {
+  const now = new Date('2026-07-14T04:05:06.000Z');
+
+  assert.equal(auditDelayMilliseconds(now, null, DEVICE_ID), 676000);
+  assert.equal(
+    auditDelayMilliseconds(now, new Date('2026-07-13T04:05:05.000Z'), DEVICE_ID),
+    676000,
+  );
+  assert.equal(
+    auditDelayMilliseconds(now, new Date('2026-07-13T12:00:00.000Z'), DEVICE_ID),
+    new Date('2026-07-15T10:45:33.000Z').getTime() - now.getTime(),
+  );
+});
+
+test('startup scan schedules an autonomous audit that catches up first and reschedules', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-14T04:05:06.000Z');
+  const timers = [];
+  const cancelled = [];
+  let scanCount = 0;
+  let auditCount = 0;
+  const auditor = {
+    async recoverPendingRepairIfNeeded() {},
+    async recordInitialSeedCompleted() {},
+    async runIfDue({ deviceId }) {
+      assert.equal(deviceId, DEVICE_ID);
+      assert.equal(scanCount, 2);
+      auditCount += 1;
+      return { outcome: 'completed', checked: 0, repaired: 0 };
+    },
+  };
+  const agent = new BackupAgent({
+    paths,
+    now: () => now,
+    deviceId: DEVICE_ID,
+    validateTarget: async () => { scanCount += 1; },
+    integrityAuditorFactory: () => auditor,
+    auditDelayProvider: (scheduledAt, lastAuditAt, deviceId) => {
+      assert.deepEqual(scheduledAt, now);
+      assert.equal(lastAuditAt, now.toISOString());
+      assert.equal(deviceId, DEVICE_ID);
+      return 1234;
+    },
+    auditTimerScheduler: (action, delay) => {
+      const timer = { action, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    cancelAuditTimer: (timer) => cancelled.push(timer),
+  });
+  t.after(() => agent.stop());
+
+  await agent.requestImmediateScan('startup');
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 1234);
+
+  assert.deepEqual(
+    await timers[0].action(),
+    { outcome: 'completed', checked: 0, repaired: 0 },
+  );
+  assert.equal(auditCount, 1);
+  assert.equal(scanCount, 2);
+  assert.equal(timers.length, 2);
+  assert.deepEqual(cancelled, []);
+});
+
+test('wake replaces an audit timer and a stale callback cannot clear or run the replacement', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const timers = [];
+  const cancelled = [];
+  let auditCount = 0;
+  const auditor = {
+    async recoverPendingRepairIfNeeded() {},
+    async recordInitialSeedCompleted() {},
+    async runIfDue() {
+      auditCount += 1;
+      return { outcome: 'not-due', checked: 0, repaired: 0 };
+    },
+  };
+  const agent = new BackupAgent({
+    paths,
+    deviceId: DEVICE_ID,
+    validateTarget: async () => {},
+    integrityAuditorFactory: () => auditor,
+    auditDelayProvider: () => 0,
+    auditTimerScheduler: (action, delay) => {
+      const timer = { action, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    cancelAuditTimer: (timer) => cancelled.push(timer),
+  });
+  t.after(() => agent.stop());
+
+  await agent.requestImmediateScan('startup');
+  const staleTimer = timers[0];
+  await agent.requestImmediateScan('wake');
+  const replacementTimer = timers[1];
+
+  assert.deepEqual(cancelled, [staleTimer]);
+  assert.equal(await staleTimer.action(), null);
+  assert.equal(auditCount, 0);
+  await replacementTimer.action();
+  assert.equal(auditCount, 1);
+  assert.equal(timers.length, 3);
+});
+
+test('scan interruption of a scheduled audit is followed by a replacement schedule', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const timers = [];
+  const auditEntered = controlledPromise();
+  const releaseAudit = controlledPromise();
+  const auditor = {
+    async recoverPendingRepairIfNeeded() {},
+    async recordInitialSeedCompleted() {},
+    async runIfDue({ interruptionRequested }) {
+      auditEntered.resolve();
+      await releaseAudit.promise;
+      return interruptionRequested()
+        ? { outcome: 'interrupted', checked: 0, repaired: 0 }
+        : { outcome: 'completed', checked: 0, repaired: 0 };
+    },
+  };
+  const agent = new BackupAgent({
+    paths,
+    deviceId: DEVICE_ID,
+    validateTarget: async () => {},
+    integrityAuditorFactory: () => auditor,
+    auditDelayProvider: () => 0,
+    auditTimerScheduler: (action, delay) => {
+      const timer = { action, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+  });
+  t.after(() => {
+    releaseAudit.resolve();
+    agent.stop();
+  });
+
+  await agent.requestImmediateScan('startup');
+  const scheduledAudit = timers[0].action();
+  await auditEntered.promise;
+  const queuedScan = agent.requestImmediateScan('timer');
+  releaseAudit.resolve();
+
+  assert.deepEqual(
+    await scheduledAudit,
+    { outcome: 'interrupted', checked: 0, repaired: 0 },
+  );
+  await queuedScan;
+  assert.equal(timers.length, 2);
+});
+
+test('stop cancels the current audit timer and rejects its stale callback', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const timers = [];
+  const cancelled = [];
+  let auditCount = 0;
+  const auditor = {
+    async recoverPendingRepairIfNeeded() {},
+    async recordInitialSeedCompleted() {},
+    async runIfDue() {
+      auditCount += 1;
+      return { outcome: 'completed', checked: 0, repaired: 0 };
+    },
+  };
+  const agent = new BackupAgent({
+    paths,
+    deviceId: DEVICE_ID,
+    validateTarget: async () => {},
+    integrityAuditorFactory: () => auditor,
+    auditDelayProvider: () => 0,
+    auditTimerScheduler: (action, delay) => {
+      const timer = { action, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    cancelAuditTimer: (timer) => cancelled.push(timer),
+  });
+
+  await agent.requestImmediateScan('startup');
+  agent.stop();
+  assert.deepEqual(cancelled, [timers[0]]);
+  assert.equal(await timers[0].action(), null);
+  assert.equal(auditCount, 0);
 });
 
 test('polling defaults to 30 seconds and stale timer callbacks are rejected after stop', async (t) => {

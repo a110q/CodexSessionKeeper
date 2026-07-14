@@ -196,6 +196,60 @@ test('stale retry callback cannot reconnect after runtime shutdown', async () =>
   assert.equal(harness.created.length, 0);
 });
 
+test('manual retry supersedes an in-flight scheduled reconnect without leaking a writer', async () => {
+  const reconnectEntered = controlledPromise();
+  const releaseReconnect = controlledPromise();
+  let resolveCall = 0;
+  const harness = runtimeHarness({
+    saved: configuration('运营部', '陈超'),
+    connected: false,
+    beforeResolve: async () => {
+      resolveCall += 1;
+      if (resolveCall !== 2) return;
+      reconnectEntered.resolve();
+      await releaseReconnect.promise;
+    },
+  });
+  await harness.runtime.initialize();
+  harness.connected.value = true;
+
+  const scheduledReconnect = harness.fireRetry();
+  await reconnectEntered.promise;
+  const manualRetry = harness.runtime.retry();
+  releaseReconnect.resolve();
+  await Promise.all([scheduledReconnect, manualRetry]);
+
+  assert.equal(harness.created.length, 1);
+  assert.equal(harness.created.filter((agent) => !agent.stopped).length, 1);
+  assert.deepEqual(harness.created[0].triggers, ['activation']);
+});
+
+test('retry supersedes an in-flight activation and only the latest operation starts a writer', async () => {
+  const activationEntered = controlledPromise();
+  const releaseActivation = controlledPromise();
+  const saved = configuration('运营部', '陈超');
+  const harness = runtimeHarness({
+    saved,
+    beforeActivate: async () => {
+      activationEntered.resolve();
+      await releaseActivation.promise;
+    },
+  });
+  await harness.runtime.initialize();
+
+  const activation = harness.runtime.activate({ department: '运营部', employee: '李雷' });
+  await activationEntered.promise;
+  const retry = harness.runtime.retry();
+  releaseActivation.resolve();
+  await Promise.all([activation, retry]);
+
+  assert.equal(harness.created.length, 2);
+  assert.equal(harness.created[0].stopped, true);
+  assert.equal(harness.created.filter((agent) => !agent.stopped).length, 1);
+  assert.equal(harness.created[1].target.configuration.employee, '陈超');
+  assert.deepEqual(harness.settings.load().nasBackup, saved);
+});
+
 function runtimeHarness(options = {}) {
   let settings = { autoRestoreOnLaunch: false, nasBackup: options.saved || null };
   let settingsLoads = 0;
@@ -212,11 +266,13 @@ function runtimeHarness(options = {}) {
   let statusReads = 0;
   const nasService = {
     async activate({ department, employee, previous }) {
+      await options.beforeActivate?.({ department, employee, previous });
       if (employee === options.failEmployee) throw new Error('injected activation failure');
       return target(previous || configuration(department, employee), department, employee);
     },
     async resolve(configurationValue) {
       resolveCalls += 1;
+      await options.beforeResolve?.({ call: resolveCalls, configuration: configurationValue });
       if (!connected.value) throw new Error('NAS disconnected');
       return target(configurationValue, configurationValue.department, configurationValue.employee);
     }
@@ -297,4 +353,14 @@ function target(baseConfiguration, department, employee) {
     backupRoot: `/nas/${department}/${employee}/${configurationValue.deviceDirectoryName}/incremental-backups`,
     localStateRoot: `/local/${configurationValue.deviceId}`
   };
+}
+
+function controlledPromise() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }

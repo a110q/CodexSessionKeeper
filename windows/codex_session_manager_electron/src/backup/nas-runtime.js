@@ -24,12 +24,19 @@ function createNasRuntime({
   let retryScheduled = false;
   let retryGeneration = 0;
   let agentGeneration = 0;
+  let lifecycleGeneration = 0;
+  let lifecycleTail = Promise.resolve();
   let lastAppliedCallbackSequence = 0;
   let stopped = false;
   let state = snapshotValue('unconfigured');
 
-  async function initialize() {
+  function initialize() {
     stopped = false;
+    return runLifecycleOperation(initializeLocked);
+  }
+
+  async function initializeLocked(generation) {
+    if (!ownsLifecycle(generation)) return snapshot();
     if (agent) return snapshot();
     const configuration = settingsStore.load().nasBackup;
     if (!configuration) {
@@ -40,18 +47,27 @@ function createNasRuntime({
     state = snapshotValue('validating', configuration);
     try {
       const resolved = await nasService.resolve(configuration);
-      await startAgent(resolved, 'startup');
+      if (!ownsLifecycle(generation)) return snapshot();
+      await startAgent(resolved, 'startup', generation);
     } catch (error) {
+      if (!ownsLifecycle(generation)) return snapshot();
       markDisconnected(error, configuration);
     }
     return snapshot();
   }
 
-  async function activate({ department, employee }) {
+  function activate({ department, employee }) {
     stopped = false;
     invalidateScheduledRetry();
+    return runLifecycleOperation((generation) => activateLocked({ department, employee }, generation));
+  }
+
+  async function activateLocked({ department, employee }, generation) {
+    if (!ownsLifecycle(generation)) return snapshot();
     const previous = settingsStore.load().nasBackup;
-    if (!await stopAgentForReplacement()) {
+    const quiesced = await stopAgentForReplacement();
+    if (!ownsLifecycle(generation)) return snapshot();
+    if (!quiesced) {
       const error = replacementQuiescenceError();
       markReplacementDeferred(error, previous);
       throw error;
@@ -59,14 +75,19 @@ function createNasRuntime({
     state = snapshotValue('validating', previous);
     try {
       const activated = await nasService.activate({ department, employee, previous });
+      if (!ownsLifecycle(generation)) return snapshot();
       settingsStore.savePatch({ nasBackup: activated.configuration });
-      await startAgent(activated, 'activation');
+      await startAgent(activated, 'activation', generation);
       return snapshot();
     } catch (error) {
+      if (!ownsLifecycle(generation)) return snapshot();
       if (previous) {
         try {
-          await startAgent(await nasService.resolve(previous), 'activation');
+          const resolved = await nasService.resolve(previous);
+          if (!ownsLifecycle(generation)) return snapshot();
+          await startAgent(resolved, 'activation', generation);
         } catch (restartError) {
+          if (!ownsLifecycle(generation)) return snapshot();
           markDisconnected(restartError, previous);
         }
       } else {
@@ -77,11 +98,18 @@ function createNasRuntime({
     }
   }
 
-  async function retry() {
-    if (stopped) return snapshot();
+  function retry() {
+    if (stopped) return Promise.resolve(snapshot());
     const trigger = state.state === 'disconnected' ? 'reconnect' : 'activation';
     invalidateScheduledRetry();
-    if (!await stopAgentForReplacement()) {
+    return runLifecycleOperation((generation) => retryLocked(trigger, generation));
+  }
+
+  async function retryLocked(trigger, generation) {
+    if (!ownsLifecycle(generation)) return snapshot();
+    const quiesced = await stopAgentForReplacement();
+    if (!ownsLifecycle(generation)) return snapshot();
+    if (!quiesced) {
       const error = replacementQuiescenceError();
       markReplacementDeferred(error, state.configuration);
       throw error;
@@ -94,18 +122,23 @@ function createNasRuntime({
     }
     state = snapshotValue('validating', configuration);
     try {
-      await startAgent(await nasService.resolve(configuration), trigger);
+      const resolved = await nasService.resolve(configuration);
+      if (!ownsLifecycle(generation)) return snapshot();
+      await startAgent(resolved, trigger, generation);
       return snapshot();
     } catch (error) {
+      if (!ownsLifecycle(generation)) return snapshot();
       markDisconnected(error, configuration);
       throw error;
     }
   }
 
-  async function startAgent(selectedTarget, trigger) {
+  async function startAgent(selectedTarget, trigger, lifecycle) {
+    if (!ownsLifecycle(lifecycle)) return false;
     invalidateScheduledRetry();
     const paths = pathsFactory({ homeDir, target: selectedTarget });
     const initialStatus = await statusLoader(paths.localStatusPath);
+    if (!ownsLifecycle(lifecycle)) return false;
     cachedStatus = initialStatus ? { ...initialStatus } : null;
     agentGeneration += 1;
     const generation = agentGeneration;
@@ -136,11 +169,33 @@ function createNasRuntime({
     agent = created;
     if (typeof created.startPolling === 'function') created.startPolling(pollInterval);
     else if (typeof created.start === 'function') await created.start();
+    if (!ownsLifecycle(lifecycle)) {
+      if (agent === created) {
+        agent = null;
+        target = null;
+      }
+      created.stop?.();
+      return false;
+    }
     if (typeof created.requestImmediateScan === 'function') {
       void Promise.resolve(created.requestImmediateScan(trigger)).catch(() => {});
     } else if (typeof created.performOneShotScan === 'function') {
       void Promise.resolve(created.performOneShotScan()).catch(() => {});
     }
+    return true;
+  }
+
+  function runLifecycleOperation(operation) {
+    lifecycleGeneration += 1;
+    const generation = lifecycleGeneration;
+    const run = () => operation(generation);
+    const result = lifecycleTail.then(run, run);
+    lifecycleTail = result.catch(() => {});
+    return result;
+  }
+
+  function ownsLifecycle(generation) {
+    return !stopped && generation === lifecycleGeneration;
   }
 
   async function stopAgentForReplacement() {
@@ -201,6 +256,7 @@ function createNasRuntime({
 
   function stop() {
     stopped = true;
+    lifecycleGeneration += 1;
     invalidateScheduledRetry();
     stopAgentImmediately();
   }

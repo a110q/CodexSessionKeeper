@@ -5,7 +5,11 @@ const path = require('node:path');
 
 const { CursorStore } = require('./cursor-store');
 const { replaceFileDurably } = require('./durable-write');
-const { BackupIntegrityAuditor } = require('./integrity-auditor');
+const {
+  BackupIntegrityAuditor,
+  dailyOffsetSeconds,
+  overdueWakeDelaySeconds,
+} = require('./integrity-auditor');
 const { AGENT_VERSION, MANIFEST_VERSION } = require('./models');
 const { loadOrCreateManifest, saveManifest } = require('./manifest-store');
 const { sessionIdFromPath } = require('./session-identity');
@@ -17,6 +21,7 @@ const {
 } = require('./session-backup-streamer');
 
 const ACTIVE_STATUS = 'active';
+const AUDIT_INTERVAL_MS = 86400 * 1000;
 
 class BackupAgent {
   constructor({
@@ -28,7 +33,11 @@ class BackupAgent {
     onProgress = null,
     onStatus = null,
     instrumentation = {},
+    deviceId = null,
     integrityAuditorFactory = (auditorPaths) => new BackupIntegrityAuditor({ paths: auditorPaths }),
+    auditDelayProvider = auditDelayMilliseconds,
+    auditTimerScheduler = setTimeout,
+    cancelAuditTimer = clearTimeout,
     scheduleInterval = setInterval,
     cancelInterval = clearInterval,
   } = {}) {
@@ -41,10 +50,15 @@ class BackupAgent {
     this.validateTarget = validateTarget;
     this.fileCommitter = fileCommitter;
     this.cachedStatus = initialStatus ? { ...initialStatus } : null;
+    this.auditLastCompletedAt = initialStatus?.lastAuditAt ?? null;
     this.onProgress = onProgress;
     this.onStatus = onStatus;
     this.instrumentation = instrumentation;
+    this.deviceId = deviceId;
     this.integrityAuditorFactory = integrityAuditorFactory;
+    this.auditDelayProvider = auditDelayProvider;
+    this.auditTimerScheduler = auditTimerScheduler;
+    this.cancelAuditTimer = cancelAuditTimer;
     this.scheduleInterval = scheduleInterval;
     this.cancelInterval = cancelInterval;
     this.pollingTimer = null;
@@ -55,6 +69,8 @@ class BackupAgent {
     this.auditPromise = null;
     this.auditScanDeferred = null;
     this.auditInterruptionEpoch = 0;
+    this.auditTimer = null;
+    this.auditTimerGeneration = 0;
     this.startupOrphanCleanupComplete = false;
     this.stopped = false;
   }
@@ -88,6 +104,7 @@ class BackupAgent {
     this.stopped = true;
     this.scanQueued = false;
     this.requestAuditInterruption();
+    this.stopAuditTimer();
     this.stopPolling();
   }
 
@@ -112,7 +129,12 @@ class BackupAgent {
   requestImmediateScan(trigger) {
     if (this.stopped) return Promise.resolve(null);
     this.instrumentation.scanRequested?.(trigger);
-    return this.performOneShotScan();
+    const scan = this.performOneShotScan();
+    return scan.finally(() => {
+      if (this.stopped) return;
+      if (trigger === 'wake') this.scheduleAudit(true);
+      else this.ensureAuditScheduled();
+    });
   }
 
   async performOneShotScan() {
@@ -140,12 +162,21 @@ class BackupAgent {
     }
   }
 
-  async performIntegrityAuditIfDue(deviceId) {
-    if (this.stopped) return interruptedAuditOutcome();
-    await this.performOneShotScan();
+  async performIntegrityAuditIfDue(deviceId, scheduledBaselineEpoch = null) {
     if (this.stopped) return interruptedAuditOutcome();
     if (this.auditPromise) return this.auditPromise;
-    const baselineEpoch = this.auditInterruptionEpoch;
+    let baselineEpoch = scheduledBaselineEpoch;
+    if (baselineEpoch === null) {
+      await this.performOneShotScan();
+      baselineEpoch = this.auditInterruptionEpoch;
+    } else {
+      if (baselineEpoch !== this.auditInterruptionEpoch) return interruptedAuditOutcome();
+      await this.startOneShotScan();
+    }
+    if (this.stopped || baselineEpoch !== this.auditInterruptionEpoch) {
+      return interruptedAuditOutcome();
+    }
+    if (this.auditPromise) return this.auditPromise;
     this.auditPromise = this.performIntegrityAuditLocked(deviceId, baselineEpoch);
     try {
       return await this.auditPromise;
@@ -158,6 +189,57 @@ class BackupAgent {
         else this.startOneShotScan().then(deferred.resolve, deferred.reject);
       }
     }
+  }
+
+  ensureAuditScheduled() {
+    if (this.stopped || !this.deviceId || this.auditTimer || this.auditPromise) return;
+    this.scheduleAudit(false);
+  }
+
+  scheduleAudit(replacingExisting) {
+    if (this.stopped || !this.deviceId) return;
+    if (!replacingExisting && this.auditTimer) return;
+    const previousTimer = this.auditTimer;
+    this.auditTimer = null;
+    this.auditTimerGeneration += 1;
+    const generation = this.auditTimerGeneration;
+    const baselineEpoch = this.auditInterruptionEpoch;
+    const delay = normalizedTimerDelay(this.auditDelayProvider(
+      this.now(),
+      this.auditLastCompletedAt,
+      this.deviceId,
+    ));
+    const action = () => {
+      const work = this.runScheduledAudit(generation, baselineEpoch);
+      void work.catch(() => {});
+      return work;
+    };
+    const timer = this.auditTimerScheduler(action, delay);
+    this.auditTimer = timer;
+    timer?.unref?.();
+    if (previousTimer) this.cancelAuditTimer(previousTimer);
+  }
+
+  async runScheduledAudit(generation, baselineEpoch) {
+    if (this.stopped || generation !== this.auditTimerGeneration) return null;
+    this.auditTimer = null;
+    try {
+      this.instrumentation.auditWillStart?.();
+      const outcome = await this.performIntegrityAuditIfDue(this.deviceId, baselineEpoch);
+      this.instrumentation.auditDidFinish?.(outcome);
+      return outcome;
+    } finally {
+      if (!this.stopped && generation === this.auditTimerGeneration) {
+        this.scheduleAudit(true);
+      }
+    }
+  }
+
+  stopAuditTimer() {
+    this.auditTimerGeneration += 1;
+    const timer = this.auditTimer;
+    this.auditTimer = null;
+    if (timer) this.cancelAuditTimer(timer);
   }
 
   async performIntegrityAuditLocked(deviceId, baselineEpoch) {
@@ -321,6 +403,7 @@ class BackupAgent {
       await replaceFileDurably(this.paths.pendingSourcesPath, jsonPayload({ pending: [] }));
       if (scanErrors.length === 0) {
         await integrityAuditor.recordInitialSeedCompleted(scanDate);
+        this.auditLastCompletedAt ??= scanDate.toISOString();
       }
       return manifest;
     } finally {
@@ -608,6 +691,7 @@ class BackupAgent {
   publishStatus(status) {
     const published = JSON.parse(JSON.stringify(status));
     this.cachedStatus = published;
+    this.auditLastCompletedAt = published.lastAuditAt ?? this.auditLastCompletedAt;
     this.onStatus?.({ ...published });
   }
 
@@ -867,7 +951,35 @@ function interruptedAuditOutcome() {
   return { outcome: 'interrupted', checked: 0, repaired: 0 };
 }
 
+function auditDelayMilliseconds(now, lastAuditAt, deviceId) {
+  const current = validDate(now);
+  const lastAudit = lastAuditAt == null ? null : validDate(lastAuditAt);
+  const overdueDelay = overdueWakeDelaySeconds(deviceId) * 1000;
+  if (!lastAudit || current.getTime() - lastAudit.getTime() >= AUDIT_INTERVAL_MS) {
+    return overdueDelay;
+  }
+
+  const startOfUtcDay = Math.floor(current.getTime() / AUDIT_INTERVAL_MS) * AUDIT_INTERVAL_MS;
+  const earliestAllowed = lastAudit.getTime() + AUDIT_INTERVAL_MS;
+  let candidate = startOfUtcDay + (dailyOffsetSeconds(deviceId) * 1000);
+  while (candidate <= current.getTime() || candidate < earliestAllowed) {
+    candidate += AUDIT_INTERVAL_MS;
+  }
+  return candidate - current.getTime();
+}
+
+function validDate(value) {
+  const date = value instanceof Date ? new Date(value) : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error(`Invalid audit date: ${String(value)}`);
+  return date;
+}
+
+function normalizedTimerDelay(value) {
+  return Math.max(0, Number.isFinite(Number(value)) ? Number(value) : 0);
+}
+
 module.exports = {
   BackupAgent,
+  auditDelayMilliseconds,
   createFileCommitter,
 };
