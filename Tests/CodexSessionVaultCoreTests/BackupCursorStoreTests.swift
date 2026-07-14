@@ -31,14 +31,26 @@ func bulkLoadAndUpsertRoundTrip() throws {
 func bulkOperationsInvokeSQLiteOnceRegardlessOfRowCount() throws {
     let tempDirectory = try makeTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: tempDirectory) }
-    let readSpy = SQLiteRunnerSpy(output: "[]")
+    let readSpy = SQLiteRunnerSpy(
+        output: """
+        [
+          {"session_id":"one","source_path":"/tmp/会话 one.jsonl","backup_path":"one.jsonl","last_byte_offset":10,"last_source_size":11,"last_source_modified_at":1,"line_count":1,"pending_partial_line":"","status":"backedUp","last_error":null,"updated_at":1},
+          {"session_id":"two","source_path":"/tmp/o'ne.jsonl","backup_path":"two.jsonl","last_byte_offset":20,"last_source_size":21,"last_source_modified_at":2,"line_count":2,"pending_partial_line":"","status":"backedUp","last_error":null,"updated_at":2},
+          {"session_id":"three","source_path":"/tmp/space three.jsonl","backup_path":"three.jsonl","last_byte_offset":30,"last_source_size":31,"last_source_modified_at":3,"line_count":3,"pending_partial_line":"","status":"backedUp","last_error":null,"updated_at":3}
+        ]
+        """
+    )
     let readStore = BackupCursorStore(
         databaseURL: tempDirectory.appendingPathComponent("read.sqlite"),
         sqliteRunner: readSpy.run
     )
 
-    _ = try readStore.loadAll()
+    let rows = try readStore.loadAll()
 
+    #expect(rows.count == 3)
+    #expect(rows["/tmp/会话 one.jsonl"]?.lastByteOffset == 10)
+    #expect(rows["/tmp/o'ne.jsonl"]?.lastByteOffset == 20)
+    #expect(rows["/tmp/space three.jsonl"]?.lastByteOffset == 30)
     #expect(readSpy.invocations.count == 1)
 
     let writeSpy = SQLiteRunnerSpy(output: "")
