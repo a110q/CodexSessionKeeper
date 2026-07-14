@@ -1452,6 +1452,87 @@ test('blocked initial seed does not initialize audit completion', async (t) => {
   assert.equal(JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8')).status, 'error');
 });
 
+for (const publication of [
+  ['remote status', (paths) => paths.remoteStatusPath],
+  ['local status', (paths) => paths.localStatusPath],
+  ['pending sources', (paths) => paths.pendingSourcesPath],
+  ['audit state', (paths) => paths.auditStatePath],
+]) {
+  test(`failed initial ${publication[0]} publication does not record seed completion and retry seeds once`, async (t) => {
+    const { paths } = await makeTestPaths(t);
+    const sourcePath = path.join(paths.codexRoot, 'sessions', `failed-${publication[0].replace(' ', '-')}.jsonl`);
+    await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: publication[0] })]);
+    const failedAt = new Date('2026-07-14T04:05:06.000Z');
+    const retryAt = new Date('2026-07-14T04:06:06.000Z');
+    let currentDate = failedAt;
+    const agent = new BackupAgent({ paths, now: () => currentDate });
+    const failedPath = publication[1](paths);
+    const originalRename = fs.rename;
+    let injectFailure = true;
+    fs.rename = async (source, destination, ...args) => {
+      if (injectFailure && path.resolve(String(destination)) === path.resolve(failedPath)) {
+        throw new Error(`injected ${publication[0]} publication failure`);
+      }
+      return originalRename.call(fs, source, destination, ...args);
+    };
+
+    try {
+      await assert.rejects(
+        agent.performOneShotScan(),
+        new RegExp(`injected ${publication[0]} publication failure`),
+      );
+      assert.equal(await fileExists(paths.auditStatePath), false);
+      if (publication[0] === 'audit state') {
+        assert.equal(await fileExists(paths.remoteStatusPath), true);
+        assert.equal(await fileExists(paths.localStatusPath), true);
+        assert.equal(await fileExists(paths.pendingSourcesPath), true);
+        for (const statusPath of [paths.remoteStatusPath, paths.localStatusPath]) {
+          const status = JSON.parse(await fs.readFile(statusPath, 'utf8'));
+          assert.notEqual(status.lastAuditResult, 'seeded');
+          assert.notEqual(status.lastAuditAt, failedAt.toISOString());
+        }
+      }
+
+      injectFailure = false;
+      currentDate = retryAt;
+      await agent.performOneShotScan();
+      const seeded = JSON.parse(await fs.readFile(paths.auditStatePath, 'utf8'));
+      assert.equal(seeded.lastCompletedAt, retryAt.toISOString());
+      assert.equal(seeded.lastResult, 'seeded');
+
+      currentDate = new Date(retryAt.getTime() + 60_000);
+      await agent.performOneShotScan();
+      assert.deepEqual(JSON.parse(await fs.readFile(paths.auditStatePath, 'utf8')), seeded);
+      for (const statusPath of [paths.remoteStatusPath, paths.localStatusPath]) {
+        const status = JSON.parse(await fs.readFile(statusPath, 'utf8'));
+        assert.equal(status.lastAuditAt, retryAt.toISOString());
+        assert.equal(status.lastAuditResult, 'seeded');
+      }
+    } finally {
+      fs.rename = originalRename;
+    }
+  });
+}
+
+test('incremental polling requests startup orphan cleanup only once per agent', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const cleanupRequests = [];
+  const integrityAuditor = {
+    recoverPendingRepairIfNeeded: async ({ cleanupOrphans }) => cleanupRequests.push(cleanupOrphans),
+    recordInitialSeedCompleted: async () => {},
+  };
+  const agent = new BackupAgent({
+    paths,
+    integrityAuditorFactory: () => integrityAuditor,
+  });
+
+  await agent.performOneShotScan();
+  await agent.performOneShotScan();
+  await agent.performOneShotScan();
+
+  assert.deepEqual(cleanupRequests, [true, false, false]);
+});
+
 test('integrity audit runs only after incremental catch-up', async (t) => {
   const { paths } = await makeTestPaths(t);
   const now = new Date('2026-07-14T04:05:06.000Z');

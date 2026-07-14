@@ -12,6 +12,7 @@ const {
   BackupIntegrityAuditor,
   dailyOffsetSeconds,
   overdueWakeDelaySeconds,
+  validateWindowsSourceNamespace,
 } = require('../../src/backup/integrity-auditor');
 const { backupPaths } = require('../../src/backup/paths');
 
@@ -456,6 +457,118 @@ test('interruption during installed verification rolls back from verified quaran
   assert.equal((await fs.readdir(path.dirname(fixture.targetPath))).some((name) => name.includes('.repair-')), false);
 });
 
+test('quarantine rename is parent-synced before the prepared repair journal advances', async (t) => {
+  const fixture = await IntegrityFixture.create(t, { corrupted: true });
+  const quarantineSessionRoot = path.join(fixture.paths.repairQuarantineRoot, fixture.sessionId);
+  let observedQuarantineSync = false;
+  fixture.auditor = fixture.makeAuditor({
+    directorySync: async (directory) => {
+      if (directory !== quarantineSessionRoot) return;
+      observedQuarantineSync = true;
+      assert.equal(await exists(fixture.pendingRepairPath), false);
+    },
+    instrumentation: {
+      checkpoint: (value) => {
+        if (value === 'beforePreparedRepairJournalFlush') {
+          assert.equal(observedQuarantineSync, true);
+        }
+      },
+    },
+  });
+
+  assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 1 });
+  assert.equal(observedQuarantineSync, true);
+});
+
+test('unsupported quarantine parent sync preserves safety and allows repair', async (t) => {
+  const fixture = await IntegrityFixture.create(t, { corrupted: true });
+  const quarantineSessionRoot = path.join(fixture.paths.repairQuarantineRoot, fixture.sessionId);
+  let attempted = false;
+  fixture.auditor = fixture.makeAuditor({
+    directorySync: async (directory) => {
+      if (directory !== quarantineSessionRoot) return;
+      attempted = true;
+      const error = new Error('directory fsync is unsupported');
+      error.code = 'ENOTSUP';
+      throw error;
+    },
+  });
+
+  assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 1 });
+  assert.equal(attempted, true);
+  assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.committed);
+  assert.equal(await exists(fixture.pendingRepairPath), false);
+});
+
+test('quarantine parent sync I/O failure leaves formal bytes and WAL untouched', async (t) => {
+  const fixture = await IntegrityFixture.create(t, { corrupted: true });
+  const quarantineSessionRoot = path.join(fixture.paths.repairQuarantineRoot, fixture.sessionId);
+  fixture.auditor = fixture.makeAuditor({
+    directorySync: async (directory) => {
+      if (directory !== quarantineSessionRoot) return;
+      const error = new Error('injected quarantine directory sync failure');
+      error.code = 'EIO';
+      throw error;
+    },
+  });
+
+  await assert.rejects(fixture.run(), /injected quarantine directory sync failure/);
+  assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.originalNASData);
+  assert.equal(await exists(fixture.pendingRepairPath), false);
+  assert.equal((await fixture.quarantineCopies()).length, 1);
+});
+
+test('rollback rename is parent-synced before the repair journal is removed', async (t) => {
+  const fixture = await IntegrityFixture.create(t, { corrupted: true });
+  const targetParent = path.dirname(fixture.targetPath);
+  let targetParentSyncs = 0;
+  fixture.auditor = fixture.makeAuditor({
+    directorySync: async (directory) => {
+      if (directory !== targetParent) return;
+      targetParentSyncs += 1;
+      if (targetParentSyncs === 2) {
+        assert.equal(await exists(fixture.pendingRepairPath), true);
+      }
+    },
+    instrumentation: {
+      checkpoint: (value) => {
+        if (value === 'beforePostReplaceVerification') throw new Error('force verified rollback');
+      },
+    },
+  });
+
+  await assert.rejects(fixture.run(), /force verified rollback/);
+  assert.equal(targetParentSyncs, 2);
+  assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.originalNASData);
+  assert.equal(await exists(fixture.pendingRepairPath), false);
+});
+
+test('rollback parent sync I/O failure preserves the repair journal for recovery', async (t) => {
+  const fixture = await IntegrityFixture.create(t, { corrupted: true });
+  const targetParent = path.dirname(fixture.targetPath);
+  let targetParentSyncs = 0;
+  fixture.auditor = fixture.makeAuditor({
+    directorySync: async (directory) => {
+      if (directory !== targetParent) return;
+      targetParentSyncs += 1;
+      if (targetParentSyncs !== 2) return;
+      const error = new Error('injected rollback directory sync failure');
+      error.code = 'EIO';
+      throw error;
+    },
+    instrumentation: {
+      checkpoint: (value) => {
+        if (value === 'beforePostReplaceVerification') throw new Error('force rollback');
+      },
+    },
+  });
+
+  await assert.rejects(fixture.run(), /rollback failed/);
+  assert.equal(targetParentSyncs, 2);
+  assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.originalNASData);
+  assert.equal(await exists(fixture.pendingRepairPath), true);
+});
+
 test('successful repair quarantines old bytes before replacement and commits accounting', async (t) => {
   const order = [];
   const fixture = await IntegrityFixture.create(t, {
@@ -715,6 +828,42 @@ for (const unsafeBackupPath of [
   });
 }
 
+test('Windows source namespace validation allows a normal absolute drive path', () => {
+  const sourcePath = 'C:\\Users\\Ada\\.codex\\sessions\\session-a.jsonl';
+
+  assert.equal(
+    validateWindowsSourceNamespace(sourcePath, { pathImpl: path.win32 }),
+    sourcePath,
+  );
+});
+
+for (const unsafeSourcePath of [
+  '\\\\server\\share\\sessions\\session-a.jsonl',
+  '\\\\?\\C:\\Users\\Ada\\.codex\\sessions\\session-a.jsonl',
+  '\\\\.\\PhysicalDrive0',
+  '\\??\\C:\\Users\\Ada\\.codex\\sessions\\session-a.jsonl',
+  'C:\\Users\\Ada\\.codex\\sessions\\session-a.jsonl:alternate',
+]) {
+  test(`Windows source namespace validation rejects ${JSON.stringify(unsafeSourcePath)}`, () => {
+    assert.throws(
+      () => validateWindowsSourceNamespace(unsafeSourcePath, { pathImpl: path.win32 }),
+      /unsafe Windows source namespace/i,
+    );
+  });
+
+  test(`unsafe Windows source ${JSON.stringify(unsafeSourcePath)} is rejected before local source trust`, async (t) => {
+    const fixture = await IntegrityFixture.create(t, { corrupted: true });
+    fixture.cursor = fixture.makeCursor({ sourcePath: unsafeSourcePath });
+    fixture.cursors = new Map([[unsafeSourcePath, fixture.cursor]]);
+    const manifest = await fixture.loadManifest();
+    manifest.sessions[fixture.sessionId].sourcePath = unsafeSourcePath;
+    await fixture.writeManifest(manifest);
+
+    await assert.rejects(fixture.run(), /unsafe Windows source namespace/i);
+    assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.originalNASData);
+  });
+}
+
 test('junction or symlink escape in the NAS target path is rejected', async (t) => {
   const fixture = await IntegrityFixture.create(t, { corrupted: true });
   const outside = path.join(fixture.root, 'outside');
@@ -825,6 +974,129 @@ for (const targetState of ['missing', 'unknown']) {
     assert.equal(await exists(fixture.pendingRepairPath), false);
   });
 }
+
+test('recovery startup removes only exact owned orphan temps from trusted formal session trees', async (t) => {
+  const fixture = await IntegrityFixture.create(t);
+  const uuid = '00000000-0000-0000-0000-000000000001';
+  const archivedDirectory = path.join(fixture.paths.archivedSessionsRoot, '2026', '07', '14');
+  await fs.mkdir(archivedDirectory, { recursive: true });
+  const owned = [
+    path.join(fixture.paths.sessionsRoot, `.session-a.jsonl.repair-${uuid}`),
+    path.join(fixture.paths.sessionsRoot, '.session-a.jsonl.tmp-123-456-deadbeef'),
+    path.join(fixture.paths.sessionsRoot, `..session-a.jsonl.repair-${uuid}.tmp-123-456-deadbeef`),
+    path.join(archivedDirectory, `.archived.jsonl.repair-${uuid}`),
+    path.join(archivedDirectory, '.archived.jsonl.tmp-123-456-deadbeef'),
+  ];
+  for (const filePath of owned) await fs.writeFile(filePath, 'orphan');
+
+  const unrelated = [
+    path.join(fixture.paths.sessionsRoot, '.session-a.jsonl.repair-not-a-uuid'),
+    path.join(fixture.paths.sessionsRoot, '.session-a.jsonl.tmp-123-not-a-time-deadbeef'),
+    path.join(fixture.paths.sessionsRoot, '.notes.tmp-123-456-deadbeef'),
+  ];
+  for (const filePath of unrelated) await fs.writeFile(filePath, 'keep');
+  const outsideDirectory = path.join(fixture.root, 'outside-orphan-cleanup');
+  await fs.mkdir(outsideDirectory);
+  const outsideFile = path.join(outsideDirectory, '.outside.jsonl.tmp-123-456-deadbeef');
+  const linkedOutsideFile = path.join(outsideDirectory, 'linked-target');
+  await fs.writeFile(outsideFile, 'outside');
+  await fs.writeFile(linkedOutsideFile, 'linked');
+  const linkedOwnedName = path.join(fixture.paths.sessionsRoot, '.linked.jsonl.tmp-123-456-deadbeef');
+  await fs.symlink(linkedOutsideFile, linkedOwnedName);
+  const linkedDirectory = path.join(fixture.paths.sessionsRoot, 'linked-directory');
+  await fs.symlink(outsideDirectory, linkedDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+
+  await fixture.makeAuditor().recoverPendingRepairIfNeeded({ now: fixture.now });
+
+  for (const filePath of owned) assert.equal(await exists(filePath), false);
+  for (const filePath of unrelated) assert.equal(await exists(filePath), true);
+  assert.equal(await exists(fixture.targetPath), true);
+  assert.equal(await exists(linkedOwnedName), true);
+  assert.equal(await exists(linkedDirectory), true);
+  assert.equal(await fs.readFile(linkedOutsideFile, 'utf8'), 'linked');
+  assert.equal(await fs.readFile(outsideFile, 'utf8'), 'outside');
+});
+
+test('not-due audit startup still removes owned orphan temps', async (t) => {
+  const fixture = await IntegrityFixture.create(t);
+  const orphan = path.join(
+    fixture.paths.sessionsRoot,
+    '.session-a.jsonl.repair-00000000-0000-0000-0000-000000000001',
+  );
+  await fs.writeFile(orphan, 'orphan');
+  await fixture.writeAuditState({
+    lastCompletedAt: fixture.now.toISOString(),
+    lastResult: 'completed',
+    repairedCount: 0,
+  });
+
+  assert.deepEqual(await fixture.run(), { outcome: 'not-due', checked: 0, repaired: 0 });
+  assert.equal(await exists(orphan), false);
+});
+
+test('orphan cleanup preserves a temp referenced by the current repair journal', async (t) => {
+  const injected = new Error('leave prepared journal');
+  const fixture = await IntegrityFixture.create(t, {
+    corrupted: true,
+    instrumentation: {
+      checkpoint: (value) => {
+        if (value === 'afterPreparedJournalCommitBeforeFormalReplace') throw injected;
+      },
+    },
+  });
+  await assert.rejects(fixture.run(), injected);
+  const referenced = path.join(
+    fixture.paths.sessionsRoot,
+    '.session-a.jsonl.repair-00000000-0000-0000-0000-000000000001',
+  );
+  const unreferenced = path.join(
+    fixture.paths.sessionsRoot,
+    '.session-a.jsonl.repair-00000000-0000-0000-0000-000000000002',
+  );
+  await fs.writeFile(referenced, 'referenced');
+  await fs.writeFile(unreferenced, 'unreferenced');
+  const pending = await readJson(fixture.pendingRepairPath);
+  pending.repairTemporaryBackupPath = fixture.paths.relativeBackupPath(referenced);
+  await writeJson(fixture.pendingRepairPath, pending);
+
+  await fixture.makeAuditor().cleanupOrphanTemporaryFiles();
+
+  assert.equal(await exists(referenced), true);
+  assert.equal(await exists(unreferenced), false);
+  assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.originalNASData);
+});
+
+test('pending repair is resolved before orphan cleanup starts', async (t) => {
+  const injected = new Error('leave prepared journal');
+  const fixture = await IntegrityFixture.create(t, {
+    corrupted: true,
+    instrumentation: {
+      checkpoint: (value) => {
+        if (value === 'afterPreparedJournalCommitBeforeFormalReplace') throw injected;
+      },
+    },
+  });
+  await assert.rejects(fixture.run(), injected);
+  const orphan = path.join(
+    fixture.paths.sessionsRoot,
+    '.session-a.jsonl.tmp-123-456-deadbeef',
+  );
+  await fs.writeFile(orphan, 'orphan');
+  let observedResolvedJournal = false;
+  const recovered = fixture.makeAuditor({
+    directorySync: async (directory) => {
+      if (directory !== fixture.paths.stateRoot) return;
+      observedResolvedJournal = true;
+      assert.equal(await exists(fixture.pendingRepairPath), false);
+      assert.equal(await exists(orphan), true);
+    },
+  });
+
+  await recovered.recoverPendingRepairIfNeeded({ now: fixture.now });
+
+  assert.equal(observedResolvedJournal, true);
+  assert.equal(await exists(orphan), false);
+});
 
 test('retention expires old copies, caps newest three, and preserves unrelated paths', async (t) => {
   const fixture = await IntegrityFixture.create(t, { cursorsEnabled: false });

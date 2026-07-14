@@ -38,6 +38,7 @@ class BackupIntegrityAuditor {
     paths,
     chunkSize = DEFAULT_CHUNK_SIZE,
     sync = (handle) => handle.sync(),
+    directorySync = syncParentDirectory,
     instrumentation = {},
     cursorStoreFactory = (storePaths) => new CursorStore({ paths: storePaths }),
   } = {}) {
@@ -45,6 +46,13 @@ class BackupIntegrityAuditor {
     this.paths = paths;
     this.chunkSize = normalizeChunkSize(chunkSize);
     this.sync = sync;
+    this.directorySync = async (directory) => {
+      try {
+        await directorySync(directory);
+      } catch (error) {
+        if (!isUnsupportedDirectorySyncError(error)) throw error;
+      }
+    };
     this.instrumentation = instrumentation;
     this.cursorStoreFactory = cursorStoreFactory;
   }
@@ -60,6 +68,8 @@ class BackupIntegrityAuditor {
     let state = await this.loadAuditState();
     const pendingRepair = await this.loadPendingRepair();
     if (!pendingRepair && completedWithinInterval(state, auditDate)) {
+      await this.validateBackupRoot();
+      await this.cleanupOrphanTemporaryFiles();
       return outcome('not-due');
     }
 
@@ -70,6 +80,7 @@ class BackupIntegrityAuditor {
       ({ manifest, state } = await this.resolvePendingRepair({ pendingRepair, manifest, state }));
       await this.cleanupQuarantine(auditDate);
     }
+    await this.cleanupOrphanTemporaryFiles();
     if (completedWithinInterval(state, auditDate)) return outcome('not-due');
 
     const bufferedHashes = new Map();
@@ -143,15 +154,17 @@ class BackupIntegrityAuditor {
     });
   }
 
-  async recoverPendingRepairIfNeeded({ now } = {}) {
+  async recoverPendingRepairIfNeeded({ now, cleanupOrphans = true } = {}) {
     const pendingRepair = await this.loadPendingRepair();
-    if (!pendingRepair) return;
     const auditDate = dateValue(now);
     await this.validateBackupRoot();
-    const manifest = loadOrCreateManifest(this.paths, auditDate);
-    const state = await this.loadAuditState();
-    await this.resolvePendingRepair({ pendingRepair, manifest, state });
-    await this.cleanupQuarantine(auditDate);
+    if (pendingRepair) {
+      const manifest = loadOrCreateManifest(this.paths, auditDate);
+      const state = await this.loadAuditState();
+      await this.resolvePendingRepair({ pendingRepair, manifest, state });
+      await this.cleanupQuarantine(auditDate);
+    }
+    if (pendingRepair || cleanupOrphans) await this.cleanupOrphanTemporaryFiles();
   }
 
   async validateBackupRoot() {
@@ -176,6 +189,7 @@ class BackupIntegrityAuditor {
       throw new Error(`Integrity audit rejected unsafe cursor metadata: ${cursor.sourcePath}`);
     }
 
+    validateWindowsSourceNamespace(cursor.sourcePath);
     const relativeBackupPath = validateRelativeBackupPath(cursor.backupPath);
     if (!['sessions', 'archived_sessions'].includes(relativeBackupPath.split('/')[0])) {
       throw new Error(`Integrity audit rejected unsafe cursor metadata: ${cursor.backupPath}`);
@@ -292,6 +306,8 @@ class BackupIntegrityAuditor {
 
     const quarantineBackupPath = this.paths.relativeBackupPath(quarantine.filePath);
     if (!quarantineBackupPath) throw new Error(`Unsafe quarantine path: ${quarantine.filePath}`);
+    const repairTemporaryBackupPath = this.paths.relativeBackupPath(repairTemporary);
+    if (!repairTemporaryBackupPath) throw new Error(`Unsafe repair temporary path: ${repairTemporary}`);
     let pendingRepair = {
       version: INTEGRITY_REPAIR_JOURNAL_VERSION,
       phase: 'prepared',
@@ -303,6 +319,7 @@ class BackupIntegrityAuditor {
       originalByteCount: quarantine.byteCount,
       originalContentHash: quarantine.hash,
       quarantineBackupPath,
+      repairTemporaryBackupPath,
       repairedAt: now.toISOString(),
       repairedCount: Number(state.repairedCount || 0) + 1,
     };
@@ -315,7 +332,7 @@ class BackupIntegrityAuditor {
       }
 
       await fsp.rename(repairTemporary, revalidated.targetPath);
-      await syncParentDirectory(path.dirname(revalidated.targetPath));
+      await this.directorySync(path.dirname(revalidated.targetPath));
       await this.checkpoint('afterFormalReplaceBeforeInstalledJournalCommit');
     } catch (error) {
       await fsp.rm(repairTemporary, { force: true }).catch(() => {});
@@ -380,6 +397,7 @@ class BackupIntegrityAuditor {
     } finally {
       await sourceHandle.close().catch(() => {});
     }
+    await this.directorySync(path.dirname(filePath));
     const quarantine = { filePath, byteCount: stats.size, hash: digest.digest('hex') };
     let verificationError;
     try {
@@ -414,6 +432,7 @@ class BackupIntegrityAuditor {
     } finally {
       await sourceHandle.close().catch(() => {});
     }
+    await this.directorySync(path.dirname(targetPath));
     await this.verifyFile(targetPath, {
       expectedByteCount: quarantine.byteCount,
       expectedHash: quarantine.hash,
@@ -617,7 +636,7 @@ class BackupIntegrityAuditor {
     assertSafeDestinationPath(directory, root);
     try {
       await fsp.mkdir(directory);
-      await syncParentDirectory(path.dirname(directory));
+      await this.directorySync(path.dirname(directory));
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
     }
@@ -666,6 +685,68 @@ class BackupIntegrityAuditor {
     }
   }
 
+  async cleanupOrphanTemporaryFiles() {
+    const protectedPaths = new Set();
+    const pendingRepair = await this.loadPendingRepair();
+    if (pendingRepair) {
+      for (const [relativePath, allowedRoots] of [
+        [pendingRepair.backupPath, [this.paths.sessionsRoot, this.paths.archivedSessionsRoot]],
+        [pendingRepair.quarantineBackupPath, [this.paths.repairQuarantineRoot]],
+        [pendingRepair.repairTemporaryBackupPath, [this.paths.sessionsRoot, this.paths.archivedSessionsRoot]],
+      ]) {
+        if (!relativePath) continue;
+        protectedPaths.add(pathKey(this.trustedPendingPath(relativePath, allowedRoots)));
+      }
+    }
+
+    for (const root of [this.paths.sessionsRoot, this.paths.archivedSessionsRoot]) {
+      let stats;
+      try {
+        stats = await fsp.lstat(root);
+      } catch (error) {
+        if (error.code === 'ENOENT') continue;
+        throw error;
+      }
+      if (!stats.isDirectory() || stats.isSymbolicLink()) {
+        throw new Error(`Unsafe formal session root: ${root}`);
+      }
+      assertSafeSourcePath(root, this.paths.backupRoot);
+      await this.cleanupOrphanTemporaryFilesInDirectory(root, root, protectedPaths);
+    }
+  }
+
+  async cleanupOrphanTemporaryFilesInDirectory(directory, root, protectedPaths) {
+    let removedEntry = false;
+    for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      const ownedTemporaryName = isOwnedOrphanTemporaryFilename(entry.name);
+      if (entry.isSymbolicLink() || (entry.isFile() && !ownedTemporaryName)) continue;
+      const stats = await fsp.lstat(entryPath).catch((error) => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (!stats || stats.isSymbolicLink()) continue;
+      if (stats.isDirectory()) {
+        assertSafeSourcePath(entryPath, root);
+        await this.cleanupOrphanTemporaryFilesInDirectory(entryPath, root, protectedPaths);
+        continue;
+      }
+      if (!stats.isFile()
+        || !ownedTemporaryName
+        || protectedPaths.has(pathKey(entryPath))) {
+        continue;
+      }
+      assertSafeSourcePath(entryPath, root);
+      try {
+        await fsp.rm(entryPath);
+        removedEntry = true;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    if (removedEntry) await this.directorySync(directory);
+  }
+
   async loadAuditState() {
     try {
       const state = JSON.parse(await fsp.readFile(this.paths.auditStatePath, 'utf8'));
@@ -706,6 +787,8 @@ class BackupIntegrityAuditor {
       && typeof pending.sourcePath === 'string'
       && typeof pending.backupPath === 'string'
       && typeof pending.quarantineBackupPath === 'string'
+      && (pending.repairTemporaryBackupPath == null
+        || typeof pending.repairTemporaryBackupPath === 'string')
       && Number.isSafeInteger(pending.byteCount) && pending.byteCount >= 0
       && Number.isSafeInteger(pending.originalByteCount) && pending.originalByteCount >= 0
       && isSHA256(pending.contentHash) && isSHA256(pending.originalContentHash)
@@ -714,6 +797,9 @@ class BackupIntegrityAuditor {
     if (!valid) throw new Error(`Integrity audit rejected unsafe repair journal: ${pending.sourcePath || ''}`);
     validateRelativeBackupPath(pending.backupPath);
     validateRelativeBackupPath(pending.quarantineBackupPath);
+    if (pending.repairTemporaryBackupPath) {
+      validateRelativeBackupPath(pending.repairTemporaryBackupPath);
+    }
     return pending;
   }
 
@@ -727,13 +813,13 @@ class BackupIntegrityAuditor {
         await this.sync(handle);
       },
     });
-    await syncParentDirectory(path.dirname(this.pendingRepairPath));
+    await this.directorySync(path.dirname(this.pendingRepairPath));
   }
 
   async removePendingRepair() {
     try {
       await fsp.rm(this.pendingRepairPath);
-      await syncParentDirectory(path.dirname(this.pendingRepairPath));
+      await this.directorySync(path.dirname(this.pendingRepairPath));
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
@@ -850,6 +936,26 @@ function validateRelativeBackupPath(value) {
   return components.join('/');
 }
 
+function validateWindowsSourceNamespace(value, { pathImpl = path.win32 } = {}) {
+  if (typeof value !== 'string' || !value || value.includes('\0')) {
+    throw new Error(`Integrity audit rejected unsafe Windows source namespace: ${String(value)}`);
+  }
+  const windowsSeparators = value.replaceAll('/', '\\');
+  const namespacePath = value.startsWith('\\')
+    || value.startsWith('//')
+    || windowsSeparators.startsWith('\\\\')
+    || windowsSeparators.startsWith('\\??\\');
+  const firstColon = value.indexOf(':');
+  const validDriveColon = firstColon === 1
+    && /^[A-Za-z]:[\\/]/.test(value)
+    && pathImpl.isAbsolute(value)
+    && value.indexOf(':', firstColon + 1) === -1;
+  if (namespacePath || (firstColon !== -1 && !validDriveColon)) {
+    throw new Error(`Integrity audit rejected unsafe Windows source namespace: ${value}`);
+  }
+  return value;
+}
+
 function validateJSONLChunk(chunk, pending, filePath) {
   let combined = pending.length ? Buffer.concat([pending, chunk]) : chunk;
   let start = 0;
@@ -925,6 +1031,18 @@ function isOwnedQuarantineFilename(name, prefix) {
   return Boolean(match);
 }
 
+function isOwnedOrphanTemporaryFilename(name) {
+  const uuid = '[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}';
+  const durableSuffix = '\\.tmp-\\d+-\\d+-[0-9a-f]+';
+  return new RegExp(`^\\.[^/\\\\]+\\.jsonl(?:\\.repair-${uuid}|${durableSuffix})$`, 'i').test(name)
+    || new RegExp(`^\\.\\.[^/\\\\]+\\.jsonl\\.repair-${uuid}${durableSuffix}$`, 'i').test(name);
+}
+
+function pathKey(value) {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
 function isSHA256(value) {
   return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 }
@@ -940,11 +1058,23 @@ async function syncParentDirectory(directory) {
   try {
     handle = await fsp.open(directory, 'r');
     await handle.sync();
-  } catch {
-    // Directory synchronization is not supported by every Windows/SMB stack.
   } finally {
     await handle?.close().catch(() => {});
   }
+}
+
+function isUnsupportedDirectorySyncError(error) {
+  return [
+    'EACCES',
+    'EBADF',
+    'EISDIR',
+    'EINVAL',
+    'ENOSYS',
+    'ENOTSUP',
+    'EOPNOTSUPP',
+    'EPERM',
+    'ERR_METHOD_NOT_IMPLEMENTED',
+  ].includes(error?.code);
 }
 
 function sortedValue(value) {
@@ -964,4 +1094,5 @@ module.exports = {
   BackupIntegrityAuditor,
   dailyOffsetSeconds,
   overdueWakeDelaySeconds,
+  validateWindowsSourceNamespace,
 };

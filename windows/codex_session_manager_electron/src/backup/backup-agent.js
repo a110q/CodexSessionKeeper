@@ -46,6 +46,7 @@ class BackupAgent {
     this.auditPromise = null;
     this.auditScanDeferred = null;
     this.auditInterruptionEpoch = 0;
+    this.startupOrphanCleanupComplete = false;
   }
 
   startPolling(intervalMs = 10000) {
@@ -153,7 +154,11 @@ class BackupAgent {
     await this.ensureRemoteDirectories();
 
     const integrityAuditor = this.integrityAuditorFactory(this.paths);
-    await integrityAuditor.recoverPendingRepairIfNeeded({ now: scanDate });
+    await integrityAuditor.recoverPendingRepairIfNeeded({
+      now: scanDate,
+      cleanupOrphans: !this.startupOrphanCleanupComplete,
+    });
+    this.startupOrphanCleanupComplete = true;
     const manifestExisted = await fileExists(this.paths.manifestPath);
     const cursorStore = new CursorStore({ paths: this.paths });
     await cursorStore.open();
@@ -222,13 +227,13 @@ class BackupAgent {
         await saveManifest(this.paths, manifest);
       }
       await cursorStore.upsertMany(updatedCursors);
-      if (scanErrors.length === 0) {
-        await integrityAuditor.recordInitialSeedCompleted(scanDate);
-      }
 
       const lastError = scanErrors[0] || null;
       await this.writeStatus(manifest, lastError ? 'error' : 'running', lastError, scanDate);
       await replaceFileDurably(this.paths.pendingSourcesPath, jsonPayload({ pending: [] }));
+      if (scanErrors.length === 0) {
+        await integrityAuditor.recordInitialSeedCompleted(scanDate);
+      }
       this.onProgress?.({
         totalFiles: sources.length,
         completedFiles: sources.length,
