@@ -17,12 +17,9 @@ public struct DurableAtomicWriter {
         to destination: URL,
         createParentDirectories: Bool = false
     ) throws {
-        try commit(
-            data,
-            to: destination,
-            createParentDirectories: createParentDirectories,
-            replaceExisting: true
-        )
+        try replace(at: destination, createParentDirectories: createParentDirectories) { handle in
+            try handle.write(contentsOf: data)
+        }
     }
 
     public func writeIfAbsent(
@@ -31,18 +28,36 @@ public struct DurableAtomicWriter {
         createParentDirectories: Bool = false
     ) throws {
         try commit(
-            data,
             to: destination,
+            permissions: nil,
             createParentDirectories: createParentDirectories,
             replaceExisting: false
+        ) { handle in
+            try handle.write(contentsOf: data)
+        }
+    }
+
+    public func replace(
+        at destination: URL,
+        permissions: NSNumber? = nil,
+        createParentDirectories: Bool = false,
+        writer: (FileHandle) throws -> Void
+    ) throws {
+        try commit(
+            to: destination,
+            permissions: permissions,
+            createParentDirectories: createParentDirectories,
+            replaceExisting: true,
+            writer: writer
         )
     }
 
     private func commit(
-        _ data: Data,
         to destination: URL,
+        permissions: NSNumber?,
         createParentDirectories: Bool,
-        replaceExisting: Bool
+        replaceExisting: Bool,
+        writer: (FileHandle) throws -> Void
     ) throws {
         let parent = destination.deletingLastPathComponent().standardizedFileURL
         if createParentDirectories {
@@ -65,7 +80,13 @@ public struct DurableAtomicWriter {
         do {
             let handle = try FileHandle(forWritingTo: temporary)
             do {
-                try handle.write(contentsOf: data)
+                try writer(handle)
+                if let permissions {
+                    try fileManager.setAttributes(
+                        [.posixPermissions: permissions],
+                        ofItemAtPath: temporary.path
+                    )
+                }
                 try synchronize(handle)
                 try handle.close()
             } catch {
@@ -78,9 +99,16 @@ public struct DurableAtomicWriter {
             } else {
                 try fileManager.moveItem(at: temporary, to: destination)
             }
+            synchronizeParentDirectoryIfSupported(parent)
         } catch {
             try? fileManager.removeItem(at: temporary)
             throw error
         }
+    }
+
+    private func synchronizeParentDirectoryIfSupported(_ parent: URL) {
+        guard let handle = try? FileHandle(forReadingFrom: parent) else { return }
+        defer { try? handle.close() }
+        try? handle.synchronize()
     }
 }

@@ -97,8 +97,17 @@ public final class BackupFileCommitter {
         return BackupFileStats(byteCount: Int64(payload.count), lineCount: lines.count)
     }
 
-    public func appendAndSynchronize(lines: [Data], to target: URL, under backupRoot: URL) throws -> BackupFileStats {
-        let targetState = try inspectTarget(target)
+    public func appendAndSynchronize(
+        lines: [Data],
+        to target: URL,
+        under backupRoot: URL,
+        knownTargetByteCount: Int64? = nil
+    ) throws -> BackupFileStats {
+        let targetState = if let knownTargetByteCount {
+            BackupTargetState(exists: true, byteCount: knownTargetByteCount)
+        } else {
+            try inspectTarget(target)
+        }
         guard !lines.isEmpty else {
             return BackupFileStats(byteCount: targetState.byteCount, lineCount: 0)
         }
@@ -161,6 +170,41 @@ public final class BackupFileCommitter {
             createParentDirectories: false
         )
         return BackupFileStats(byteCount: Int64(payload.count), lineCount: lines.count)
+    }
+
+    public func rebuildCompleteLines(
+        from source: URL,
+        through maximumOffset: Int64? = nil,
+        at target: URL,
+        under backupRoot: URL,
+        using streamer: SessionBackupStreamer = SessionBackupStreamer()
+    ) throws -> StreamedBackupResult {
+        try ensureParent(of: target, under: backupRoot)
+        return try streamer.rebuildCompleteLines(
+            source: source,
+            through: maximumOffset,
+            destination: target,
+            atomicWriter: DurableAtomicWriter(
+                fileManager: fileManager,
+                synchronize: synchronize
+            )
+        )
+    }
+
+    func appendCompleteLines(
+        from source: URL,
+        offset: Int64,
+        to target: URL,
+        under backupRoot: URL,
+        using streamer: SessionBackupStreamer
+    ) throws -> StreamedAppendResult {
+        try ensureParent(of: target, under: backupRoot)
+        return try streamer.appendCompleteLines(
+            source: source,
+            from: offset,
+            destination: target,
+            synchronize: synchronize
+        )
     }
 
     public func stats(at target: URL) throws -> BackupFileStats {

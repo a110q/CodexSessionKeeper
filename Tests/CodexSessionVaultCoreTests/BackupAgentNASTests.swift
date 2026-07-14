@@ -45,6 +45,24 @@ struct BackupAgentNASTests {
     }
 
     @Test
+    func errorStatusDoesNotLaunchSecondDiscoveryOrCursorPass() throws {
+        let fixture = try DirectNASBackupFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.writeActiveSession(name: "no-rescan.jsonl", contents: fixture.line("one"))
+        let agent = fixture.makeAgent(targetValidator: BackupTargetValidator {
+            throw DirectNASBackupTestError.injectedTargetFailure
+        })
+
+        #expect(throws: DirectNASBackupTestError.injectedTargetFailure) {
+            try agent.performOneShotScan()
+        }
+
+        #expect(FileManager.default.fileExists(atPath: fixture.paths.cursorDatabaseURL.path) == false)
+        #expect(FileManager.default.fileExists(atPath: fixture.paths.pendingSourcesURL.path) == false)
+        #expect(try fixture.loadLocalStatus().status == .error)
+    }
+
+    @Test
     func failedDataSynchronizeDoesNotAdvanceCursorOrManifest() throws {
         let fixture = try DirectNASBackupFixture()
         defer { fixture.cleanup() }
@@ -166,6 +184,7 @@ struct BackupAgentNASTests {
         let agent = fixture.makeAgent()
         try agent.performOneShotScan()
         try fixture.append(fixture.line("two"), to: source)
+        #expect(try agent.pendingSessionCount() == 1)
         try FileManager.default.removeItem(at: fixture.paths.backupRoot)
 
         #expect(throws: BackupTargetValidationError.self) {

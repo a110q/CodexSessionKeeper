@@ -152,7 +152,7 @@ func inaccessibleExistingBackupFailsClosedWithoutAdvancingMetadata() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
     let sessionID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-    try fixture.writeSession(
+    let sourceURL = try fixture.writeSession(
         named: "\(sessionID).jsonl",
         contents: #"{"role":"user","content":"Steady state"}"# + "\n"
     )
@@ -168,6 +168,7 @@ func inaccessibleExistingBackupFailsClosedWithoutAdvancingMetadata() throws {
     defer {
         try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: backupURL.path)
     }
+    try fixture.append(#"{"role":"assistant","content":"force target access"}"# + "\n", to: sourceURL)
 
     #expect(throws: (any Error).self) {
         try agent.performOneShotScan()
@@ -201,6 +202,200 @@ func steadyStateScanDoesNotRewriteCursor() throws {
 
     let cursorAfterNoOpScan = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
     #expect(cursorAfterNoOpScan == cursorBeforeNoOpScan)
+}
+
+@Test
+func unchangedScanStopsBeforeTargetAccess() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+
+    try fixture.makeAgent().performOneShotScan()
+
+    #expect(fixture.sourceBodyReadCount == 0)
+    #expect(fixture.targetStatCount == 0)
+    #expect(fixture.fullHashCount == 0)
+    #expect(fixture.manifestWriteCount == 0)
+    #expect(fixture.cursorReadBatchCount == 1)
+    #expect(fixture.cursorWriteBatchCount == 0)
+}
+
+@Test
+func unchangedFiveHundredSessionScanUsesOneCursorReadAndNoTargetCalls() throws {
+    let fixture = try BackupAgentFixture.seededSession(count: 500)
+    defer { fixture.cleanup() }
+
+    try fixture.makeAgent().performOneShotScan()
+
+    #expect(fixture.cursorReadBatchCount == 1)
+    #expect(fixture.cursorWriteBatchCount == 0)
+    #expect(fixture.targetStatCount == 0)
+    #expect(fixture.sourceBodyReadCount == 0)
+    #expect(fixture.manifestWriteCount == 0)
+    #expect(fixture.sqliteRunnerInvocationCount == 2)
+}
+
+@Test
+func appendReadsAndVerifiesOnlyNewRangeAndClearsFullHash() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "13131313-1313-1313-1313-131313131313"
+    let firstLine = #"{"role":"user","content":"first"}"# + "\n"
+    let secondLine = #"{"role":"assistant","content":"second"}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: firstLine)
+    try fixture.makeAgent().performOneShotScan()
+    let oldOffset = Int64(Data(firstLine.utf8).count)
+    fixture.resetSpies()
+
+    try fixture.append(secondLine, to: source)
+    let newOffset = oldOffset + Int64(Data(secondLine.utf8).count)
+    try fixture.makeAgent().performOneShotScan()
+
+    #expect(!fixture.sourceBodyReadRanges.isEmpty)
+    #expect(fixture.sourceBodyReadRanges.allSatisfy { $0 == oldOffset..<newOffset })
+    #expect(fixture.targetStatCount == 1)
+    #expect(fixture.fullHashCount == 0)
+    #expect(fixture.manifestWriteCount == 1)
+    #expect(fixture.cursorReadBatchCount == 1)
+    #expect(fixture.cursorWriteBatchCount == 1)
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    #expect(record.contentHash == nil)
+    #expect(record.bytesBackedUp == newOffset)
+}
+
+@Test
+func appendStreamsLargeDeltaWithoutMaterializingTailerLines() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "18181818-1818-1818-1818-181818181818"
+    let firstLine = #"{"role":"user","content":"first"}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: firstLine)
+    let agent = fixture.makeAgent(tailer: SessionTailer(maxReadBytes: 0))
+    try agent.performOneShotScan()
+    let largeLine = #"{"role":"assistant","content":""#
+        + String(repeating: "x", count: 3 * 1_048_576 + 17)
+        + #""}"#
+        + "\n"
+
+    try fixture.append(largeLine, to: source)
+    try agent.performOneShotScan()
+
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    #expect(try Data(contentsOf: target).count == Data((firstLine + largeLine).utf8).count)
+    #expect(record.lineCount == 2)
+}
+
+@Test
+func sameSizeNewMtimeRewriteStreamsRebuild() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "14141414-1414-1414-1414-141414141414"
+    let original = #"{"role":"user","content":"AAAA"}"# + "\n"
+    let replacement = #"{"role":"user","content":"BBBB"}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: original)
+    try fixture.makeAgent().performOneShotScan()
+    fixture.resetSpies()
+    try Data(replacement.utf8).write(to: source)
+    try FileManager.default.setAttributes(
+        [.modificationDate: fixture.now.addingTimeInterval(120)],
+        ofItemAtPath: source.path
+    )
+
+    try fixture.makeAgent().performOneShotScan()
+
+    let sourceSize = Int64(Data(replacement.utf8).count)
+    #expect(fixture.sourceBodyReadRanges == [0..<sourceSize])
+    #expect(fixture.targetStatCount == 1)
+    #expect(fixture.fullHashCount == 0)
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    #expect(try String(contentsOf: target, encoding: .utf8) == replacement)
+    #expect(record.contentHash?.isEmpty == false)
+}
+
+@Test
+func truncationStreamsRebuild() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "15151515-1515-1515-1515-151515151515"
+    let retained = #"{"role":"user","content":"keep"}"# + "\n"
+    let removed = #"{"role":"assistant","content":"remove"}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: retained + removed)
+    try fixture.makeAgent().performOneShotScan()
+    fixture.resetSpies()
+    try Data(retained.utf8).write(to: source)
+    try FileManager.default.setAttributes(
+        [.modificationDate: fixture.now.addingTimeInterval(120)],
+        ofItemAtPath: source.path
+    )
+
+    try fixture.makeAgent().performOneShotScan()
+
+    let retainedSize = Int64(Data(retained.utf8).count)
+    #expect(fixture.sourceBodyReadRanges == [0..<retainedSize])
+    #expect(fixture.targetStatCount == 1)
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    #expect(try String(contentsOf: target, encoding: .utf8) == retained)
+    #expect(record.bytesBackedUp == retainedSize)
+    #expect(record.lineCount == 1)
+}
+
+@Test
+func missingTargetStreamsRebuild() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "16161616-1616-1616-1616-161616161616"
+    let contents = #"{"role":"user","content":"restore target"}"# + "\n"
+    _ = try fixture.writeSession(named: "\(sessionID).jsonl", contents: contents)
+    try fixture.makeAgent().performOneShotScan()
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    try FileManager.default.removeItem(at: target)
+    try FileManager.default.setAttributes(
+        [.modificationDate: fixture.now.addingTimeInterval(120)],
+        ofItemAtPath: fixture.paths.codexRoot
+            .appendingPathComponent("sessions/\(sessionID).jsonl").path
+    )
+    fixture.resetSpies()
+
+    try fixture.makeAgent().performOneShotScan()
+
+    let sourceSize = Int64(Data(contents.utf8).count)
+    #expect(fixture.sourceBodyReadRanges == [0..<sourceSize])
+    #expect(fixture.targetStatCount == 1)
+    #expect(try String(contentsOf: target, encoding: .utf8) == contents)
+}
+
+@Test
+func partialTrailingLineDoesNotAdvanceCommittedOffset() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "17171717-1717-1717-1717-171717171717"
+    let committed = #"{"role":"user","content":"committed"}"# + "\n"
+    let partial = #"{"role":"assistant","content":"partial"}"#
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: committed)
+    try fixture.makeAgent().performOneShotScan()
+    let committedOffset = Int64(Data(committed.utf8).count)
+    fixture.resetSpies()
+
+    try fixture.append(partial, to: source)
+    try fixture.makeAgent().performOneShotScan()
+
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    let cursor = try #require(try cursorStore.cursor(sourcePath: source.path))
+    #expect(cursor.lastByteOffset == committedOffset)
+    #expect(!cursor.pendingPartialLine.isEmpty)
+    #expect(record.bytesBackedUp == committedOffset)
+    #expect(record.lineCount == 1)
+
+    fixture.resetSpies()
+    try fixture.makeAgent().performOneShotScan()
+    #expect(fixture.sourceBodyReadCount == 0)
+    #expect(fixture.targetStatCount == 0)
+    #expect(fixture.cursorWriteBatchCount == 0)
 }
 
 @Test
@@ -562,10 +757,19 @@ func corruptedManifestBackupPathOutsideBackupRootIsRepairedWithoutWritingOutside
 
 }
 
-private struct BackupAgentFixture {
+private final class BackupAgentFixture {
     let root: URL
     let paths: BackupPaths
     let now: Date
+    private(set) var sourceBodyReadRanges: [Range<Int64>] = []
+    private(set) var targetStatCount = 0
+    private(set) var fullHashCount = 0
+    private(set) var manifestWriteCount = 0
+    private(set) var cursorReadBatchCount = 0
+    private(set) var cursorWriteBatchCount = 0
+    private(set) var sqliteRunnerInvocationCount = 0
+
+    var sourceBodyReadCount: Int { sourceBodyReadRanges.count }
 
     init(now: Date = Date(timeIntervalSince1970: 1_783_123_200)) throws {
         self.root = FileManager.default.temporaryDirectory
@@ -588,8 +792,75 @@ private struct BackupAgentFixture {
         try? FileManager.default.removeItem(at: root)
     }
 
-    func makeAgent() -> BackupAgent {
-        BackupAgent(paths: paths, now: { now })
+    static func seededSession(count: Int = 1) throws -> BackupAgentFixture {
+        let fixture = try BackupAgentFixture()
+        for index in 0..<count {
+            let sessionID = String(format: "00000000-0000-0000-0000-%012d", index)
+            try fixture.writeSession(
+                named: "\(sessionID).jsonl",
+                contents: #"{"role":"user","content":"seeded"}"# + "\n"
+            )
+        }
+        try fixture.makeAgent().performOneShotScan()
+        fixture.resetSpies()
+        return fixture
+    }
+
+    func resetSpies() {
+        sourceBodyReadRanges = []
+        targetStatCount = 0
+        fullHashCount = 0
+        manifestWriteCount = 0
+        cursorReadBatchCount = 0
+        cursorWriteBatchCount = 0
+        sqliteRunnerInvocationCount = 0
+    }
+
+    func makeAgent(tailer: SessionTailer = SessionTailer()) -> BackupAgent {
+        BackupAgent(
+            paths: paths,
+            now: { self.now },
+            tailer: tailer,
+            sessionBackupStreamer: SessionBackupStreamer(chunkSize: 1_048_576),
+            cursorStoreFactory: { [weak self] databaseURL in
+                BackupCursorStore(databaseURL: databaseURL, sqliteRunner: { arguments, input in
+                    guard let self else { throw BackupAgentFixtureError.fixtureReleased }
+                    self.sqliteRunnerInvocationCount += 1
+                    if input.contains("FROM backup_cursors") {
+                        self.cursorReadBatchCount += 1
+                    }
+                    if input.contains("BEGIN IMMEDIATE") {
+                        self.cursorWriteBatchCount += 1
+                    }
+                    return try runSQLiteForBackupAgentTests(arguments: arguments, input: input)
+                })
+            },
+            manifestStoreFactory: { [weak self] manifestURL in
+                guard let self else {
+                    return BackupManifestStore(manifestURL: manifestURL, createParentDirectories: false)
+                }
+                return BackupManifestStore(
+                    manifestURL: manifestURL,
+                    createParentDirectories: false,
+                    writer: DurableAtomicWriter(synchronize: { handle in
+                        self.manifestWriteCount += 1
+                        try handle.synchronize()
+                    })
+                )
+            },
+            instrumentation: BackupAgentInstrumentation(
+                sourceBodyRead: { [weak self] _, offset, length in
+                    guard let self else { return }
+                    self.sourceBodyReadRanges.append(offset..<(offset + length))
+                },
+                targetStat: { [weak self] _ in
+                    self?.targetStatCount += 1
+                },
+                fullHash: { [weak self] _, _ in
+                    self?.fullHashCount += 1
+                }
+            )
+        )
     }
 
     @discardableResult
@@ -664,4 +935,36 @@ private struct BackupAgentFixture {
         try Data(contents.utf8).write(to: fileURL)
         return fileURL
     }
+}
+
+private enum BackupAgentFixtureError: Error {
+    case fixtureReleased
+    case sqliteFailed(String)
+}
+
+private func runSQLiteForBackupAgentTests(arguments: [String], input: String) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+    process.arguments = arguments
+    let inputPipe = Pipe()
+    let outputPipe = Pipe()
+    let errorPipe = Pipe()
+    process.standardInput = inputPipe
+    process.standardOutput = outputPipe
+    process.standardError = errorPipe
+
+    try process.run()
+    try inputPipe.fileHandleForWriting.write(contentsOf: Data(input.utf8))
+    try inputPipe.fileHandleForWriting.close()
+    let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    let error = errorPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    try? outputPipe.fileHandleForReading.close()
+    try? errorPipe.fileHandleForReading.close()
+    guard process.terminationStatus == 0 else {
+        throw BackupAgentFixtureError.sqliteFailed(
+            String(data: error, encoding: .utf8) ?? "sqlite failed"
+        )
+    }
+    return String(data: output, encoding: .utf8) ?? ""
 }

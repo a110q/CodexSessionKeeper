@@ -12,6 +12,22 @@ public struct BackupProgress: Equatable, Sendable {
     public let phase: BackupProgressPhase
 }
 
+struct BackupAgentInstrumentation {
+    let sourceBodyRead: (URL, Int64, Int64) -> Void
+    let targetStat: (URL) -> Void
+    let fullHash: (URL, Int64) -> Void
+
+    init(
+        sourceBodyRead: @escaping (URL, Int64, Int64) -> Void = { _, _, _ in },
+        targetStat: @escaping (URL) -> Void = { _ in },
+        fullHash: @escaping (URL, Int64) -> Void = { _, _ in }
+    ) {
+        self.sourceBodyRead = sourceBodyRead
+        self.targetStat = targetStat
+        self.fullHash = fullHash
+    }
+}
+
 public final class BackupAgent: @unchecked Sendable {
     private static let agentVersion = "2.0.0"
     private static let activeStatus = "active"
@@ -22,12 +38,17 @@ public final class BackupAgent: @unchecked Sendable {
     private let tailer: SessionTailer
     private let targetValidator: BackupTargetValidator
     private let fileCommitter: BackupFileCommitter
+    private let sessionBackupStreamer: SessionBackupStreamer
     private let progressHandler: ((BackupProgress) -> Void)?
     private let remoteStatusWriter: (Data, URL) throws -> Void
+    private let cursorStoreFactory: (URL) -> BackupCursorStore
+    private let manifestStoreFactory: (URL) -> BackupManifestStore
+    private let instrumentation: BackupAgentInstrumentation
     private let scanLock = NSLock()
     private let taskLock = NSLock()
     private var pollingTask: Task<Void, Never>?
     private var pollingStartedAt: Date?
+    private var lastKnownProgress: BackupProgress?
 
     private struct ProcessSessionFileResult {
         var manifestChanged: Bool
@@ -35,7 +56,7 @@ public final class BackupAgent: @unchecked Sendable {
         var lastError: String?
     }
 
-    public init(
+    public convenience init(
         paths: BackupPaths = BackupPaths(),
         now: @escaping () -> Date = Date.init,
         fileManager: FileManager = .default,
@@ -45,13 +66,49 @@ public final class BackupAgent: @unchecked Sendable {
         progressHandler: ((BackupProgress) -> Void)? = nil,
         remoteStatusWriter: ((Data, URL) throws -> Void)? = nil
     ) {
+        self.init(
+            paths: paths,
+            now: now,
+            fileManager: fileManager,
+            tailer: tailer,
+            targetValidator: targetValidator,
+            fileCommitter: fileCommitter,
+            progressHandler: progressHandler,
+            remoteStatusWriter: remoteStatusWriter,
+            sessionBackupStreamer: SessionBackupStreamer(),
+            cursorStoreFactory: { BackupCursorStore(databaseURL: $0) },
+            manifestStoreFactory: {
+                BackupManifestStore(manifestURL: $0, createParentDirectories: false)
+            },
+            instrumentation: BackupAgentInstrumentation()
+        )
+    }
+
+    init(
+        paths: BackupPaths,
+        now: @escaping () -> Date,
+        fileManager: FileManager = .default,
+        tailer: SessionTailer = SessionTailer(),
+        targetValidator: BackupTargetValidator? = nil,
+        fileCommitter: BackupFileCommitter = BackupFileCommitter(),
+        progressHandler: ((BackupProgress) -> Void)? = nil,
+        remoteStatusWriter: ((Data, URL) throws -> Void)? = nil,
+        sessionBackupStreamer: SessionBackupStreamer,
+        cursorStoreFactory: @escaping (URL) -> BackupCursorStore,
+        manifestStoreFactory: @escaping (URL) -> BackupManifestStore,
+        instrumentation: BackupAgentInstrumentation
+    ) {
         self.paths = paths
         self.now = now
         self.fileManager = fileManager
         self.tailer = tailer
         self.targetValidator = targetValidator ?? BackupTargetValidator(backupRoot: paths.backupRoot)
         self.fileCommitter = fileCommitter
+        self.sessionBackupStreamer = sessionBackupStreamer
         self.progressHandler = progressHandler
+        self.cursorStoreFactory = cursorStoreFactory
+        self.manifestStoreFactory = manifestStoreFactory
+        self.instrumentation = instrumentation
         self.remoteStatusWriter = remoteStatusWriter ?? { data, url in
             try DurableAtomicWriter().write(data, to: url, createParentDirectories: false)
         }
@@ -76,14 +133,12 @@ public final class BackupAgent: @unchecked Sendable {
         try targetValidator.validateTarget()
         try ensureLocalStateDirectoriesExist()
         let scanDate = now()
-        let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
+        let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
         try cursorStore.open()
+        let cursorMap = try cursorStore.loadAll()
 
         let manifestExisted = fileManager.fileExists(atPath: paths.manifestURL.path)
-        let manifestStore = BackupManifestStore(
-            manifestURL: paths.manifestURL,
-            createParentDirectories: false
-        )
+        let manifestStore = manifestStoreFactory(paths.manifestURL)
         var manifest = try manifestStore.loadOrCreate(
             codexRoot: paths.codexRoot.path,
             backupRoot: paths.backupRoot.path,
@@ -109,6 +164,12 @@ public final class BackupAgent: @unchecked Sendable {
         var updatedCursors: [BackupCursor] = []
         var scanErrors: [String] = []
         var completed = 0
+        lastKnownProgress = BackupProgress(
+            totalFiles: sources.count,
+            completedFiles: 0,
+            pendingFiles: sources.count,
+            phase: phase
+        )
         for sourceURL in sources {
             guard let sessionID = SessionIdentity.sessionID(from: sourceURL),
                   processedSessionIDs.insert(sessionID).inserted else {
@@ -119,7 +180,7 @@ public final class BackupAgent: @unchecked Sendable {
                 sessionID: sessionID,
                 scanDate: scanDate,
                 manifest: &manifest,
-                cursorStore: cursorStore
+                cursorMap: cursorMap
             )
             manifestChanged = manifestChanged || result.manifestChanged
             if let cursor = result.cursor {
@@ -129,23 +190,22 @@ public final class BackupAgent: @unchecked Sendable {
                 scanErrors.append(lastError)
             }
             completed += 1
-            progressHandler?(BackupProgress(
+            let progress = BackupProgress(
                 totalFiles: sources.count,
                 completedFiles: completed,
                 pendingFiles: max(0, sources.count - completed),
                 phase: phase
-            ))
+            )
+            lastKnownProgress = progress
+            progressHandler?(progress)
         }
 
         if manifestChanged {
             manifest.updatedAt = scanDate
             try manifestStore.save(manifest)
         }
-        for cursor in updatedCursors {
-            let current = try cursorStore.cursor(sourcePath: cursor.sourcePath)
-            if cursorNeedsUpsert(currentCursor: current, updatedCursor: cursor) {
-                try cursorStore.upsert(cursor)
-            }
+        if !updatedCursors.isEmpty {
+            try cursorStore.upsertMany(updatedCursors)
         }
 
         try writeStatus(
@@ -188,20 +248,22 @@ public final class BackupAgent: @unchecked Sendable {
 
     public func pendingSessionCount() throws -> Int {
         try ensureLocalStateDirectoriesExist()
-        let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
+        let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
         try cursorStore.open()
+        let cursorMap = try cursorStore.loadAll()
         let existing = try loadPendingSources()
         var pendingByPath: [String: PendingSourceRecord] = [:]
         let sources = try discoverSessionFiles()
-        let discoveredPaths = Set(sources.map(\.path))
+        let discoveredPaths = Set(sources.map(canonicalSourcePath))
         for source in sources {
             let metadata = try metadata(for: source)
-            let cursor = try cursorStore.cursor(sourcePath: source.path)
+            let sourcePath = canonicalSourcePath(source)
+            let cursor = cursorMap[sourcePath] ?? cursorMap[source.path]
             if cursor == nil
                 || cursor?.lastSourceSize != metadata.size
                 || cursor?.lastSourceModifiedAt != metadata.modifiedAt {
-                pendingByPath[source.path] = PendingSourceRecord(
-                    sourcePath: source.path,
+                pendingByPath[sourcePath] = PendingSourceRecord(
+                    sourcePath: sourcePath,
                     sourceSize: metadata.size,
                     sourceModifiedAt: metadata.modifiedAt,
                     committedOffset: cursor?.lastByteOffset ?? 0,
@@ -228,88 +290,121 @@ public final class BackupAgent: @unchecked Sendable {
         sessionID: String,
         scanDate: Date,
         manifest: inout BackupManifest,
-        cursorStore: BackupCursorStore
+        cursorMap: [String: BackupCursor]
     ) throws -> ProcessSessionFileResult {
-        let sourcePath = sourceURL.path
+        let sourcePath = canonicalSourcePath(sourceURL)
         let existingRecord = manifest.sessions[sessionID]
-        let currentCursor = try cursorStore.cursor(sourcePath: sourcePath)
-        let baselineCursor = try currentCursor ?? migratedCursor(
+        let currentCursor = cursorMap[sourcePath] ?? cursorMap[sourceURL.path]
+        let baselineCursor = currentCursor ?? migratedCursor(
             for: existingRecord,
             currentSourcePath: sourcePath,
-            cursorStore: cursorStore
+            cursorMap: cursorMap
         )
         let targetURL = try paths.backupFileURL(for: sourceURL)
         guard let relativeBackupPath = paths.relativeBackupPath(for: targetURL) else {
             throw BackupTargetValidationError.unsafeTarget(targetURL.path)
         }
         let sourceMetadata = try fileCommitter.inspectSource(sourceURL)
-        let targetState = try fileCommitter.inspectTarget(targetURL)
-        let targetExists = targetState.exists
-        let recordedBytes = existingRecord?.bytesBackedUp ?? 0
-        let recordedLines = existingRecord?.lineCount ?? 0
-        let recordedOffset = baselineCursor?.lastByteOffset ?? 0
-        let pathChanged = existingRecord.map { $0.backupPath != relativeBackupPath } ?? false
-        var rebuild = pathChanged || sourceMetadata.byteCount < recordedOffset
-        var readOffset = recordedOffset
-        var baseLineCount = recordedLines
-        if targetExists, !rebuild {
-            if targetState.byteCount == recordedBytes {
-                if let contentHash = existingRecord?.contentHash, recordedOffset > 0 {
-                    rebuild = try fileCommitter.hashPrefix(of: sourceURL, byteCount: recordedOffset) != contentHash
-                        || !fileCommitter.targetMatchesBoundedFingerprint(
-                            targetURL,
-                            source: sourceURL,
-                            byteCount: recordedBytes
-                        )
-                } else if targetState.byteCount > 0 {
-                    rebuild = try !fileCommitter.targetIsCompletePrefix(targetURL, of: sourceURL)
-                }
-            } else if targetState.byteCount > recordedBytes,
-                      try fileCommitter.targetIsCompletePrefix(targetURL, of: sourceURL) {
-                readOffset = targetState.byteCount
-                baseLineCount = try fileCommitter.stats(at: targetURL).lineCount
-            } else {
-                rebuild = true
-            }
-        } else if !targetExists, recordedOffset > 0 || recordedBytes > 0 {
-            rebuild = true
+        if scanIsStrictlyUnchanged(
+            sourcePath: sourcePath,
+            relativeBackupPath: relativeBackupPath,
+            sourceMetadata: sourceMetadata,
+            record: existingRecord,
+            cursor: currentCursor
+        ) {
+            return ProcessSessionFileResult(
+                manifestChanged: false,
+                cursor: nil,
+                lastError: currentCursor?.lastError
+            )
         }
 
-        let tailResult: TailReadResult
+        instrumentation.targetStat(targetURL)
+        let targetState = try fileCommitter.inspectTarget(targetURL)
+        let recordedOffset = baselineCursor?.lastByteOffset ?? 0
+        let recordedLineCount = baselineCursor?.lineCount ?? existingRecord?.lineCount ?? 0
+        let metadataAgrees = baselineCursor.map {
+            sourceMetadata.byteCount > $0.lastSourceSize
+                && sourceMetadata.byteCount >= $0.lastByteOffset
+                && existingRecord?.bytesBackedUp == $0.lastByteOffset
+                && existingRecord?.lineCount == $0.lineCount
+        } ?? false
+        let pathAgrees = baselineCursor?.backupPath == relativeBackupPath
+            && existingRecord?.backupPath == relativeBackupPath
+            && existingRecord?.sourcePath == sourcePath
+        let rebuild = !targetState.exists
+            || !metadataAgrees
+            || !pathAgrees
+            || targetState.byteCount != recordedOffset
+
         let finalStats: BackupFileStats
         let wroteData: Bool
+        let finalOffset: Int64
+        let pendingPartialLine: Data
+        let blockedError: String?
+        let contentHash: String?
+        let appendedLineCount: Int
         if rebuild {
-            tailResult = try tailer.readNewCompleteLines(from: sourceURL, offset: 0)
-            finalStats = try fileCommitter.rebuildCompleteLines(
-                lines: tailResult.lines,
+            instrumentation.sourceBodyRead(sourceURL, 0, sourceMetadata.byteCount)
+            let streamed = try fileCommitter.rebuildCompleteLines(
+                from: sourceURL,
                 at: targetURL,
-                under: paths.backupRoot
+                under: paths.backupRoot,
+                using: sessionBackupStreamer
             )
-            wroteData = true
-        } else {
-            tailResult = try tailer.readNewCompleteLines(from: sourceURL, offset: readOffset)
-            if !targetExists {
-                finalStats = try fileCommitter.commitInitial(
-                    lines: tailResult.lines,
-                    to: targetURL,
-                    under: paths.backupRoot
-                )
-            } else {
-                finalStats = try fileCommitter.appendAndSynchronize(
-                    lines: tailResult.lines,
-                    to: targetURL,
-                    under: paths.backupRoot
-                )
+            if !targetState.exists, streamed.committedByteCount == 0 {
+                try? fileManager.removeItem(at: targetURL)
             }
-            wroteData = !tailResult.lines.isEmpty || targetState.byteCount != recordedBytes
+            finalStats = BackupFileStats(
+                byteCount: streamed.committedByteCount,
+                lineCount: streamed.lineCount
+            )
+            wroteData = targetState.exists || streamed.committedByteCount > 0
+            finalOffset = streamed.committedByteCount
+            pendingPartialLine = streamed.pendingPartialLine
+            blockedError = streamed.blockedError
+            contentHash = streamed.committedByteCount > 0 ? streamed.contentHash : nil
+            appendedLineCount = 0
+        } else {
+            instrumentation.sourceBodyRead(
+                sourceURL,
+                recordedOffset,
+                sourceMetadata.byteCount - recordedOffset
+            )
+            let appended = try fileCommitter.appendCompleteLines(
+                from: sourceURL,
+                offset: recordedOffset,
+                to: targetURL,
+                under: paths.backupRoot,
+                using: sessionBackupStreamer
+            )
+            finalStats = BackupFileStats(
+                byteCount: appended.committedByteCount,
+                lineCount: appended.lineCount
+            )
+            finalOffset = appended.committedByteCount
+            pendingPartialLine = appended.pendingPartialLine
+            blockedError = appended.blockedError
+            appendedLineCount = appended.lineCount
+            wroteData = appended.appendedByteCount > 0
+            contentHash = appended.appendedByteCount > 0 ? nil : existingRecord?.contentHash
+
+            if finalOffset > recordedOffset {
+                let verifiedByteCount = finalOffset - recordedOffset
+                instrumentation.sourceBodyRead(sourceURL, recordedOffset, verifiedByteCount)
+                guard try sessionBackupStreamer.rangesMatch(
+                    source: sourceURL,
+                    sourceOffset: recordedOffset,
+                    target: targetURL,
+                    targetOffset: recordedOffset,
+                    length: verifiedByteCount
+                ) else {
+                    throw BackupAgentScanError.rangeVerificationFailed(targetURL.path)
+                }
+            }
         }
 
-        let finalOffset = tailResult.nextOffset
-        let contentHash = finalOffset > 0
-            ? try fileCommitter.hashPrefix(of: sourceURL, byteCount: finalOffset)
-            : nil
         let title = existingRecord?.title
-            ?? firstTitle(in: tailResult.lines)
             ?? firstTitle(inBackupFileAt: targetURL)
         let firstSeenAt = existingRecord?.firstSeenAt ?? scanDate
         let lastBackedUpAt = wroteData || existingRecord?.lastBackedUpAt == nil && finalStats.lineCount > 0
@@ -322,9 +417,9 @@ public final class BackupAgent: @unchecked Sendable {
             title: title,
             firstSeenAt: firstSeenAt,
             lastBackedUpAt: lastBackedUpAt,
-            lineCount: rebuild || !targetExists
+            lineCount: rebuild
                 ? finalStats.lineCount
-                : max(baseLineCount + tailResult.lines.count, baseLineCount),
+                : recordedLineCount + appendedLineCount,
             bytesBackedUp: finalStats.byteCount,
             status: Self.activeStatus,
             contentHash: contentHash
@@ -341,28 +436,60 @@ public final class BackupAgent: @unchecked Sendable {
             lastSourceSize: sourceMetadata.byteCount,
             lastSourceModifiedAt: sourceMetadata.modifiedAt,
             lineCount: updatedRecord.lineCount,
-            pendingPartialLine: tailResult.pendingPartialLine,
+            pendingPartialLine: pendingPartialLine,
             status: Self.activeStatus,
-            lastError: tailResult.blockedError,
+            lastError: blockedError,
             updatedAt: scanDate.timeIntervalSince1970
         )
         return ProcessSessionFileResult(
             manifestChanged: manifestChanged,
             cursor: cursorNeedsUpsert(currentCursor: currentCursor, updatedCursor: updatedCursor) ? updatedCursor : nil,
-            lastError: tailResult.blockedError
+            lastError: blockedError
         )
     }
 
     private func migratedCursor(
         for existingRecord: BackupSessionRecord?,
         currentSourcePath: String,
-        cursorStore: BackupCursorStore
-    ) throws -> BackupCursor? {
+        cursorMap: [String: BackupCursor]
+    ) -> BackupCursor? {
         guard let previousSourcePath = existingRecord?.sourcePath,
               previousSourcePath != currentSourcePath else {
             return nil
         }
-        return try cursorStore.cursor(sourcePath: previousSourcePath)
+        return cursorMap[previousSourcePath]
+    }
+
+    private func scanIsStrictlyUnchanged(
+        sourcePath: String,
+        relativeBackupPath: String,
+        sourceMetadata: BackupSourceMetadata,
+        record: BackupSessionRecord?,
+        cursor: BackupCursor?
+    ) -> Bool {
+        guard let record, let cursor,
+              record.sourcePath == sourcePath,
+              cursor.sourcePath == sourcePath,
+              record.backupPath == relativeBackupPath,
+              cursor.backupPath == relativeBackupPath,
+              record.bytesBackedUp == cursor.lastByteOffset,
+              record.lineCount == cursor.lineCount,
+              cursor.lastByteOffset >= 0,
+              cursor.lastByteOffset <= sourceMetadata.byteCount,
+              cursor.lastSourceSize == sourceMetadata.byteCount,
+              cursor.lastSourceModifiedAt == sourceMetadata.modifiedAt else {
+            return false
+        }
+
+        let hasUncommittedBytes = sourceMetadata.byteCount > cursor.lastByteOffset
+        if hasUncommittedBytes {
+            return !cursor.pendingPartialLine.isEmpty || cursor.lastError != nil
+        }
+        return cursor.pendingPartialLine.isEmpty && cursor.lastError == nil
+    }
+
+    private func canonicalSourcePath(_ sourceURL: URL) -> String {
+        sourceURL.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     private func ensureLocalStateDirectoriesExist() throws {
@@ -403,15 +530,6 @@ public final class BackupAgent: @unchecked Sendable {
             (attributes[.size] as? NSNumber)?.int64Value ?? 0,
             (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         )
-    }
-
-    private func firstTitle(in lines: [Data]) -> String? {
-        for line in lines {
-            guard let text = String(data: line, encoding: .utf8),
-                  let title = SessionIdentity.title(fromJSONLine: text) else { continue }
-            return title
-        }
-        return nil
     }
 
     private func firstTitle(inBackupFileAt backupURL: URL) -> String? {
@@ -489,10 +607,11 @@ public final class BackupAgent: @unchecked Sendable {
         try ensureLocalStateDirectoriesExist()
         let manifest: BackupManifest
         if fileManager.fileExists(atPath: paths.manifestURL.path),
-           let loaded = try? BackupManifestStore(
-               manifestURL: paths.manifestURL,
-               createParentDirectories: false
-           ).loadOrCreate(codexRoot: paths.codexRoot.path, backupRoot: paths.backupRoot.path, now: now()) {
+           let loaded = try? manifestStoreFactory(paths.manifestURL).loadOrCreate(
+               codexRoot: paths.codexRoot.path,
+               backupRoot: paths.backupRoot.path,
+               now: now()
+           ) {
             manifest = loaded
         } else {
             manifest = BackupManifest(
@@ -502,7 +621,9 @@ public final class BackupAgent: @unchecked Sendable {
                 updatedAt: now()
             )
         }
-        _ = try? pendingSessionCount()
+        if let lastKnownProgress {
+            progressHandler?(lastKnownProgress)
+        }
         try writeStatus(
             for: manifest,
             status: .error,
@@ -544,6 +665,17 @@ public final class BackupAgent: @unchecked Sendable {
         let multiplier: UInt64 = 1_000_000_000
         guard seconds <= UInt64.max / multiplier else { return UInt64.max }
         return seconds * multiplier
+    }
+}
+
+private enum BackupAgentScanError: LocalizedError {
+    case rangeVerificationFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .rangeVerificationFailed(path):
+            return "NAS append range verification failed: \(path)"
+        }
     }
 }
 
