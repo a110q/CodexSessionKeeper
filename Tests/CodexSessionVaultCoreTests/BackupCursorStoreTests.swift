@@ -3,6 +3,124 @@ import Testing
 @testable import CodexSessionVaultCore
 
 @Test
+func bulkLoadAndUpsertRoundTrip() throws {
+    let fixture = try CursorStoreFixture()
+    let original = fixture.cursor(sourcePath: "/tmp/会话 one.jsonl", offset: 10)
+    let second = fixture.cursor(sourcePath: "/tmp/o'ne.jsonl", offset: 20)
+    let third = fixture.cursor(sourcePath: "/tmp/space three.jsonl", offset: 30)
+
+    try fixture.store.upsertMany([original, second, third])
+    var rows = try fixture.store.loadAll()
+
+    #expect(rows.count == 3)
+    #expect(rows[original.sourcePath]?.lastByteOffset == 10)
+    #expect(rows[second.sourcePath]?.lastByteOffset == 20)
+    #expect(rows[third.sourcePath]?.lastByteOffset == 30)
+
+    let replacement = fixture.cursor(sourcePath: original.sourcePath, offset: 40)
+    try fixture.store.upsertMany([replacement])
+    rows = try fixture.store.loadAll()
+
+    #expect(rows.count == 3)
+    #expect(rows[original.sourcePath]?.lastByteOffset == 40)
+    #expect(rows[second.sourcePath]?.lastByteOffset == 20)
+    #expect(rows[third.sourcePath]?.lastByteOffset == 30)
+}
+
+@Test
+func bulkOperationsInvokeSQLiteOnceRegardlessOfRowCount() throws {
+    let tempDirectory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: tempDirectory) }
+    let readSpy = SQLiteRunnerSpy(output: "[]")
+    let readStore = BackupCursorStore(
+        databaseURL: tempDirectory.appendingPathComponent("read.sqlite"),
+        sqliteRunner: readSpy.run
+    )
+
+    _ = try readStore.loadAll()
+
+    #expect(readSpy.invocations.count == 1)
+
+    let writeSpy = SQLiteRunnerSpy(output: "")
+    let writeStore = BackupCursorStore(
+        databaseURL: tempDirectory.appendingPathComponent("write.sqlite"),
+        sqliteRunner: writeSpy.run
+    )
+    let cursors = [
+        makeCursor(sourcePath: "/tmp/会话 one.jsonl"),
+        makeCursor(sourcePath: "/tmp/o'ne.jsonl"),
+        makeCursor(sourcePath: "/tmp/space three.jsonl"),
+    ]
+
+    try writeStore.upsertMany([])
+    #expect(writeSpy.invocations.isEmpty)
+
+    try writeStore.upsertMany(cursors)
+
+    #expect(writeSpy.invocations.count == 1)
+}
+
+@Test
+func bulkLoadRejectsDuplicateSourcePaths() throws {
+    let tempDirectory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: tempDirectory) }
+    let duplicateRows = """
+    [
+      {"session_id":"one","source_path":"/tmp/duplicate.jsonl","backup_path":"one.jsonl","last_byte_offset":1,"last_source_size":1,"last_source_modified_at":1,"line_count":1,"pending_partial_line":"","status":"backedUp","last_error":null,"updated_at":1},
+      {"session_id":"two","source_path":"/tmp/duplicate.jsonl","backup_path":"two.jsonl","last_byte_offset":2,"last_source_size":2,"last_source_modified_at":2,"line_count":2,"pending_partial_line":"","status":"backedUp","last_error":null,"updated_at":2}
+    ]
+    """
+    let spy = SQLiteRunnerSpy(output: duplicateRows)
+    let store = BackupCursorStore(
+        databaseURL: tempDirectory.appendingPathComponent("duplicates.sqlite"),
+        sqliteRunner: spy.run
+    )
+
+    var didThrow = false
+    do {
+        _ = try store.loadAll()
+    } catch {
+        didThrow = true
+    }
+
+    #expect(didThrow)
+    #expect(spy.invocations.count == 1)
+}
+
+@Test
+func bulkUpsertRollsBackWhenSecondStatementViolatesConstraint() throws {
+    let fixture = try CursorStoreFixture()
+    let first = fixture.cursor(sourcePath: "/tmp/first.jsonl", offset: 10)
+    let second = fixture.cursor(sourcePath: "/tmp/second.jsonl", offset: 20)
+    try fixture.store.upsertMany([first, second])
+    try executeSQLite(
+        """
+        CREATE TRIGGER reject_second_cursor
+        BEFORE UPDATE ON backup_cursors
+        WHEN NEW.source_path = '/tmp/second.jsonl'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced constraint violation');
+        END;
+        """,
+        databaseURL: fixture.databaseURL
+    )
+    let updatedFirst = fixture.cursor(sourcePath: first.sourcePath, offset: 100)
+    let updatedSecond = fixture.cursor(sourcePath: second.sourcePath, offset: 200)
+
+    var didThrow = false
+    do {
+        try fixture.store.upsertMany([updatedFirst, updatedSecond])
+    } catch {
+        didThrow = true
+    }
+    let rows = try fixture.store.loadAll()
+
+    #expect(didThrow)
+    #expect(rows[first.sourcePath]?.lastByteOffset == 10)
+    #expect(rows[second.sourcePath]?.lastByteOffset == 20)
+}
+
+@Test
 func cursorStoreUpsertsAndLoadsCursor() throws {
     let tempDirectory = try makeTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: tempDirectory) }
@@ -246,4 +364,77 @@ private func writeExecutableScript(_ contents: String, named name: String, in di
     try Data(contents.utf8).write(to: url)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     return url
+}
+
+private final class CursorStoreFixture {
+    let databaseURL: URL
+    let store: BackupCursorStore
+    private let tempDirectory: URL
+
+    init() throws {
+        tempDirectory = try makeTemporaryDirectory()
+        databaseURL = tempDirectory.appendingPathComponent("cursors.sqlite")
+        store = BackupCursorStore(databaseURL: databaseURL)
+        try store.open()
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: tempDirectory)
+    }
+
+    func cursor(sourcePath: String, offset: Int64) -> BackupCursor {
+        BackupCursor(
+            sessionId: "session-\(offset)",
+            sourcePath: sourcePath,
+            backupPath: "sessions/\(offset).jsonl",
+            lastByteOffset: offset,
+            lastSourceSize: offset + 1,
+            lastSourceModifiedAt: TimeInterval(offset),
+            lineCount: Int(offset),
+            pendingPartialLine: Data("partial \(offset)".utf8),
+            status: "backedUp",
+            lastError: nil,
+            updatedAt: TimeInterval(offset + 2)
+        )
+    }
+}
+
+private final class SQLiteRunnerSpy {
+    struct Invocation {
+        var arguments: [String]
+        var input: String
+    }
+
+    private(set) var invocations: [Invocation] = []
+    private let output: String
+
+    init(output: String) {
+        self.output = output
+    }
+
+    func run(arguments: [String], input: String) throws -> String {
+        invocations.append(Invocation(arguments: arguments, input: input))
+        return output
+    }
+}
+
+private func executeSQLite(_ sql: String, databaseURL: URL) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+    process.arguments = [databaseURL.path, sql]
+    let errorPipe = Pipe()
+    process.standardError = errorPipe
+
+    try process.run()
+    process.waitUntilExit()
+
+    guard process.terminationStatus == 0 else {
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let message = String(data: errorData, encoding: .utf8) ?? "sqlite3 failed"
+        throw NSError(
+            domain: "BackupCursorStoreTests",
+            code: Int(process.terminationStatus),
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
 }

@@ -45,12 +45,26 @@ public final class BackupCursorStore {
     private let sqlitePath: String
     private let fileManager: FileManager
     private let decoder: JSONDecoder
+    private let sqliteRunner: (([String], String) throws -> String)?
 
     public init(databaseURL: URL, sqlitePath: String = "/usr/bin/sqlite3") {
         self.databaseURL = databaseURL
         self.sqlitePath = sqlitePath
         self.fileManager = .default
         self.decoder = JSONDecoder()
+        self.sqliteRunner = nil
+    }
+
+    init(
+        databaseURL: URL,
+        sqlitePath: String = "/usr/bin/sqlite3",
+        sqliteRunner: @escaping ([String], String) throws -> String
+    ) {
+        self.databaseURL = databaseURL
+        self.sqlitePath = sqlitePath
+        self.fileManager = .default
+        self.decoder = JSONDecoder()
+        self.sqliteRunner = sqliteRunner
     }
 
     public func open() throws {
@@ -76,7 +90,7 @@ public final class BackupCursorStore {
         """)
     }
 
-    public func cursor(sourcePath: String) throws -> BackupCursor? {
+    public func loadAll() throws -> [String: BackupCursor] {
         let output = try queryJSON("""
         SELECT
             session_id,
@@ -91,26 +105,54 @@ public final class BackupCursorStore {
             last_error,
             updated_at
         FROM backup_cursors
-        WHERE source_path = \(Self.sqlText(sourcePath))
-        LIMIT 1;
+        ORDER BY source_path COLLATE BINARY ASC;
         """)
 
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
+            return [:]
         }
 
         let rows = try decoder.decode([CursorRow].self, from: Data(output.utf8))
-        guard let row = rows.first else {
-            return nil
+        var cursors: [String: BackupCursor] = [:]
+        cursors.reserveCapacity(rows.count)
+
+        for row in rows {
+            let cursor = try row.cursor()
+            guard cursors.updateValue(cursor, forKey: cursor.sourcePath) == nil else {
+                throw BackupCursorStoreError.duplicateSourcePath(cursor.sourcePath)
+            }
         }
 
-        return try row.cursor()
+        return cursors
+    }
+
+    public func cursor(sourcePath: String) throws -> BackupCursor? {
+        try loadAll()[sourcePath]
     }
 
     public func upsert(_ cursor: BackupCursor) throws {
+        try upsertMany([cursor])
+    }
+
+    public func upsertMany(_ cursors: [BackupCursor]) throws {
+        guard !cursors.isEmpty else {
+            return
+        }
+
+        let statements = cursors.map(Self.upsertStatement).joined(separator: "\n")
+        try execute("""
+        .bail on
+        .timeout 5000
+        BEGIN IMMEDIATE;
+        \(statements)
+        COMMIT;
+        """)
+    }
+
+    private static func upsertStatement(_ cursor: BackupCursor) -> String {
         let pendingPartialLine = cursor.pendingPartialLine.base64EncodedString()
 
-        try execute("""
+        return """
         INSERT INTO backup_cursors (
             source_path,
             session_id,
@@ -147,7 +189,7 @@ public final class BackupCursorStore {
             status = excluded.status,
             last_error = excluded.last_error,
             updated_at = excluded.updated_at;
-        """)
+        """
     }
 
     private func execute(_ sql: String) throws {
@@ -163,6 +205,10 @@ public final class BackupCursorStore {
     }
 
     private func runSQLite(arguments: [String], input: String) throws -> String {
+        if let sqliteRunner {
+            return try sqliteRunner(arguments, input)
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: sqlitePath)
         process.arguments = arguments
@@ -284,6 +330,7 @@ private enum BackupCursorStoreError: Error, Sendable {
     case launchFailed(sqlitePath: String, underlying: Error)
     case sqliteFailed(status: Int32, stderr: String)
     case invalidPendingPartialLine
+    case duplicateSourcePath(String)
 }
 
 extension BackupCursorStoreError: LocalizedError {
@@ -299,6 +346,8 @@ extension BackupCursorStoreError: LocalizedError {
             }
         case .invalidPendingPartialLine:
             "Stored backup cursor has invalid base64 pending partial line data."
+        case let .duplicateSourcePath(sourcePath):
+            "Stored backup cursors contain duplicate source path: \(sourcePath)"
         }
     }
 }
