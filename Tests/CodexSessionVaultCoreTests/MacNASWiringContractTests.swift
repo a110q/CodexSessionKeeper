@@ -40,6 +40,18 @@ struct MacNASWiringContractTests {
         #expect(source.contains("nasSetupSnapshot.state == .pending"))
     }
 
+    @Test
+    func applicationLifecycleForwardsActivationAndWakeScansAndRemovesObserver() throws {
+        let source = try macAppSource()
+
+        #expect(source.contains("func applicationDidBecomeActive"))
+        #expect(source.contains("requestNASBackupScan(.activation)"))
+        #expect(source.contains("NSWorkspace.shared.notificationCenter"))
+        #expect(source.contains("NSWorkspace.didWakeNotification"))
+        #expect(source.contains("requestNASBackupScan(.wake)"))
+        #expect(source.contains("removeObserver"))
+    }
+
     private func macAppSource() throws -> String {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         return try String(

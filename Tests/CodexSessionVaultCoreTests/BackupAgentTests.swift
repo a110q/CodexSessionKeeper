@@ -718,6 +718,144 @@ func statusJSONIsWrittenWithAggregateCountsAndRunningStatus() throws {
 }
 
 @Test
+func persistedStatusIsPublishedThroughSendableCallback() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    try fixture.writeSession(
+        named: "67676767-6767-6767-6767-676767676767.jsonl",
+        contents: #"{"role":"user","content":"Publish me"}"# + "\n"
+    )
+    let statuses = LockedStatusRecorder()
+    let agent = fixture.makeAgent(statusHandler: { status in
+        statuses.append(status)
+    })
+
+    try agent.performOneShotScan()
+
+    #expect(statuses.values == [try fixture.loadStatus()])
+}
+
+@Test
+func concurrentTriggersAreSerializedAndCoalescedIntoOneFollowUpScan() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let barrier = ControlledScanBarrier()
+    let published = DispatchSemaphore(value: 0)
+    let agent = fixture.makeAgent(
+        targetValidator: BackupTargetValidator { barrier.enterAndWait() },
+        statusHandler: { _ in published.signal() }
+    )
+    defer {
+        barrier.releaseAll()
+        agent.stop()
+    }
+
+    agent.requestImmediateScan(.timer)
+    #expect(barrier.waitForEntry() == .success)
+    agent.requestImmediateScan(.wake)
+    agent.requestImmediateScan(.reconnect)
+    agent.requestImmediateScan(.timer)
+    barrier.releaseOne()
+    #expect(barrier.waitForEntry() == .success)
+    barrier.releaseOne()
+    #expect(published.wait(timeout: .now() + 5) == .success)
+    #expect(published.wait(timeout: .now() + 5) == .success)
+
+    #expect(barrier.scanCount == 2)
+    #expect(barrier.maximumConcurrentScans == 1)
+}
+
+@Test
+func stopReturnsPromptlyAndDropsQueuedAndFutureWork() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let barrier = ControlledScanBarrier()
+    let published = DispatchSemaphore(value: 0)
+    let agent = fixture.makeAgent(
+        targetValidator: BackupTargetValidator { barrier.enterAndWait() },
+        statusHandler: { _ in published.signal() }
+    )
+    defer { barrier.releaseAll() }
+
+    agent.startPolling(intervalSeconds: 1)
+    agent.requestImmediateScan(.startup)
+    #expect(barrier.waitForEntry() == .success)
+    agent.requestImmediateScan(.wake)
+    let started = ContinuousClock.now
+    agent.stop()
+    let stopDuration = started.duration(to: .now)
+    agent.requestImmediateScan(.reconnect)
+    barrier.releaseOne()
+    #expect(published.wait(timeout: .now() + 5) == .success)
+    Thread.sleep(forTimeInterval: 1.2)
+
+    #expect(stopDuration < .milliseconds(250))
+    #expect(barrier.scanCount == 1)
+}
+
+@Test
+func overdueAuditRunsAfterIncrementalCatchupOnDeviceUUIDSchedule() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    var initialStatus = try fixture.loadStatus()
+    initialStatus.lastAuditAt = previousAudit
+    initialStatus.lastAuditResult = "previous"
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000009a"))
+    #expect(BackupIntegrityAuditor.overdueWakeDelaySeconds(deviceID: deviceID) == 0)
+    let statuses = LockedStatusRecorder()
+    let agent = fixture.makeAgent(
+        deviceID: deviceID,
+        initialStatus: initialStatus,
+        statusHandler: { statuses.append($0) }
+    )
+    defer { agent.stop() }
+
+    agent.requestImmediateScan(.startup)
+
+    #expect(statuses.waitForStatus(timeout: 5) { status in
+        status.lastAuditAt == fixture.now && status.lastAuditResult == "completed"
+    })
+    #expect(try fixture.loadAuditState().lastCompletedAt == fixture.now)
+}
+
+@Test
+func stopCancelsScheduledAuditBeforeItStarts() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    var initialStatus = try fixture.loadStatus()
+    initialStatus.lastAuditAt = previousAudit
+    initialStatus.lastAuditResult = "previous"
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000014"))
+    #expect(BackupIntegrityAuditor.overdueWakeDelaySeconds(deviceID: deviceID) == 1)
+    let statuses = LockedStatusRecorder()
+    let agent = fixture.makeAgent(
+        deviceID: deviceID,
+        initialStatus: initialStatus,
+        statusHandler: { statuses.append($0) }
+    )
+
+    agent.requestImmediateScan(.startup)
+    #expect(statuses.waitForStatus(timeout: 5) { $0.lastAuditAt == previousAudit })
+    agent.stop()
+    Thread.sleep(forTimeInterval: 1.2)
+
+    #expect(try fixture.loadAuditState().lastCompletedAt == previousAudit)
+    #expect(try fixture.loadAuditState().lastResult == "previous")
+}
+
+@Test
 func oversizedLineWithinLimitBacksUpAndDoesNotBlockFollowingLines() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
@@ -881,11 +1019,21 @@ private final class BackupAgentFixture {
         sqliteRunnerInvocationCount = 0
     }
 
-    func makeAgent(tailer: SessionTailer = SessionTailer()) -> BackupAgent {
+    func makeAgent(
+        tailer: SessionTailer = SessionTailer(),
+        targetValidator: BackupTargetValidator? = nil,
+        deviceID: UUID? = nil,
+        initialStatus: BackupStatus? = nil,
+        statusHandler: (@Sendable (BackupStatus) -> Void)? = nil
+    ) -> BackupAgent {
         BackupAgent(
             paths: paths,
             now: { self.now },
             tailer: tailer,
+            targetValidator: targetValidator,
+            deviceID: deviceID,
+            initialStatus: initialStatus,
+            statusHandler: statusHandler,
             sessionBackupStreamer: SessionBackupStreamer(chunkSize: 1_048_576),
             cursorStoreFactory: { [weak self] databaseURL in
                 BackupCursorStore(databaseURL: databaseURL, sqliteRunner: { arguments, input in
@@ -983,6 +1131,23 @@ private final class BackupAgentFixture {
         return try decoder.decode(BackupStatus.self, from: Data(contentsOf: paths.statusURL))
     }
 
+    func writeAuditState(_ state: IntegrityAuditState) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try FileManager.default.createDirectory(
+            at: paths.auditStateURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try encoder.encode(state).write(to: paths.auditStateURL, options: .atomic)
+    }
+
+    func loadAuditState() throws -> IntegrityAuditState {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(IntegrityAuditState.self, from: Data(contentsOf: paths.auditStateURL))
+    }
+
     func lineBytes(_ lines: [String]) -> Int {
         lines.reduce(0) { total, line in
             total + Data(line.utf8).count + 1
@@ -1009,6 +1174,73 @@ private final class BackupAgentFixture {
 private enum BackupAgentFixtureError: Error {
     case fixtureReleased
     case sqliteFailed(String)
+}
+
+private final class LockedStatusRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [BackupStatus] = []
+
+    var values: [BackupStatus] {
+        lock.withLock { storage }
+    }
+
+    func append(_ status: BackupStatus) {
+        lock.withLock { storage.append(status) }
+    }
+
+    func waitForStatus(
+        timeout: TimeInterval,
+        matching predicate: (BackupStatus) -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if lock.withLock({ storage.contains(where: predicate) }) {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return lock.withLock { storage.contains(where: predicate) }
+    }
+}
+
+private final class ControlledScanBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let continuation = DispatchSemaphore(value: 0)
+    private var activeScans = 0
+    private var storedScanCount = 0
+    private var storedMaximumConcurrentScans = 0
+
+    var scanCount: Int {
+        lock.withLock { storedScanCount }
+    }
+
+    var maximumConcurrentScans: Int {
+        lock.withLock { storedMaximumConcurrentScans }
+    }
+
+    func enterAndWait() {
+        lock.withLock {
+            activeScans += 1
+            storedScanCount += 1
+            storedMaximumConcurrentScans = max(storedMaximumConcurrentScans, activeScans)
+        }
+        entered.signal()
+        continuation.wait()
+        lock.withLock { activeScans -= 1 }
+    }
+
+    func waitForEntry() -> DispatchTimeoutResult {
+        entered.wait(timeout: .now() + 5)
+    }
+
+    func releaseOne() {
+        continuation.signal()
+    }
+
+    func releaseAll() {
+        for _ in 0..<8 { continuation.signal() }
+    }
 }
 
 private func runSQLiteForBackupAgentTests(arguments: [String], input: String) throws -> String {

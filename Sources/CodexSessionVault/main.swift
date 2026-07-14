@@ -688,6 +688,10 @@ final class VaultModel: ObservableObject {
         nasRuntime.stop()
     }
 
+    func requestNASBackupScan(_ trigger: BackupScanTrigger) {
+        nasRuntime.requestImmediateScan(trigger)
+    }
+
     func refreshNASRecoverySources() {
         do {
             let sources = try nasRuntime.recoverySources()
@@ -4801,8 +4805,50 @@ struct ContentView: View {
     }
 }
 
+@MainActor
 final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
-    weak var model: VaultModel?
+    weak var model: VaultModel? {
+        didSet {
+            if pendingActivation, let model {
+                pendingActivation = false
+                model.requestNASBackupScan(.activation)
+            }
+            if pendingWake, let model {
+                pendingWake = false
+                model.requestNASBackupScan(.wake)
+            }
+        }
+    }
+    private var observesWorkspaceWake = false
+    private var pendingActivation = false
+    private var pendingWake = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !observesWorkspaceWake else { return }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        observesWorkspaceWake = true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard let model else {
+            pendingActivation = true
+            return
+        }
+        model.requestNASBackupScan(.activation)
+    }
+
+    @objc private func workspaceDidWake(_ notification: Notification) {
+        guard let model else {
+            pendingWake = true
+            return
+        }
+        model.requestNASBackupScan(.wake)
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model,
@@ -4820,7 +4866,18 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        removeWorkspaceObservers()
         model?.stopNASBackup()
+    }
+
+    private func removeWorkspaceObservers() {
+        guard observesWorkspaceWake else { return }
+        NSWorkspace.shared.notificationCenter.removeObserver(
+            self,
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        observesWorkspaceWake = false
     }
 }
 

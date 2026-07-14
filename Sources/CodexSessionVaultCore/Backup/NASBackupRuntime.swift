@@ -10,6 +10,15 @@ public enum NASSetupState: String, Codable, Sendable {
     case error
 }
 
+public enum BackupScanTrigger: String, Sendable {
+    case startup
+    case activation
+    case timer
+    case wake
+    case reconnect
+    case queued
+}
+
 public struct NASSetupSnapshot: Codable, Equatable, Sendable {
     public static let unconfigured = NASSetupSnapshot(state: .unconfigured)
 
@@ -20,6 +29,10 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
     public let totalCount: Int
     public let lastBackupAt: Date?
     public let lastError: String?
+    public let lastAuditAt: Date?
+    public let lastAuditResult: String?
+    public let lastRepairAt: Date?
+    public let repairCount: Int?
 
     public init(
         state: NASSetupState,
@@ -28,7 +41,11 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
         completedCount: Int = 0,
         totalCount: Int = 0,
         lastBackupAt: Date? = nil,
-        lastError: String? = nil
+        lastError: String? = nil,
+        lastAuditAt: Date? = nil,
+        lastAuditResult: String? = nil,
+        lastRepairAt: Date? = nil,
+        repairCount: Int? = nil
     ) {
         self.state = state
         self.configuration = configuration
@@ -37,13 +54,17 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
         self.totalCount = totalCount
         self.lastBackupAt = lastBackupAt
         self.lastError = lastError
+        self.lastAuditAt = lastAuditAt
+        self.lastAuditResult = lastAuditResult
+        self.lastRepairAt = lastRepairAt
+        self.repairCount = repairCount
     }
 }
 
 public protocol NASBackupAgentControlling: AnyObject {
     func startPolling(intervalSeconds: UInt64)
+    func requestImmediateScan(_ trigger: BackupScanTrigger)
     func stop()
-    func pendingSessionCount() throws -> Int
 }
 
 extension BackupAgent: NASBackupAgentControlling {}
@@ -52,9 +73,13 @@ extension BackupAgent: NASBackupAgentControlling {}
 public final class NASBackupRuntime {
     public typealias AgentFactory = (
         BackupPaths,
+        UUID,
         BackupTargetValidator,
-        @escaping (BackupProgress) -> Void
+        BackupStatus?,
+        @escaping (BackupProgress) -> Void,
+        @escaping @Sendable (BackupStatus) -> Void
     ) -> any NASBackupAgentControlling
+    public typealias StatusLoader = @MainActor (URL) -> BackupStatus?
     public typealias RetryScheduler = (
         TimeInterval,
         @escaping @MainActor @Sendable () -> Void
@@ -63,6 +88,7 @@ public final class NASBackupRuntime {
     private let configurationService: NASConfigurationService
     private let codexRoot: URL
     private let agentFactory: AgentFactory
+    private let loadStatus: StatusLoader
     private let scheduleRetry: RetryScheduler
     private let retryDelay: TimeInterval
     private var agent: (any NASBackupAgentControlling)?
@@ -70,12 +96,26 @@ public final class NASBackupRuntime {
     private var snapshot = NASSetupSnapshot.unconfigured
     private var retryScheduled = false
     private var stopped = false
+    private var agentGeneration: UInt64 = 0
 
     public init(
         configurationService: NASConfigurationService,
         codexRoot: URL,
-        agentFactory: @escaping AgentFactory = { paths, validator, progress in
-            BackupAgent(paths: paths, targetValidator: validator, progressHandler: progress)
+        agentFactory: @escaping AgentFactory = { paths, deviceID, validator, initialStatus, progress, status in
+            BackupAgent(
+                paths: paths,
+                targetValidator: validator,
+                deviceID: deviceID,
+                initialStatus: initialStatus,
+                progressHandler: progress,
+                statusHandler: status
+            )
+        },
+        loadStatus: @escaping StatusLoader = { url in
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            return try? decoder.decode(BackupStatus.self, from: data)
         },
         retryDelay: TimeInterval = 30,
         scheduleRetry: @escaping RetryScheduler = { delay, action in
@@ -88,6 +128,7 @@ public final class NASBackupRuntime {
         self.configurationService = configurationService
         self.codexRoot = codexRoot
         self.agentFactory = agentFactory
+        self.loadStatus = loadStatus
         self.retryDelay = retryDelay
         self.scheduleRetry = scheduleRetry
     }
@@ -101,7 +142,7 @@ public final class NASBackupRuntime {
         )
         do {
             let target = try configurationService.resolveActiveTarget()
-            startAgent(for: target)
+            startAgent(for: target, trigger: .startup)
         } catch NASConfigurationError.configurationMissing {
             snapshot = .unconfigured
         } catch {
@@ -116,11 +157,11 @@ public final class NASBackupRuntime {
         snapshot = NASSetupSnapshot(state: .validating)
         do {
             let target = try configurationService.activate(department: department, employee: employee)
-            startAgent(for: target)
+            startAgent(for: target, trigger: .activation)
             return target
         } catch {
             if let previous = try? configurationService.resolveActiveTarget() {
-                startAgent(for: previous)
+                startAgent(for: previous, trigger: .activation)
             } else {
                 markDisconnected(error)
             }
@@ -130,12 +171,13 @@ public final class NASBackupRuntime {
 
     public func retry() throws {
         guard !stopped else { return }
+        let trigger: BackupScanTrigger = snapshot.state == .disconnected ? .reconnect : .activation
         retryScheduled = false
         stopAgent()
         snapshot = NASSetupSnapshot(state: .validating, configuration: snapshot.configuration)
         do {
             let target = try configurationService.resolveActiveTarget()
-            startAgent(for: target)
+            startAgent(for: target, trigger: trigger)
         } catch {
             markDisconnected(error)
             throw error
@@ -149,40 +191,12 @@ public final class NASBackupRuntime {
     }
 
     public func setupSnapshot() -> NASSetupSnapshot {
-        if let target = activeTarget,
-           let status = loadLocalStatus(from: target.localStateRoot.appendingPathComponent("status.json")) {
-            if status.status == .error {
-                snapshot = NASSetupSnapshot(
-                    state: .error,
-                    configuration: target.configuration,
-                    pendingCount: snapshot.pendingCount,
-                    completedCount: snapshot.completedCount,
-                    totalCount: snapshot.totalCount,
-                    lastBackupAt: status.lastBackupAt,
-                    lastError: status.lastError
-                )
-            } else if snapshot.state == .error {
-                snapshot = NASSetupSnapshot(
-                    state: .running,
-                    configuration: target.configuration,
-                    lastBackupAt: status.lastBackupAt
-                )
-            }
-        }
-        if let agent,
-           snapshot.state == .running || snapshot.state == .pending,
-           let pendingCount = try? agent.pendingSessionCount() {
-            snapshot = NASSetupSnapshot(
-                state: pendingCount > 0 ? .pending : .running,
-                configuration: snapshot.configuration,
-                pendingCount: pendingCount,
-                completedCount: snapshot.completedCount,
-                totalCount: snapshot.totalCount,
-                lastBackupAt: snapshot.lastBackupAt,
-                lastError: snapshot.lastError
-            )
-        }
         return snapshot
+    }
+
+    public func requestImmediateScan(_ trigger: BackupScanTrigger) {
+        guard !stopped else { return }
+        agent?.requestImmediateScan(trigger)
     }
 
     public func recoverySources() throws -> [NASRecoverySource] {
@@ -198,7 +212,7 @@ public final class NASBackupRuntime {
         )
     }
 
-    private func startAgent(for target: NASBackupTarget) {
+    private func startAgent(for target: NASBackupTarget, trigger: BackupScanTrigger) {
         let paths = BackupPaths(
             codexRoot: codexRoot,
             backupRoot: target.backupRoot,
@@ -210,26 +224,50 @@ public final class NASBackupRuntime {
                 throw NASConfigurationError.invalidDeviceMarker(target.deviceRoot.path)
             }
         }
-        let createdAgent = agentFactory(paths, validator) { [weak self] progress in
-            Task { @MainActor in
-                self?.record(progress)
-            }
-        }
-        agent = createdAgent
+        let initialStatus = loadStatus(paths.localStatusURL)
+        agentGeneration &+= 1
+        let generation = agentGeneration
         activeTarget = target
+        snapshot = snapshot(
+            state: initialStatus?.status == .error ? .error : .running,
+            configuration: target.configuration,
+            status: initialStatus
+        )
+        let createdAgent = agentFactory(
+            paths,
+            target.configuration.deviceID,
+            validator,
+            initialStatus,
+            { [weak self] progress in
+                Task { @MainActor in
+                    self?.record(progress, for: target.configuration, generation: generation)
+                }
+            },
+            { [weak self] status in
+                Task { @MainActor in
+                    self?.record(status, for: target.configuration, generation: generation)
+                }
+            }
+        )
+        agent = createdAgent
         retryScheduled = false
-        createdAgent.startPolling(intervalSeconds: 10)
-        snapshot = NASSetupSnapshot(state: .running, configuration: target.configuration)
+        createdAgent.startPolling(intervalSeconds: 30)
+        createdAgent.requestImmediateScan(trigger)
     }
 
     private func stopAgent() {
+        agentGeneration &+= 1
         agent?.stop()
         agent = nil
         activeTarget = nil
     }
 
-    private func record(_ progress: BackupProgress) {
-        guard let configuration = activeTarget?.configuration else { return }
+    private func record(
+        _ progress: BackupProgress,
+        for configuration: NASBackupConfiguration,
+        generation: UInt64
+    ) {
+        guard agentGeneration == generation, activeTarget?.configuration == configuration else { return }
         let state: NASSetupState = progress.pendingFiles > 0
             ? (progress.phase == .seeding ? .seeding : .pending)
             : .running
@@ -238,8 +276,31 @@ public final class NASBackupRuntime {
             configuration: configuration,
             pendingCount: progress.pendingFiles,
             completedCount: progress.completedFiles,
-            totalCount: progress.totalFiles
+            totalCount: progress.totalFiles,
+            lastBackupAt: snapshot.lastBackupAt,
+            lastError: snapshot.lastError,
+            lastAuditAt: snapshot.lastAuditAt,
+            lastAuditResult: snapshot.lastAuditResult,
+            lastRepairAt: snapshot.lastRepairAt,
+            repairCount: snapshot.repairCount
         )
+    }
+
+    private func record(
+        _ status: BackupStatus,
+        for configuration: NASBackupConfiguration,
+        generation: UInt64
+    ) {
+        guard agentGeneration == generation, activeTarget?.configuration == configuration else { return }
+        let state: NASSetupState
+        if status.status == .error {
+            state = .error
+        } else if snapshot.pendingCount > 0 {
+            state = snapshot.state == .seeding ? .seeding : .pending
+        } else {
+            state = .running
+        }
+        snapshot = snapshot(state: state, configuration: configuration, status: status)
     }
 
     private func markDisconnected(_ error: Error) {
@@ -247,7 +308,15 @@ public final class NASBackupRuntime {
         snapshot = NASSetupSnapshot(
             state: .disconnected,
             configuration: snapshot.configuration,
-            lastError: error.localizedDescription
+            pendingCount: snapshot.pendingCount,
+            completedCount: snapshot.completedCount,
+            totalCount: snapshot.totalCount,
+            lastBackupAt: snapshot.lastBackupAt,
+            lastError: error.localizedDescription,
+            lastAuditAt: snapshot.lastAuditAt,
+            lastAuditResult: snapshot.lastAuditResult,
+            lastRepairAt: snapshot.lastRepairAt,
+            repairCount: snapshot.repairCount
         )
         guard !retryScheduled, !stopped else { return }
         retryScheduled = true
@@ -258,10 +327,24 @@ public final class NASBackupRuntime {
         }
     }
 
-    private func loadLocalStatus(from url: URL) -> BackupStatus? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(BackupStatus.self, from: data)
+    private func snapshot(
+        state: NASSetupState,
+        configuration: NASBackupConfiguration,
+        status: BackupStatus?
+    ) -> NASSetupSnapshot {
+        NASSetupSnapshot(
+            state: state,
+            configuration: configuration,
+            pendingCount: snapshot.pendingCount,
+            completedCount: snapshot.completedCount,
+            totalCount: snapshot.totalCount,
+            lastBackupAt: status?.lastBackupAt ?? snapshot.lastBackupAt,
+            lastError: status?.lastError,
+            lastAuditAt: status?.lastAuditAt ?? snapshot.lastAuditAt,
+            lastAuditResult: status?.lastAuditResult ?? snapshot.lastAuditResult,
+            lastRepairAt: status?.lastRepairAt ?? snapshot.lastRepairAt,
+            repairCount: status?.repairCount ?? snapshot.repairCount
+        )
     }
+
 }

@@ -29,6 +29,8 @@ struct NASBackupRuntimeTests {
         #expect(fixture.agentFactory.agents.count == 1)
         #expect(fixture.agentFactory.agents[0].paths.backupRoot == target.backupRoot)
         #expect(fixture.agentFactory.agents[0].startCount == 1)
+        #expect(fixture.agentFactory.agents[0].pollingIntervals == [30])
+        #expect(fixture.agentFactory.agents[0].triggers == [.startup])
         #expect(runtime.setupSnapshot().state == .running)
     }
 
@@ -51,6 +53,7 @@ struct NASBackupRuntimeTests {
         fixture.scheduler.fireNext()
 
         #expect(fixture.agentFactory.agents.count == 1)
+        #expect(fixture.agentFactory.agents[0].triggers == [.reconnect])
         #expect(runtime.setupSnapshot().state == .running)
     }
 
@@ -69,31 +72,63 @@ struct NASBackupRuntimeTests {
     }
 
     @Test
-    func setupSnapshotReportsMetadataOnlyPendingCount() throws {
+    func setupSnapshotIsPureCachedRead() throws {
         let fixture = try NASRuntimeFixture()
         defer { fixture.cleanup() }
         _ = try fixture.activateStoredConfiguration()
         let runtime = fixture.makeRuntime()
         try runtime.initialize()
-        fixture.agentFactory.agents[0].pendingCount = 2
+        fixture.resetRuntimeIOCounts()
+        let agent = fixture.agentFactory.agents[0]
+        let requestsBeforeReads = agent.interactionCount
 
-        let snapshot = runtime.setupSnapshot()
+        for _ in 0..<100 {
+            _ = runtime.setupSnapshot()
+        }
 
-        #expect(snapshot.state == .pending)
-        #expect(snapshot.pendingCount == 2)
+        #expect(agent.interactionCount == requestsBeforeReads)
+        #expect(agent.pendingCallCount == 0)
+        #expect(fixture.statusReadCount == 0)
     }
 
     @Test
-    func setupSnapshotSurfacesAgentLocalErrorStatus() throws {
+    func initializationLoadsPersistedStatusOnceAndCachesAuditFields() throws {
         let fixture = try NASRuntimeFixture()
         defer { fixture.cleanup() }
         let target = try fixture.activateStoredConfiguration()
-        let runtime = fixture.makeRuntime()
-        try runtime.initialize()
         try fixture.writeLocalErrorStatus(for: target, message: "NAS volume disappeared")
+        let runtime = fixture.makeRuntime()
+
+        try runtime.initialize()
 
         let snapshot = runtime.setupSnapshot()
 
+        #expect(fixture.statusReadCount == 1)
+        #expect(snapshot.state == .error)
+        #expect(snapshot.lastError == "NAS volume disappeared")
+        #expect(snapshot.lastAuditAt == Date(timeIntervalSince1970: 1_700_000_002))
+        #expect(snapshot.lastAuditResult == "completed")
+        #expect(snapshot.lastRepairAt == Date(timeIntervalSince1970: 1_700_000_003))
+        #expect(snapshot.repairCount == 4)
+    }
+
+    @Test
+    func agentStatusCallbackUpdatesCachedSnapshotWithoutStatusRead() async throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        fixture.resetRuntimeIOCounts()
+
+        fixture.agentFactory.agents[0].publishStatus(fixture.status(
+            health: .error,
+            message: "NAS volume disappeared"
+        ))
+        await Task.yield()
+
+        let snapshot = runtime.setupSnapshot()
+        #expect(fixture.statusReadCount == 0)
         #expect(snapshot.state == .error)
         #expect(snapshot.lastError == "NAS volume disappeared")
     }
@@ -111,7 +146,34 @@ struct NASBackupRuntimeTests {
         try runtime.retry()
 
         #expect(fixture.agentFactory.agents.count == 1)
+        #expect(fixture.agentFactory.agents[0].triggers == [.reconnect])
         #expect(runtime.setupSnapshot().state == .running)
+    }
+
+    @Test
+    func successfulFirstActivationRequestsImmediateActivationScan() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+
+        _ = try runtime.activate(department: "运营部", employee: "陈超")
+
+        #expect(fixture.agentFactory.agents.count == 1)
+        #expect(fixture.agentFactory.agents[0].triggers == [.activation])
+    }
+
+    @Test
+    func lifecycleScanRequestForwardsToActiveAgent() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+
+        runtime.requestImmediateScan(.wake)
+
+        #expect(fixture.agentFactory.agents[0].triggers == [.startup, .wake])
     }
 
     @Test
@@ -128,6 +190,27 @@ struct NASBackupRuntimeTests {
         #expect(fixture.agentFactory.agents[0].stopCount == 1)
         let restarted = try #require(fixture.agentFactory.agents.dropFirst().first)
         #expect(restarted.startCount == 1)
+        #expect(restarted.triggers == [.activation])
+    }
+
+    @Test
+    func stoppedAgentStatusCallbackCannotOverwriteReplacementAgentSnapshot() async throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        let stoppedAgent = fixture.agentFactory.agents[0]
+        try runtime.retry()
+
+        stoppedAgent.publishStatus(fixture.status(
+            health: .error,
+            message: "stale stopped agent"
+        ))
+        await Task.yield()
+
+        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().lastError == nil)
     }
 
     @Test
@@ -146,6 +229,7 @@ struct NASBackupRuntimeTests {
         #expect(fixture.agentFactory.agents[0].stopCount == 1)
         #expect(fixture.agentFactory.agents[1].paths.backupRoot == previous.backupRoot)
         #expect(fixture.agentFactory.agents[1].startCount == 1)
+        #expect(fixture.agentFactory.agents[1].triggers == [.activation])
         #expect(runtime.setupSnapshot().state == .running)
     }
 
@@ -180,6 +264,7 @@ private final class NASRuntimeFixture {
     let agentFactory = RecordingNASAgentFactory()
     let scheduler = RecordingRetryScheduler()
     private let connectivity = NASRuntimeConnectivity()
+    private(set) var statusReadCount = 0
     var connected: Bool {
         get { connectivity.isConnected }
         set { connectivity.isConnected = newValue }
@@ -227,9 +312,29 @@ private final class NASRuntimeFixture {
         NASBackupRuntime(
             configurationService: service,
             codexRoot: codexRoot,
-            agentFactory: { paths, _, _ in self.agentFactory.make(paths: paths) },
+            agentFactory: { paths, _, _, initialStatus, _, statusHandler in
+                self.agentFactory.make(
+                    paths: paths,
+                    initialStatus: initialStatus,
+                    statusHandler: statusHandler
+                )
+            },
+            loadStatus: { url in
+                self.statusReadCount += 1
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                return try? decoder.decode(BackupStatus.self, from: data)
+            },
             scheduleRetry: { delay, action in self.scheduler.schedule(delay: delay, action: action) }
         )
+    }
+
+    func resetRuntimeIOCounts() {
+        statusReadCount = 0
+        for agent in agentFactory.agents {
+            agent.resetInteractionCounts()
+        }
     }
 
     func activateStoredConfiguration() throws -> NASBackupTarget {
@@ -283,13 +388,21 @@ private final class NASRuntimeFixture {
     }
 
     func writeLocalErrorStatus(for target: NASBackupTarget, message: String) throws {
-        let status = BackupStatus(
+        let status = status(health: .error, message: message)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try FileManager.default.createDirectory(at: target.localStateRoot, withIntermediateDirectories: true)
+        try encoder.encode(status).write(to: target.localStateRoot.appendingPathComponent("status.json"))
+    }
+
+    func status(health: BackupHealthStatus, message: String?) -> BackupStatus {
+        BackupStatus(
             agentVersion: "2.0.0",
             enabled: true,
-            status: .error,
+            status: health,
             mode: .polling,
             codexRoot: codexRoot.path,
-            backupRoot: target.backupRoot.path,
+            backupRoot: trustedRoot.path,
             firstRunAt: Date(timeIntervalSince1970: 1_700_000_000),
             lastStartedAt: Date(timeIntervalSince1970: 1_700_000_000),
             lastHeartbeatAt: Date(timeIntervalSince1970: 1_700_000_001),
@@ -298,12 +411,12 @@ private final class NASRuntimeFixture {
             lineCount: 1,
             bytesBackedUp: 32,
             autoStartEnabled: false,
-            lastError: message
+            lastError: message,
+            lastAuditAt: Date(timeIntervalSince1970: 1_700_000_002),
+            lastAuditResult: "completed",
+            lastRepairAt: Date(timeIntervalSince1970: 1_700_000_003),
+            repairCount: 4
         )
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        try FileManager.default.createDirectory(at: target.localStateRoot, withIntermediateDirectories: true)
-        try encoder.encode(status).write(to: target.localStateRoot.appendingPathComponent("status.json"))
     }
 
     func cleanup() {
@@ -319,32 +432,70 @@ private final class NASRuntimeConnectivity {
 private final class RecordingNASAgentFactory {
     private(set) var agents: [RecordingNASAgent] = []
 
-    func make(paths: BackupPaths) -> RecordingNASAgent {
-        let agent = RecordingNASAgent(paths: paths)
+    func make(
+        paths: BackupPaths,
+        initialStatus: BackupStatus?,
+        statusHandler: @escaping @Sendable (BackupStatus) -> Void
+    ) -> RecordingNASAgent {
+        let agent = RecordingNASAgent(
+            paths: paths,
+            initialStatus: initialStatus,
+            statusHandler: statusHandler
+        )
         agents.append(agent)
         return agent
     }
 }
 
-private final class RecordingNASAgent: NASBackupAgentControlling {
+private final class RecordingNASAgent: NASBackupAgentControlling, @unchecked Sendable {
     let paths: BackupPaths
     private(set) var startCount = 0
     private(set) var stopCount = 0
-    var pendingCount = 0
+    private(set) var pollingIntervals: [UInt64] = []
+    private(set) var triggers: [BackupScanTrigger] = []
+    private(set) var pendingCallCount = 0
+    private let statusHandler: @Sendable (BackupStatus) -> Void
+    let initialStatus: BackupStatus?
 
-    init(paths: BackupPaths) {
+    var interactionCount: Int {
+        startCount + stopCount + triggers.count + pendingCallCount
+    }
+
+    init(
+        paths: BackupPaths,
+        initialStatus: BackupStatus?,
+        statusHandler: @escaping @Sendable (BackupStatus) -> Void
+    ) {
         self.paths = paths
+        self.initialStatus = initialStatus
+        self.statusHandler = statusHandler
     }
 
     func startPolling(intervalSeconds: UInt64) {
         startCount += 1
+        pollingIntervals.append(intervalSeconds)
+    }
+
+    func requestImmediateScan(_ trigger: BackupScanTrigger) {
+        triggers.append(trigger)
     }
 
     func stop() {
         stopCount += 1
     }
 
-    func pendingSessionCount() throws -> Int { pendingCount }
+    func pendingSessionCount() throws -> Int {
+        pendingCallCount += 1
+        return 0
+    }
+
+    func publishStatus(_ status: BackupStatus) {
+        statusHandler(status)
+    }
+
+    func resetInteractionCounts() {
+        pendingCallCount = 0
+    }
 }
 
 @MainActor

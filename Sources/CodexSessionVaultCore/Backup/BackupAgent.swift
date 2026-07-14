@@ -40,21 +40,36 @@ public final class BackupAgent: @unchecked Sendable {
     private let fileManager: FileManager
     private let tailer: SessionTailer
     private let targetValidator: BackupTargetValidator
+    private let deviceID: UUID?
     private let fileCommitter: BackupFileCommitter
     private let sessionBackupStreamer: SessionBackupStreamer
     private let progressHandler: ((BackupProgress) -> Void)?
+    private let statusHandler: (@Sendable (BackupStatus) -> Void)?
     private let remoteStatusWriter: (Data, URL) throws -> Void
     private let cursorStoreFactory: (URL) -> BackupCursorStore
     private let manifestStoreFactory: (URL) -> BackupManifestStore
     private let instrumentation: BackupAgentInstrumentation
     private let integrityAuditorFactory: (BackupPaths) -> BackupIntegrityAuditor
     private let scanLock = NSLock()
-    private let auditInterruptionLock = NSLock()
-    private let taskLock = NSLock()
+    private let stateLock = NSLock()
     private var pollingTask: Task<Void, Never>?
+    private var auditTimerTask: Task<Void, Never>?
+    private var workerTask: Task<Void, Never>?
     private var pollingStartedAt: Date?
     private var lastKnownProgress: BackupProgress?
+    private var cachedStatus: BackupStatus?
     private var auditInterruptionRequested = false
+    private var workerActive = false
+    private var isScanning = false
+    private var isAuditing = false
+    private var rescanQueued = false
+    private var auditQueued = false
+    private var stopped = false
+
+    private enum BackgroundWork {
+        case scan(BackupScanTrigger)
+        case audit
+    }
 
     private struct ProcessSessionFileResult {
         var manifestChanged: Bool
@@ -68,8 +83,11 @@ public final class BackupAgent: @unchecked Sendable {
         fileManager: FileManager = .default,
         tailer: SessionTailer = SessionTailer(),
         targetValidator: BackupTargetValidator? = nil,
+        deviceID: UUID? = nil,
+        initialStatus: BackupStatus? = nil,
         fileCommitter: BackupFileCommitter = BackupFileCommitter(),
         progressHandler: ((BackupProgress) -> Void)? = nil,
+        statusHandler: (@Sendable (BackupStatus) -> Void)? = nil,
         remoteStatusWriter: ((Data, URL) throws -> Void)? = nil
     ) {
         self.init(
@@ -78,8 +96,11 @@ public final class BackupAgent: @unchecked Sendable {
             fileManager: fileManager,
             tailer: tailer,
             targetValidator: targetValidator,
+            deviceID: deviceID,
+            initialStatus: initialStatus,
             fileCommitter: fileCommitter,
             progressHandler: progressHandler,
+            statusHandler: statusHandler,
             remoteStatusWriter: remoteStatusWriter,
             sessionBackupStreamer: SessionBackupStreamer(),
             cursorStoreFactory: { BackupCursorStore(databaseURL: $0) },
@@ -97,8 +118,11 @@ public final class BackupAgent: @unchecked Sendable {
         fileManager: FileManager = .default,
         tailer: SessionTailer = SessionTailer(),
         targetValidator: BackupTargetValidator? = nil,
+        deviceID: UUID? = nil,
+        initialStatus: BackupStatus? = nil,
         fileCommitter: BackupFileCommitter = BackupFileCommitter(),
         progressHandler: ((BackupProgress) -> Void)? = nil,
+        statusHandler: (@Sendable (BackupStatus) -> Void)? = nil,
         remoteStatusWriter: ((Data, URL) throws -> Void)? = nil,
         sessionBackupStreamer: SessionBackupStreamer,
         cursorStoreFactory: @escaping (URL) -> BackupCursorStore,
@@ -113,13 +137,16 @@ public final class BackupAgent: @unchecked Sendable {
         self.fileManager = fileManager
         self.tailer = tailer
         self.targetValidator = targetValidator ?? BackupTargetValidator(backupRoot: paths.backupRoot)
+        self.deviceID = deviceID
         self.fileCommitter = fileCommitter
         self.sessionBackupStreamer = sessionBackupStreamer
         self.progressHandler = progressHandler
+        self.statusHandler = statusHandler
         self.cursorStoreFactory = cursorStoreFactory
         self.manifestStoreFactory = manifestStoreFactory
         self.instrumentation = instrumentation
         self.integrityAuditorFactory = integrityAuditorFactory
+        self.cachedStatus = initialStatus ?? Self.loadPersistedStatus(at: paths.localStatusURL)
         self.remoteStatusWriter = remoteStatusWriter ?? { data, url in
             try DurableAtomicWriter().write(data, to: url, createParentDirectories: false)
         }
@@ -151,7 +178,7 @@ public final class BackupAgent: @unchecked Sendable {
             let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
             try cursorStore.open()
             let cursors = try cursorStore.loadAll()
-            return try integrityAuditorFactory(paths).runIfDue(
+            let outcome = try integrityAuditorFactory(paths).runIfDue(
                 now: now(),
                 deviceID: deviceID,
                 cursors: cursors,
@@ -159,6 +186,10 @@ public final class BackupAgent: @unchecked Sendable {
                     self?.isAuditInterruptionRequested() ?? true
                 }
             )
+            if outcome != .interrupted {
+                publishPersistedStatusIfAvailable()
+            }
+            return outcome
         } catch {
             try? writeErrorStatus(error)
             throw error
@@ -169,7 +200,15 @@ public final class BackupAgent: @unchecked Sendable {
         try targetValidator.validateTarget()
         try ensureLocalStateDirectoriesExist()
         let scanDate = now()
+        let pendingRepairURL = paths.stateRoot.appendingPathComponent(
+            "integrity-repair-pending.json",
+            isDirectory: false
+        )
+        let recoveringPendingRepair = fileManager.fileExists(atPath: pendingRepairURL.path)
         try integrityAuditorFactory(paths).recoverPendingRepairIfNeeded(now: scanDate)
+        if recoveringPendingRepair {
+            publishPersistedStatusIfAvailable()
+        }
         let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
         try cursorStore.open()
         let cursorMap = try cursorStore.loadAll()
@@ -258,32 +297,215 @@ public final class BackupAgent: @unchecked Sendable {
         try writePendingSources([])
     }
 
-    public func startPolling(intervalSeconds: UInt64 = 10) {
-        taskLock.lock()
-        defer { taskLock.unlock() }
-        guard pollingTask == nil else { return }
-        pollingStartedAt = now()
+    public func startPolling(intervalSeconds: UInt64 = 30) {
         let sleepNanoseconds = Self.nanoseconds(fromSeconds: intervalSeconds)
-        pollingTask = Task { [weak self] in
+        stateLock.lock()
+        guard !stopped, pollingTask == nil else {
+            stateLock.unlock()
+            return
+        }
+        pollingStartedAt = now()
+        pollingTask = Task.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
-                try? self.performOneShotScan()
-                guard !Task.isCancelled else { return }
                 do {
                     try await Task.sleep(nanoseconds: sleepNanoseconds)
                 } catch {
                     return
                 }
+                guard let self, !Task.isCancelled else { return }
+                self.requestImmediateScan(.timer)
             }
+        }
+        stateLock.unlock()
+    }
+
+    public func requestImmediateScan(_ trigger: BackupScanTrigger) {
+        stateLock.lock()
+        guard !stopped else {
+            stateLock.unlock()
+            return
+        }
+        auditInterruptionRequested = true
+        if workerActive {
+            rescanQueued = true
+            if isAuditing {
+                auditQueued = true
+            }
+        } else {
+            startWorkerLocked(with: .scan(trigger))
+        }
+        stateLock.unlock()
+        instrumentation.auditInterruptionSet()
+        if trigger == .wake {
+            scheduleAudit(replacingExisting: true)
         }
     }
 
     public func stop() {
-        taskLock.lock()
-        let task = pollingTask
+        stateLock.lock()
+        guard !stopped else {
+            stateLock.unlock()
+            return
+        }
+        stopped = true
+        auditInterruptionRequested = true
+        rescanQueued = false
+        auditQueued = false
+        let polling = pollingTask
+        let auditTimer = auditTimerTask
+        let worker = workerTask
         pollingTask = nil
-        taskLock.unlock()
-        task?.cancel()
+        auditTimerTask = nil
+        stateLock.unlock()
+        instrumentation.auditInterruptionSet()
+        polling?.cancel()
+        auditTimer?.cancel()
+        worker?.cancel()
+    }
+
+    private func startWorkerLocked(with initialWork: BackgroundWork) {
+        workerActive = true
+        workerTask = Task.detached(priority: .utility) { [weak self] in
+            self?.drainBackgroundWork(startingWith: initialWork)
+        }
+    }
+
+    private func drainBackgroundWork(startingWith initialWork: BackgroundWork) {
+        var work = initialWork
+        while true {
+            guard !backgroundWorkShouldStop() else {
+                finishBackgroundWorker()
+                return
+            }
+
+            var interruptedAudit = false
+            switch work {
+            case .scan:
+                setBackgroundPhase(scanning: true, auditing: false)
+                try? performOneShotScan()
+                setBackgroundPhase(scanning: false, auditing: false)
+                ensureAuditScheduled()
+            case .audit:
+                setBackgroundPhase(scanning: false, auditing: true)
+                if let deviceID {
+                    interruptedAudit = (try? performIntegrityAuditIfDue(deviceID: deviceID)) == .interrupted
+                }
+                setBackgroundPhase(scanning: false, auditing: false)
+                if !interruptedAudit {
+                    scheduleAudit(replacingExisting: true)
+                }
+            }
+
+            stateLock.lock()
+            if stopped {
+                workerActive = false
+                workerTask = nil
+                stateLock.unlock()
+                return
+            }
+            if interruptedAudit {
+                auditQueued = true
+            }
+            if rescanQueued {
+                rescanQueued = false
+                work = .scan(.queued)
+                stateLock.unlock()
+                continue
+            }
+            if auditQueued {
+                auditQueued = false
+                work = .audit
+                stateLock.unlock()
+                continue
+            }
+            workerActive = false
+            workerTask = nil
+            stateLock.unlock()
+            return
+        }
+    }
+
+    private func backgroundWorkShouldStop() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped || Task.isCancelled
+    }
+
+    private func setBackgroundPhase(scanning: Bool, auditing: Bool) {
+        stateLock.lock()
+        isScanning = scanning
+        isAuditing = auditing
+        stateLock.unlock()
+    }
+
+    private func finishBackgroundWorker() {
+        stateLock.lock()
+        workerActive = false
+        isScanning = false
+        isAuditing = false
+        workerTask = nil
+        stateLock.unlock()
+    }
+
+    private func requestScheduledAudit() {
+        stateLock.lock()
+        auditTimerTask = nil
+        guard !stopped else {
+            stateLock.unlock()
+            return
+        }
+        if workerActive {
+            auditQueued = true
+        } else {
+            startWorkerLocked(with: .audit)
+        }
+        stateLock.unlock()
+    }
+
+    private func ensureAuditScheduled() {
+        stateLock.lock()
+        let shouldSchedule = !stopped
+            && deviceID != nil
+            && auditTimerTask == nil
+            && !auditQueued
+            && !isAuditing
+        stateLock.unlock()
+        if shouldSchedule {
+            scheduleAudit(replacingExisting: false)
+        }
+    }
+
+    private func scheduleAudit(replacingExisting: Bool) {
+        guard let deviceID else { return }
+        stateLock.lock()
+        guard !stopped else {
+            stateLock.unlock()
+            return
+        }
+        if !replacingExisting, auditTimerTask != nil {
+            stateLock.unlock()
+            return
+        }
+        let existingTask = auditTimerTask
+        auditTimerTask = nil
+        let currentDate = now()
+        let delay = Self.auditDelay(
+            now: currentDate,
+            lastAuditAt: cachedStatus?.lastAuditAt,
+            deviceID: deviceID
+        )
+        let delayNanoseconds = Self.nanoseconds(fromTimeInterval: delay)
+        auditTimerTask = Task.detached(priority: .background) { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.requestScheduledAudit()
+        }
+        stateLock.unlock()
+        existingTask?.cancel()
     }
 
     public func pendingSessionCount() throws -> Int {
@@ -596,7 +818,7 @@ public final class BackupAgent: @unchecked Sendable {
         at date: Date,
         includeRemote: Bool
     ) throws {
-        let existingStatus = try? loadLocalStatus()
+        let existingStatus = cachedStatusSnapshot()
         let auditState = try? loadIntegrityAuditState()
         let records = Array(manifest.sessions.values)
         let snapshot = BackupStatus(
@@ -628,6 +850,7 @@ public final class BackupAgent: @unchecked Sendable {
             try remoteStatusWriter(data, paths.remoteStatusURL)
         }
         try DurableAtomicWriter().write(data, to: paths.localStatusURL, createParentDirectories: true)
+        publish(snapshot)
     }
 
     private func writeErrorStatus(_ error: Error) throws {
@@ -666,6 +889,31 @@ public final class BackupAgent: @unchecked Sendable {
         return try decoder.decode(BackupStatus.self, from: Data(contentsOf: paths.localStatusURL))
     }
 
+    private static func loadPersistedStatus(at url: URL) -> BackupStatus? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? decoder.decode(BackupStatus.self, from: data)
+    }
+
+    private func publishPersistedStatusIfAvailable() {
+        guard let status = try? loadLocalStatus() else { return }
+        publish(status)
+    }
+
+    private func publish(_ status: BackupStatus) {
+        stateLock.lock()
+        cachedStatus = status
+        stateLock.unlock()
+        statusHandler?(status)
+    }
+
+    private func cachedStatusSnapshot() -> BackupStatus? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return cachedStatus
+    }
+
     private func loadIntegrityAuditState() throws -> IntegrityAuditState {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -676,21 +924,21 @@ public final class BackupAgent: @unchecked Sendable {
     }
 
     private func requestAuditInterruption() {
-        auditInterruptionLock.lock()
+        stateLock.lock()
         auditInterruptionRequested = true
-        auditInterruptionLock.unlock()
+        stateLock.unlock()
         instrumentation.auditInterruptionSet()
     }
 
     private func clearAuditInterruption() {
-        auditInterruptionLock.lock()
+        stateLock.lock()
         auditInterruptionRequested = false
-        auditInterruptionLock.unlock()
+        stateLock.unlock()
     }
 
     private func isAuditInterruptionRequested() -> Bool {
-        auditInterruptionLock.lock()
-        defer { auditInterruptionLock.unlock() }
+        stateLock.lock()
+        defer { stateLock.unlock() }
         return auditInterruptionRequested
     }
 
@@ -710,9 +958,9 @@ public final class BackupAgent: @unchecked Sendable {
     }
 
     private func startedAt(existingStatus: BackupStatus?, fallback: Date) -> Date {
-        taskLock.lock()
+        stateLock.lock()
         let value = pollingStartedAt
-        taskLock.unlock()
+        stateLock.unlock()
         return value ?? existingStatus?.lastStartedAt ?? fallback
     }
 
@@ -720,6 +968,32 @@ public final class BackupAgent: @unchecked Sendable {
         let multiplier: UInt64 = 1_000_000_000
         guard seconds <= UInt64.max / multiplier else { return UInt64.max }
         return seconds * multiplier
+    }
+
+    private static func nanoseconds(fromTimeInterval interval: TimeInterval) -> UInt64 {
+        guard interval.isFinite, interval > 0 else { return 0 }
+        let nanoseconds = interval * 1_000_000_000
+        guard nanoseconds < Double(UInt64.max) else { return UInt64.max }
+        return UInt64(nanoseconds.rounded(.up))
+    }
+
+    static func auditDelay(now: Date, lastAuditAt: Date?, deviceID: UUID) -> TimeInterval {
+        let auditInterval: TimeInterval = 86_400
+        guard let lastAuditAt else {
+            return BackupIntegrityAuditor.overdueWakeDelaySeconds(deviceID: deviceID)
+        }
+        if now.timeIntervalSince(lastAuditAt) >= auditInterval {
+            return BackupIntegrityAuditor.overdueWakeDelaySeconds(deviceID: deviceID)
+        }
+
+        let offset = BackupIntegrityAuditor.dailyOffsetSeconds(deviceID: deviceID)
+        let startOfUTCDay = floor(now.timeIntervalSince1970 / auditInterval) * auditInterval
+        var candidate = Date(timeIntervalSince1970: startOfUTCDay + offset)
+        let earliestAllowed = lastAuditAt.addingTimeInterval(auditInterval)
+        while candidate <= now || candidate < earliestAllowed {
+            candidate = candidate.addingTimeInterval(auditInterval)
+        }
+        return candidate.timeIntervalSince(now)
     }
 }
 
