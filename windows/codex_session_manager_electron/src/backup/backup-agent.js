@@ -327,11 +327,10 @@ class BackupAgent {
     }
 
     const firstSeenAt = existingRecord?.firstSeenAt || scanDate.toISOString();
-    const streamedTitle = freshPrefixSeed
-      ? adoptedPrefix?.firstTitle || streamed.firstTitle
-      : streamed.firstTitle;
     const title = existingRecord?.title
-      || streamedTitle;
+      || adoptedPrefix?.firstTitle
+      || streamed.firstTitle
+      || null;
     const updatedRecord = {
       sessionId,
       sourcePath,

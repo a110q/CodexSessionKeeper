@@ -722,6 +722,39 @@ test('matching interrupted append is adopted without duplication', async (t) => 
   assert.equal(JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions.interrupted.lineCount, 2);
 });
 
+test('adopting an ahead user record recovers and preserves the first title', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'interrupted-title.jsonl');
+  const assistant = jsonLine({ role: 'assistant', content: 'assistant only' });
+  const firstUser = jsonLine({ role: 'user', content: 'Recovered first prompt' });
+  const laterUser = jsonLine({ role: 'user', content: 'Later prompt' });
+  await writeSessionFile(sourcePath, [assistant]);
+  const agent = new BackupAgent({ paths, now: makeClock() });
+
+  await agent.performOneShotScan();
+  let manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  assert.equal(manifest.sessions['interrupted-title'].title, null);
+
+  const targetPath = paths.backupFilePath(sourcePath);
+  await fs.appendFile(sourcePath, firstUser);
+  await fs.appendFile(targetPath, firstUser);
+  await agent.performOneShotScan();
+
+  manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  assert.equal(manifest.sessions['interrupted-title'].title, 'Recovered first prompt');
+  assert.equal(manifest.sessions['interrupted-title'].lineCount, 2);
+
+  await agent.performOneShotScan();
+  manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  assert.equal(manifest.sessions['interrupted-title'].title, 'Recovered first prompt');
+
+  await fs.appendFile(sourcePath, laterUser);
+  await agent.performOneShotScan();
+  manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  assert.equal(manifest.sessions['interrupted-title'].title, 'Recovered first prompt');
+  assert.equal(await fs.readFile(targetPath, 'utf8'), assistant + firstUser + laterUser);
+});
+
 test('retry syncs an adopted ahead target before advancing metadata', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'sync-ahead-retry.jsonl');
