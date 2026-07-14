@@ -8,13 +8,17 @@ function temporaryPathFor(destination) {
   return path.join(path.dirname(destination), `.${path.basename(destination)}.tmp-${nonce}`);
 }
 
-async function writeSyncedTemporaryFile(destination, data, { sync = (handle) => handle.sync() } = {}) {
+async function writeSyncedTemporaryFileWithWriter(
+  destination,
+  writer,
+  { sync = (handle) => handle.sync() } = {},
+) {
   const temporaryPath = temporaryPathFor(destination);
   let handle;
 
   try {
     handle = await fsp.open(temporaryPath, 'wx');
-    await handle.writeFile(data);
+    await writer(handle);
     await sync(handle);
     await handle.close();
     handle = null;
@@ -26,8 +30,16 @@ async function writeSyncedTemporaryFile(destination, data, { sync = (handle) => 
   }
 }
 
-async function replaceFileDurably(destination, data, options = {}) {
-  const temporaryPath = await writeSyncedTemporaryFile(destination, data, options);
+async function writeSyncedTemporaryFile(destination, data, options = {}) {
+  return writeSyncedTemporaryFileWithWriter(
+    destination,
+    (handle) => handle.writeFile(data),
+    options,
+  );
+}
+
+async function durableReplaceWithWriter(destination, writer, options = {}) {
+  const temporaryPath = await writeSyncedTemporaryFileWithWriter(destination, writer, options);
 
   try {
     await fsp.rename(temporaryPath, destination);
@@ -35,6 +47,10 @@ async function replaceFileDurably(destination, data, options = {}) {
     await fsp.rm(temporaryPath, { force: true }).catch(() => {});
     throw error;
   }
+}
+
+async function replaceFileDurably(destination, data, options = {}) {
+  return durableReplaceWithWriter(destination, (handle) => handle.writeFile(data), options);
 }
 
 async function writeFileDurably(destination, data, options = {}) {
@@ -79,6 +95,7 @@ async function writeFileDurably(destination, data, options = {}) {
 }
 
 module.exports = {
+  durableReplaceWithWriter,
   replaceFileDurably,
   writeFileDurably,
 };

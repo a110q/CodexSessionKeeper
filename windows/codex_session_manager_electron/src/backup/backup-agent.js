@@ -1,15 +1,20 @@
 'use strict';
 
-const crypto = require('node:crypto');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 
 const { CursorStore } = require('./cursor-store');
-const { replaceFileDurably, writeFileDurably } = require('./durable-write');
+const { replaceFileDurably } = require('./durable-write');
 const { AGENT_VERSION, MANIFEST_VERSION } = require('./models');
 const { loadOrCreateManifest, saveManifest } = require('./manifest-store');
-const { readNewCompleteLines } = require('./session-tailer');
 const { sessionIdFromPath, titleFromJsonLine } = require('./session-identity');
+const {
+  appendCompleteLines,
+  rangesMatch,
+  rebuildSessionCompleteLines,
+  streamStats,
+  targetIsCompletePrefix,
+} = require('./session-backup-streamer');
 
 const ACTIVE_STATUS = 'active';
 
@@ -28,7 +33,7 @@ class BackupAgent {
 
     this.paths = paths;
     this.now = now;
-    this.tailer = tailer || { readNewCompleteLines };
+    this.tailer = tailer || null;
     this.validateTarget = validateTarget;
     this.fileCommitter = fileCommitter;
     this.onProgress = onProgress;
@@ -211,78 +216,109 @@ class BackupAgent {
     const sourceStats = await trustedSourceMetadata(sourcePath);
     const existingRecord = manifest.sessions[sessionId] || null;
     const baselineCursor = currentCursor || this.migratedCursor(existingRecord, sourcePath, cursorMap);
-    const mappedBackupPath = this.paths.backupFilePath(sourcePath);
     const backupPath = this.backupFilePathFor(sourcePath, existingRecord, baselineCursor);
     const relativeBackupPath = this.validatedRelativeBackupPath(backupPath);
-    const mappedRelativePath = this.validatedRelativeBackupPath(mappedBackupPath);
+    if (scanIsStrictlyUnchanged({
+      sourcePath,
+      relativeBackupPath,
+      sourceStats,
+      record: existingRecord,
+      cursor: currentCursor,
+    })) {
+      return {
+        manifestChanged: false,
+        cursor: null,
+        lastError: currentCursor?.lastError || null,
+      };
+    }
+
     const targetState = await this.fileCommitter.inspectTarget(backupPath);
-    const recordedBytes = Number(existingRecord?.bytesBackedUp ?? 0);
-    const recordedLines = Number(existingRecord?.lineCount ?? 0);
+    const recordedLines = Number(baselineCursor?.lineCount ?? existingRecord?.lineCount ?? 0);
     const recordedOffset = Number(baselineCursor?.lastByteOffset ?? 0);
-    const pathChanged = Boolean(existingRecord && existingRecord.backupPath !== mappedRelativePath);
-    let rebuild = pathChanged || sourceStats.size < recordedOffset;
+    const metadataAgrees = Boolean(
+      baselineCursor
+      && sourceStats.size > baselineCursor.lastSourceSize
+      && sourceStats.size >= baselineCursor.lastByteOffset
+      && existingRecord?.bytesBackedUp === baselineCursor.lastByteOffset
+      && existingRecord?.lineCount === baselineCursor.lineCount
+    );
+    const pathAgrees = Boolean(
+      baselineCursor
+      && baselineCursor.backupPath === relativeBackupPath
+      && existingRecord?.backupPath === relativeBackupPath
+      && existingRecord?.sourcePath === sourcePath
+    );
+    let rebuild = !targetState.exists;
     let readOffset = recordedOffset;
     let baseLineCount = recordedLines;
 
-    if (targetState.exists && !rebuild) {
-      if (targetState.byteCount === recordedBytes) {
-        if (existingRecord?.contentHash && recordedOffset > 0) {
-          rebuild = await hashPrefix(sourcePath, recordedOffset) !== existingRecord.contentHash
-            || !await this.fileCommitter.targetMatchesBoundedFingerprint(
-              backupPath,
-              sourcePath,
-              recordedBytes,
-            );
-        } else if (targetState.byteCount > 0) {
-          rebuild = !await this.fileCommitter.targetIsCompletePrefix(backupPath, sourcePath);
-        }
-      } else if (
-        targetState.byteCount > recordedBytes
-        && await this.fileCommitter.targetIsCompletePrefix(backupPath, sourcePath)
-      ) {
-        readOffset = targetState.byteCount;
-        baseLineCount = (await this.fileCommitter.stats(backupPath)).lineCount;
+    if (targetState.exists) {
+      if (metadataAgrees && pathAgrees && targetState.byteCount === recordedOffset) {
+        rebuild = false;
       } else {
-        rebuild = true;
+        const canAdoptPrefix = targetState.byteCount <= sourceStats.size
+          && ((!baselineCursor && !existingRecord) || targetState.byteCount > recordedOffset);
+        if (canAdoptPrefix && await this.fileCommitter.targetIsCompletePrefix(
+          backupPath,
+          sourcePath,
+          targetState.byteCount,
+        )) {
+          rebuild = false;
+          readOffset = targetState.byteCount;
+          baseLineCount = (await this.fileCommitter.stats(backupPath)).lineCount;
+        } else {
+          rebuild = true;
+        }
       }
-    } else if (!targetState.exists && (recordedOffset > 0 || recordedBytes > 0)) {
-      rebuild = true;
     }
 
-    let tailResult;
+    if (this.tailer) {
+      await this.readTail(sourcePath, rebuild ? 0 : readOffset);
+    }
+
+    let streamed;
     let finalStats;
+    let finalOffset;
     let wroteData;
+    let contentHash;
     if (rebuild) {
-      tailResult = await this.readTail(sourcePath, 0);
-      finalStats = await this.fileCommitter.rebuildCompleteLines(
+      streamed = await this.fileCommitter.rebuildCompleteLines(
+        sourcePath,
         backupPath,
-        tailResult.lines,
         this.paths.backupRoot,
       );
-      wroteData = true;
+      finalOffset = streamed.committedByteCount;
+      finalStats = { byteCount: finalOffset, lineCount: streamed.lineCount };
+      wroteData = targetState.exists || finalOffset > 0;
+      contentHash = streamed.contentHash;
     } else {
-      tailResult = await this.readTail(sourcePath, readOffset);
-      if (targetState.exists) {
-        finalStats = await this.fileCommitter.appendAndSynchronize(
-          backupPath,
-          tailResult.lines,
-          this.paths.backupRoot,
-        );
-      } else {
-        finalStats = await this.fileCommitter.commitInitial(
-          backupPath,
-          tailResult.lines,
-          this.paths.backupRoot,
-        );
+      streamed = await this.fileCommitter.appendCompleteLines(
+        sourcePath,
+        backupPath,
+        readOffset,
+        this.paths.backupRoot,
+      );
+      finalOffset = streamed.committedByteCount;
+      if (finalOffset > readOffset && !await this.fileCommitter.rangesMatch(
+        sourcePath,
+        readOffset,
+        backupPath,
+        readOffset,
+        finalOffset - readOffset,
+      )) {
+        throw new Error(`Backup range verification failed: ${backupPath}`);
       }
-      wroteData = tailResult.lines.length > 0 || targetState.byteCount !== recordedBytes;
+      finalStats = {
+        byteCount: finalOffset,
+        lineCount: baseLineCount + streamed.lineCount,
+      };
+      wroteData = streamed.appendedByteCount > 0 || readOffset !== recordedOffset;
+      contentHash = finalOffset > recordedOffset ? null : existingRecord?.contentHash ?? null;
     }
 
-    const finalOffset = tailResult.nextOffset;
-    const contentHash = finalOffset > 0 ? await hashPrefix(sourcePath, finalOffset) : null;
     const firstSeenAt = existingRecord?.firstSeenAt || scanDate.toISOString();
     const title = existingRecord?.title
-      || firstTitle(tailResult.lines)
+      || streamed.firstTitle
       || await firstTitleInBackup(backupPath);
     const updatedRecord = {
       sessionId,
@@ -293,9 +329,7 @@ class BackupAgent {
       lastBackedUpAt: wroteData || (!existingRecord?.lastBackedUpAt && finalStats.lineCount > 0)
         ? scanDate.toISOString()
         : existingRecord?.lastBackedUpAt ?? null,
-      lineCount: rebuild || !targetState.exists
-        ? finalStats.lineCount
-        : Math.max(baseLineCount + tailResult.lines.length, baseLineCount),
+      lineCount: finalStats.lineCount,
       bytesBackedUp: finalStats.byteCount,
       contentHash,
       status: ACTIVE_STATUS,
@@ -313,9 +347,9 @@ class BackupAgent {
       lastSourceSize: sourceStats.size,
       lastSourceModifiedAt: sourceStats.modifiedAt,
       lineCount: updatedRecord.lineCount,
-      pendingPartialLine: tailResult.pendingPartialLine,
+      pendingPartialLine: streamed.pendingPartialLine,
       status: ACTIVE_STATUS,
-      lastError: tailResult.blockedError || null,
+      lastError: streamed.blockedError || null,
       updatedAt: scanDate.getTime() / 1000,
     };
 
@@ -324,7 +358,7 @@ class BackupAgent {
       cursor: sameCursor(currentCursor, updatedCursor)
         ? null
         : updatedCursor,
-      lastError: tailResult.blockedError || null,
+      lastError: streamed.blockedError || null,
     };
   }
 
@@ -424,8 +458,6 @@ class BackupAgent {
 }
 
 function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
-  const lineBuffer = (lines) => Buffer.from(lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
-
   return {
     async inspectTarget(targetPath) {
       try {
@@ -440,68 +472,26 @@ function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
       }
     },
 
-    async targetIsCompletePrefix(targetPath, sourcePath) {
-      const target = await fsp.readFile(targetPath);
-      const sourcePrefix = await readPrefix(sourcePath, target.length);
-      return target.equals(sourcePrefix) && (target.length === 0 || target[target.length - 1] === 0x0A);
-    },
-
-    async targetMatchesBoundedFingerprint(targetPath, sourcePath, byteCount) {
-      if (byteCount === 0) return true;
-      const window = Math.min(64 * 1024, byteCount);
-      const [targetFirst, sourceFirst, targetLast, sourceLast] = await Promise.all([
-        readRange(targetPath, 0, window),
-        readRange(sourcePath, 0, window),
-        readRange(targetPath, byteCount - window, window),
-        readRange(sourcePath, byteCount - window, window),
-      ]);
-      return targetFirst.equals(sourceFirst) && targetLast.equals(sourceLast);
+    async targetIsCompletePrefix(targetPath, sourcePath, targetByteCount) {
+      return targetIsCompletePrefix({ sourcePath, targetPath, targetByteCount });
     },
 
     async stats(targetPath) {
-      const content = await fsp.readFile(targetPath);
-      return {
-        byteCount: content.length,
-        lineCount: countNewlines(content),
-      };
+      return streamStats(targetPath);
     },
 
-    async commitInitial(targetPath, lines, backupRoot) {
-      const content = lineBuffer(lines);
-      if (content.length > 0) {
-        await ensureContainedParent(backupRoot, targetPath);
-        await writeFileDurably(targetPath, content, { sync });
-      }
-      return { byteCount: content.length, lineCount: lines.length };
+    async rangesMatch(sourcePath, sourceOffset, targetPath, targetOffset, length) {
+      return rangesMatch({ sourcePath, sourceOffset, targetPath, targetOffset, length });
     },
 
-    async appendAndSynchronize(targetPath, lines, backupRoot) {
-      const before = await this.stats(targetPath);
-      if (lines.length === 0) return before;
+    async appendCompleteLines(sourcePath, targetPath, sourceOffset, backupRoot) {
       await assertContainedTarget(backupRoot, targetPath);
-      const content = lineBuffer(lines);
-      const handle = await fsp.open(targetPath, 'a');
-      try {
-        await handle.writeFile(content);
-        await sync(handle);
-      } finally {
-        await handle.close();
-      }
-      return {
-        byteCount: before.byteCount + content.length,
-        lineCount: before.lineCount + lines.length,
-      };
+      return appendCompleteLines({ sourcePath, sourceOffset, targetPath, sync });
     },
 
-    async rebuildCompleteLines(targetPath, lines, backupRoot) {
-      const content = lineBuffer(lines);
+    async rebuildCompleteLines(sourcePath, targetPath, backupRoot) {
       await ensureContainedParent(backupRoot, targetPath);
-      if (await fileExists(targetPath)) {
-        await replaceFileDurably(targetPath, content, { sync });
-      } else if (content.length > 0) {
-        await writeFileDurably(targetPath, content, { sync });
-      }
-      return { byteCount: content.length, lineCount: lines.length };
+      return rebuildSessionCompleteLines({ sourcePath, targetPath, sync });
     },
   };
 }
@@ -597,16 +587,6 @@ async function trustedSourceMetadata(sourcePath) {
   return { modifiedAt: stats.mtimeMs / 1000, size: stats.size };
 }
 
-function firstTitle(lines) {
-  for (const line of lines) {
-    const title = titleFromJsonLine(line);
-    if (title) {
-      return title;
-    }
-  }
-  return null;
-}
-
 async function firstTitleInBackup(filePath) {
   try {
     const content = await readPrefix(filePath, 256 * 1024);
@@ -618,27 +598,6 @@ async function firstTitleInBackup(filePath) {
     if (error.code !== 'ENOENT') throw error;
   }
   return null;
-}
-
-async function hashPrefix(filePath, byteCount) {
-  const handle = await fsp.open(filePath, 'r');
-  const hash = crypto.createHash('sha256');
-  let offset = 0;
-  try {
-    while (offset < byteCount) {
-      const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, byteCount - offset));
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
-      if (bytesRead === 0) break;
-      hash.update(buffer.subarray(0, bytesRead));
-      offset += bytesRead;
-    }
-  } finally {
-    await handle.close();
-  }
-  if (offset !== byteCount) {
-    throw new Error(`Source file became shorter while hashing: ${filePath}`);
-  }
-  return hash.digest('hex');
 }
 
 async function readPrefix(filePath, byteCount) {
@@ -662,12 +621,32 @@ async function readRange(filePath, position, byteCount) {
   return buffer.subarray(0, offset);
 }
 
-function countNewlines(content) {
-  let total = 0;
-  for (const byte of content) {
-    if (byte === 0x0A) total += 1;
+function scanIsStrictlyUnchanged({
+  sourcePath,
+  relativeBackupPath,
+  sourceStats,
+  record,
+  cursor,
+}) {
+  if (!record || !cursor
+    || record.sourcePath !== sourcePath
+    || cursor.sourcePath !== sourcePath
+    || record.backupPath !== relativeBackupPath
+    || cursor.backupPath !== relativeBackupPath
+    || record.bytesBackedUp !== cursor.lastByteOffset
+    || record.lineCount !== cursor.lineCount
+    || cursor.lastByteOffset < 0
+    || cursor.lastByteOffset > sourceStats.size
+    || cursor.lastSourceSize !== sourceStats.size
+    || cursor.lastSourceModifiedAt !== sourceStats.modifiedAt) {
+    return false;
   }
-  return total;
+
+  const hasUncommittedBytes = sourceStats.size > cursor.lastByteOffset;
+  if (hasUncommittedBytes) {
+    return Boolean(cursor.pendingPartialLine) || cursor.lastError != null;
+  }
+  return !cursor.pendingPartialLine && cursor.lastError == null;
 }
 
 function sameRecord(lhs, rhs) {

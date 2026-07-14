@@ -61,6 +61,21 @@ function makeClock() {
   return () => new Date(Date.UTC(2026, 0, 2, 3, 4, tick++));
 }
 
+async function withoutJsonlReadFile(operation) {
+  const originalReadFile = fs.readFile;
+  fs.readFile = async (filePath, ...args) => {
+    if (String(filePath).endsWith('.jsonl')) {
+      throw new Error(`whole-file JSONL read attempted: ${filePath}`);
+    }
+    return originalReadFile.call(fs, filePath, ...args);
+  };
+  try {
+    return await operation();
+  } finally {
+    fs.readFile = originalReadFile;
+  }
+}
+
 function cursorFor(paths, sourceName, overrides = {}) {
   const sourcePath = path.join(paths.codexRoot, 'sessions', sourceName);
   return {
@@ -647,6 +662,225 @@ test('matching interrupted append is adopted without duplication', async (t) => 
 
   assert.equal(await fs.readFile(target, 'utf8'), one + two);
   assert.equal(JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions.interrupted.lineCount, 2);
+});
+
+test('fresh large scan never uses whole-file JSONL reads for rebuild or stats', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'large-streamed.jsonl');
+  const longLine = jsonLine({ role: 'user', content: 'x'.repeat(3 * 1024 * 1024 + 17) });
+  await writeSessionFile(sourcePath, [longLine, 'partial']);
+
+  await withoutJsonlReadFile(() => new BackupAgent({ paths }).performOneShotScan());
+
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const record = manifest.sessions['large-streamed'];
+  assert.equal(record.lineCount, 1);
+  assert.equal((await fs.stat(path.join(paths.backupRoot, record.backupPath))).size, Buffer.byteLength(longLine));
+});
+
+test('fresh cursor reconciliation compares an existing target prefix without whole-file reads', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'prefix-streamed.jsonl');
+  const first = jsonLine({ role: 'user', content: 'already committed' });
+  const second = jsonLine({ role: 'assistant', content: 'new record' });
+  await writeSessionFile(sourcePath, [first, second]);
+  const targetPath = paths.backupFilePath(sourcePath);
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, first);
+
+  await withoutJsonlReadFile(() => new BackupAgent({ paths }).performOneShotScan());
+
+  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
+});
+
+test('unchanged scan stops before target, body, hash, manifest, cursor, and export work', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'strict-no-change.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'stable' })]);
+  await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const targetPath = path.join(paths.backupRoot, manifest.sessions['strict-no-change'].backupPath);
+  const exportSpy = spyOnAllCursorStoreExports();
+  const originalStat = fs.stat;
+  const originalLstat = fs.lstat;
+  const originalOpen = fs.open;
+  const originalReadFile = fs.readFile;
+  const originalRename = fs.rename;
+  let targetStatCount = 0;
+  let bodyReadCount = 0;
+  let manifestWriteCount = 0;
+  let cursorWriteCount = 0;
+  fs.stat = async (filePath, ...args) => {
+    if (path.resolve(String(filePath)) === path.resolve(targetPath)) {
+      targetStatCount += 1;
+      throw new Error('unchanged scan touched target stat');
+    }
+    return originalStat.call(fs, filePath, ...args);
+  };
+  fs.lstat = async (filePath, ...args) => {
+    if (path.resolve(String(filePath)) === path.resolve(targetPath)) {
+      targetStatCount += 1;
+      throw new Error('unchanged scan touched target lstat');
+    }
+    return originalLstat.call(fs, filePath, ...args);
+  };
+  fs.open = async (filePath, ...args) => {
+    if ([sourcePath, targetPath].some((candidate) => path.resolve(String(filePath)) === path.resolve(candidate))) {
+      bodyReadCount += 1;
+      throw new Error('unchanged scan opened session body');
+    }
+    return originalOpen.call(fs, filePath, ...args);
+  };
+  fs.readFile = async (filePath, ...args) => {
+    if ([sourcePath, targetPath].some((candidate) => path.resolve(String(filePath)) === path.resolve(candidate))) {
+      bodyReadCount += 1;
+      throw new Error('unchanged scan read session body');
+    }
+    return originalReadFile.call(fs, filePath, ...args);
+  };
+  fs.rename = async (from, to, ...args) => {
+    if (path.resolve(String(to)) === path.resolve(paths.manifestPath)) manifestWriteCount += 1;
+    if (path.resolve(String(to)) === path.resolve(paths.cursorDatabasePath)) cursorWriteCount += 1;
+    return originalRename.call(fs, from, to, ...args);
+  };
+
+  try {
+    await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+  } finally {
+    fs.stat = originalStat;
+    fs.lstat = originalLstat;
+    fs.open = originalOpen;
+    fs.readFile = originalReadFile;
+    fs.rename = originalRename;
+    exportSpy.restore();
+  }
+
+  assert.equal(targetStatCount, 0);
+  assert.equal(bodyReadCount, 0);
+  assert.equal(manifestWriteCount, 0);
+  assert.equal(cursorWriteCount, 0);
+  assert.equal(exportSpy.calls, 0);
+});
+
+test('append reads only the new committed range and clears the optional full hash', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'range-append.jsonl');
+  const first = jsonLine({ role: 'user', content: 'first' });
+  const second = jsonLine({ role: 'assistant', content: 'second' });
+  await writeSessionFile(sourcePath, [first]);
+  const agent = new BackupAgent({ paths });
+  await agent.performOneShotScan();
+  const oldOffset = Buffer.byteLength(first);
+  await fs.appendFile(sourcePath, second);
+  const newOffset = oldOffset + Buffer.byteLength(second);
+  const originalOpen = fs.open;
+  const readRanges = [];
+  fs.open = async (filePath, ...args) => {
+    const handle = await originalOpen.call(fs, filePath, ...args);
+    if (path.resolve(String(filePath)) === path.resolve(sourcePath)) {
+      const originalRead = handle.read.bind(handle);
+      handle.read = async (buffer, offset, length, position) => {
+        const result = await originalRead(buffer, offset, length, position);
+        if (result.bytesRead > 0) {
+          readRanges.push({ start: position, end: position + result.bytesRead, requested: length });
+        }
+        return result;
+      };
+    }
+    return handle;
+  };
+  try {
+    await withoutJsonlReadFile(() => agent.performOneShotScan());
+  } finally {
+    fs.open = originalOpen;
+  }
+
+  assert.ok(readRanges.length > 0);
+  assert.ok(readRanges.every(({ start, end, requested }) => (
+    start >= oldOffset && end <= newOffset && requested <= 1024 * 1024
+  )));
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const record = manifest.sessions['range-append'];
+  assert.equal(record.bytesBackedUp, newOffset);
+  assert.equal(record.contentHash, null);
+});
+
+test('empty seed and empty rebuild store the canonical full hash', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'empty-hash.jsonl');
+  await writeSessionFile(sourcePath, []);
+  const agent = new BackupAgent({ paths });
+  await agent.performOneShotScan();
+  const emptyHash = crypto.createHash('sha256').update('').digest('hex');
+  let manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  assert.equal(manifest.sessions['empty-hash'].contentHash, emptyHash);
+
+  await fs.writeFile(sourcePath, jsonLine({ role: 'user', content: 'temporary' }));
+  await fs.utimes(sourcePath, new Date(), new Date(Date.now() + 5_000));
+  await agent.performOneShotScan();
+  await fs.writeFile(sourcePath, '');
+  await fs.utimes(sourcePath, new Date(), new Date(Date.now() + 10_000));
+  await agent.performOneShotScan();
+
+  manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const record = manifest.sessions['empty-hash'];
+  assert.equal(record.contentHash, emptyHash);
+  assert.equal((await fs.stat(path.join(paths.backupRoot, record.backupPath))).size, 0);
+});
+
+test('same-size changed-mtime rewrite streams an exact rebuild without JSONL readFile', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'same-size-streamed.jsonl');
+  const original = jsonLine({ role: 'user', content: 'AAAA' });
+  const replacement = jsonLine({ role: 'user', content: 'BBBB' });
+  await writeSessionFile(sourcePath, [original]);
+  const agent = new BackupAgent({ paths });
+  await agent.performOneShotScan();
+  await fs.writeFile(sourcePath, replacement);
+  await fs.utimes(sourcePath, new Date(), new Date(Date.now() + 5_000));
+
+  await withoutJsonlReadFile(() => agent.performOneShotScan());
+
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const record = manifest.sessions['same-size-streamed'];
+  assert.equal(await fs.readFile(path.join(paths.backupRoot, record.backupPath), 'utf8'), replacement);
+  assert.equal(record.contentHash, crypto.createHash('sha256').update(replacement).digest('hex'));
+});
+
+test('truncation streams an exact rebuild without JSONL readFile', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'truncated-streamed.jsonl');
+  const retained = jsonLine({ role: 'user', content: 'keep' });
+  await writeSessionFile(sourcePath, [retained, jsonLine({ role: 'assistant', content: 'remove' })]);
+  const agent = new BackupAgent({ paths });
+  await agent.performOneShotScan();
+  await fs.writeFile(sourcePath, retained);
+  await fs.utimes(sourcePath, new Date(), new Date(Date.now() + 5_000));
+
+  await withoutJsonlReadFile(() => agent.performOneShotScan());
+
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const record = manifest.sessions['truncated-streamed'];
+  assert.equal(await fs.readFile(path.join(paths.backupRoot, record.backupPath), 'utf8'), retained);
+  assert.equal(record.lineCount, 1);
+  assert.equal(record.bytesBackedUp, Buffer.byteLength(retained));
+});
+
+test('missing target streams a rebuild without JSONL readFile', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'missing-streamed.jsonl');
+  const contents = jsonLine({ role: 'user', content: 'restore target' });
+  await writeSessionFile(sourcePath, [contents]);
+  const agent = new BackupAgent({ paths });
+  await agent.performOneShotScan();
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const targetPath = path.join(paths.backupRoot, manifest.sessions['missing-streamed'].backupPath);
+  await fs.rm(targetPath);
+  await fs.utimes(sourcePath, new Date(), new Date(Date.now() + 5_000));
+
+  await withoutJsonlReadFile(() => agent.performOneShotScan());
+
+  assert.equal(await fs.readFile(targetPath, 'utf8'), contents);
 });
 
 test('mismatched interrupted append and same-size rewrite rebuild exact source', async (t) => {
