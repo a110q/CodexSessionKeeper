@@ -77,6 +77,7 @@ function backupPaths(input) {
   }
 
   return {
+    auditStatePath: path.join(stateRoot, 'integrity-audit.json'),
     backupFilePath,
     backupRoot,
     archivedSessionsRoot,
@@ -88,6 +89,7 @@ function backupPaths(input) {
     manifestPath: path.join(backupRoot, 'manifest.json'),
     pendingSourcesPath: path.join(stateRoot, 'pending-sources.json'),
     relativeBackupPath,
+    repairQuarantineRoot: path.join(backupRoot, 'repair-quarantine'),
     remoteStatusPath: path.join(backupRoot, 'status.json'),
     sessionsRoot,
     statusPath: path.join(backupRoot, 'status.json'),

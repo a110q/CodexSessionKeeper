@@ -22,9 +22,11 @@ test('backupPaths splits NAS content from local state and mirrors source paths',
   });
 
   assert.ok(paths.cursorDatabasePath.startsWith(paths.stateRoot));
+  assert.ok(paths.auditStatePath.startsWith(paths.stateRoot));
   assert.ok(paths.localStatusPath.startsWith(paths.stateRoot));
   assert.ok(paths.manifestPath.startsWith(paths.backupRoot));
   assert.ok(paths.remoteStatusPath.startsWith(paths.backupRoot));
+  assert.equal(paths.repairQuarantineRoot, pathImpl.join(paths.backupRoot, 'repair-quarantine'));
   assert.equal(
     paths.backupFilePath('/home/ada/.codex/sessions/2026/07/active.jsonl'),
     '/mnt/nas/device/incremental-backups/sessions/2026/07/active.jsonl',
@@ -43,6 +45,8 @@ test('backupPaths returns the Windows backup layout', () => {
   assert.equal(paths.backupRoot, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups');
   assert.equal(paths.manifestPath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\manifest.json');
   assert.equal(paths.cursorDatabasePath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\cursors.sqlite');
+  assert.equal(paths.auditStatePath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\integrity-audit.json');
+  assert.equal(paths.repairQuarantineRoot, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\repair-quarantine');
   assert.equal(paths.statusPath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\status.json');
   assert.equal(paths.sessionsRoot, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\sessions');
   assert.equal(paths.logsRoot, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\logs');

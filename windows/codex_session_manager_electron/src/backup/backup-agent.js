@@ -5,6 +5,7 @@ const path = require('node:path');
 
 const { CursorStore } = require('./cursor-store');
 const { replaceFileDurably } = require('./durable-write');
+const { BackupIntegrityAuditor } = require('./integrity-auditor');
 const { AGENT_VERSION, MANIFEST_VERSION } = require('./models');
 const { loadOrCreateManifest, saveManifest } = require('./manifest-store');
 const { sessionIdFromPath } = require('./session-identity');
@@ -24,6 +25,8 @@ class BackupAgent {
     validateTarget = defaultValidateTarget,
     fileCommitter = createFileCommitter(),
     onProgress = null,
+    instrumentation = {},
+    integrityAuditorFactory = (auditorPaths) => new BackupIntegrityAuditor({ paths: auditorPaths }),
   } = {}) {
     if (!paths) {
       throw new Error('BackupAgent requires paths.');
@@ -34,10 +37,15 @@ class BackupAgent {
     this.validateTarget = validateTarget;
     this.fileCommitter = fileCommitter;
     this.onProgress = onProgress;
+    this.instrumentation = instrumentation;
+    this.integrityAuditorFactory = integrityAuditorFactory;
     this.pollingTimer = null;
     this.pollingStartedAt = null;
     this.scanPromise = null;
     this.scanQueued = false;
+    this.auditPromise = null;
+    this.auditScanDeferred = null;
+    this.auditInterruptionEpoch = 0;
   }
 
   startPolling(intervalMs = 10000) {
@@ -60,10 +68,20 @@ class BackupAgent {
   }
 
   stop() {
+    this.requestAuditInterruption();
     this.stopPolling();
   }
 
   async performOneShotScan() {
+    this.requestAuditInterruption();
+    if (this.auditPromise) {
+      if (!this.auditScanDeferred) this.auditScanDeferred = deferredPromise();
+      return this.auditScanDeferred.promise;
+    }
+    return this.startOneShotScan();
+  }
+
+  async startOneShotScan() {
     if (this.scanPromise) {
       this.scanQueued = true;
       return this.scanPromise;
@@ -74,6 +92,41 @@ class BackupAgent {
       return await this.scanPromise;
     } finally {
       this.scanPromise = null;
+    }
+  }
+
+  async performIntegrityAuditIfDue(deviceId) {
+    await this.performOneShotScan();
+    if (this.auditPromise) return this.auditPromise;
+    const baselineEpoch = this.auditInterruptionEpoch;
+    this.auditPromise = this.performIntegrityAuditLocked(deviceId, baselineEpoch);
+    try {
+      return await this.auditPromise;
+    } finally {
+      this.auditPromise = null;
+      const deferred = this.auditScanDeferred;
+      this.auditScanDeferred = null;
+      if (deferred) {
+        this.startOneShotScan().then(deferred.resolve, deferred.reject);
+      }
+    }
+  }
+
+  async performIntegrityAuditLocked(deviceId, baselineEpoch) {
+    const cursorStore = new CursorStore({ paths: this.paths });
+    await cursorStore.open();
+    try {
+      return await this.integrityAuditorFactory(this.paths).runIfDue({
+        now: this.now(),
+        deviceId,
+        cursors: cursorStore.all(),
+        interruptionRequested: () => this.auditInterruptionEpoch !== baselineEpoch,
+      });
+    } catch (error) {
+      await this.writeLocalErrorStatus(error).catch(() => {});
+      throw error;
+    } finally {
+      await cursorStore.close();
     }
   }
 
@@ -99,6 +152,8 @@ class BackupAgent {
     await this.ensureStateDirectories();
     await this.ensureRemoteDirectories();
 
+    const integrityAuditor = this.integrityAuditorFactory(this.paths);
+    await integrityAuditor.recoverPendingRepairIfNeeded({ now: scanDate });
     const manifestExisted = await fileExists(this.paths.manifestPath);
     const cursorStore = new CursorStore({ paths: this.paths });
     await cursorStore.open();
@@ -167,6 +222,9 @@ class BackupAgent {
         await saveManifest(this.paths, manifest);
       }
       await cursorStore.upsertMany(updatedCursors);
+      if (scanErrors.length === 0) {
+        await integrityAuditor.recordInitialSeedCompleted(scanDate);
+      }
 
       const lastError = scanErrors[0] || null;
       await this.writeStatus(manifest, lastError ? 'error' : 'running', lastError, scanDate);
@@ -398,6 +456,7 @@ class BackupAgent {
 
   async writeStatus(manifest, status, lastError, date) {
     const existingStatus = await loadStatus(this.paths.localStatusPath);
+    const auditState = await loadStatus(this.paths.auditStatePath);
     const records = Object.values(manifest.sessions || {});
     const snapshot = {
       agentVersion: AGENT_VERSION,
@@ -415,6 +474,10 @@ class BackupAgent {
       bytesBackedUp: records.reduce((total, record) => total + Number(record.bytesBackedUp ?? 0), 0),
       autoStartEnabled: false,
       lastError,
+      lastAuditAt: auditState?.lastCompletedAt ?? existingStatus?.lastAuditAt,
+      lastAuditResult: auditState?.lastResult ?? existingStatus?.lastAuditResult,
+      lastRepairAt: existingStatus?.lastRepairAt,
+      repairCount: auditState?.repairedCount ?? existingStatus?.repairCount,
     };
 
     await replaceFileDurably(this.paths.remoteStatusPath, jsonPayload(snapshot));
@@ -458,6 +521,11 @@ class BackupAgent {
     } finally {
       await store.close();
     }
+  }
+
+  requestAuditInterruption() {
+    this.auditInterruptionEpoch += 1;
+    this.instrumentation.auditInterruptionSet?.();
   }
 }
 
@@ -670,6 +738,16 @@ async function fileExists(filePath) {
   } catch {
     return false;
   }
+}
+
+function deferredPromise() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 module.exports = {

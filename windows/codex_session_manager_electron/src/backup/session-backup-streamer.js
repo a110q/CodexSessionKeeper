@@ -47,6 +47,8 @@ async function scanCompleteRecords({
   maximumByteCount = null,
   chunkSize,
   maxLineBytes,
+  interruptionRequested = () => false,
+  onChunk = null,
   onRecord,
 }) {
   const boundedChunkSize = normalizedChunkSize(chunkSize);
@@ -61,6 +63,7 @@ async function scanCompleteRecords({
   let firstTitle = null;
 
   readLoop: while (remaining === null || remaining > 0) {
+    if (interruptionRequested()) throw interruptedError();
     const requested = remaining === null
       ? boundedChunkSize
       : Math.min(boundedChunkSize, remaining);
@@ -69,6 +72,8 @@ async function scanCompleteRecords({
     const { bytesRead } = await sourceHandle.read(buffer, 0, requested, position);
     if (bytesRead === 0) break;
     const chunk = buffer.subarray(0, bytesRead);
+    await onChunk?.(position, bytesRead);
+    if (interruptionRequested()) throw interruptedError();
     position += bytesRead;
     if (remaining !== null) remaining -= bytesRead;
 
@@ -138,6 +143,8 @@ async function rebuildSessionCompleteLines({
   maximumOffset = null,
   chunkSize = DEFAULT_CHUNK_SIZE,
   maxLineBytes = DEFAULT_MAX_LINE_BYTES,
+  interruptionRequested = () => false,
+  onChunk = null,
   sync = (handle) => handle.sync(),
 }) {
   if (maximumOffset !== null && (!Number.isSafeInteger(maximumOffset) || maximumOffset < 0)) {
@@ -155,6 +162,8 @@ async function rebuildSessionCompleteLines({
         maximumByteCount: maximumOffset,
         chunkSize,
         maxLineBytes,
+        interruptionRequested,
+        onChunk,
         onRecord: async (line) => {
           if (line.length > 0) {
             await writeAll(targetHandle, line);
@@ -173,6 +182,12 @@ async function rebuildSessionCompleteLines({
     ...scanResult,
     contentHash: digest.digest('hex'),
   };
+}
+
+function interruptedError() {
+  const error = new Error('Integrity audit interrupted.');
+  error.code = 'INTEGRITY_AUDIT_INTERRUPTED';
+  return error;
 }
 
 async function rebuildCompleteLines(options) {

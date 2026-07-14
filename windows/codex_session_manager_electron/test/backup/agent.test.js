@@ -7,6 +7,7 @@ const test = require('node:test');
 
 const { BackupAgent, createFileCommitter } = require('../../src/backup/backup-agent');
 const { CursorStore } = require('../../src/backup/cursor-store');
+const { BackupIntegrityAuditor } = require('../../src/backup/integrity-auditor');
 const { backupPaths } = require('../../src/backup/paths');
 const { readNewCompleteLines } = require('../../src/backup/session-tailer');
 
@@ -1416,4 +1417,159 @@ test('session tailer keeps data available when an oversized partial line is late
     pendingPartialLine: '',
     blockedError: null,
   });
+});
+
+test('successful initial seed initializes audit state and prevents an immediate audit', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-14T04:05:06.000Z');
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'initial-seed-audit.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'one' })]);
+  const agent = new BackupAgent({ paths, now: () => now });
+
+  await agent.performOneShotScan();
+
+  const state = JSON.parse(await fs.readFile(paths.auditStatePath, 'utf8'));
+  assert.equal(state.lastCompletedAt, now.toISOString());
+  assert.equal(state.lastResult, 'seeded');
+  assert.deepEqual(
+    await agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001'),
+    { outcome: 'not-due', checked: 0, repaired: 0 },
+  );
+  const status = JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8'));
+  assert.equal(status.lastAuditAt, now.toISOString());
+  assert.equal(status.lastAuditResult, 'seeded');
+  assert.equal(status.repairCount, 0);
+});
+
+test('blocked initial seed does not initialize audit completion', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'blocked-audit-seed.jsonl');
+  await writeSessionFile(sourcePath, ['x'.repeat(32 * 1024 * 1024 + 1)]);
+
+  await new BackupAgent({ paths }).performOneShotScan();
+
+  assert.equal(await fileExists(paths.auditStatePath), false);
+  assert.equal(JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8')).status, 'error');
+});
+
+test('integrity audit runs only after incremental catch-up', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-14T04:05:06.000Z');
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'audit-catchup.jsonl');
+  const one = jsonLine({ role: 'user', content: 'one' });
+  const two = jsonLine({ role: 'assistant', content: 'two' });
+  await writeSessionFile(sourcePath, [one]);
+  const agent = new BackupAgent({ paths, now: () => now });
+  await agent.performOneShotScan();
+  await fs.writeFile(paths.auditStatePath, JSON.stringify({
+    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  }));
+  await fs.appendFile(sourcePath, two);
+
+  assert.deepEqual(
+    await agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001'),
+    { outcome: 'completed', checked: 1, repaired: 0 },
+  );
+  assert.equal(await fs.readFile(paths.backupFilePath(sourcePath), 'utf8'), one + two);
+  assert.ok(JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions['audit-catchup'].contentHash);
+});
+
+test('queued incremental scan interrupts audit at a chunk boundary and catches up', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-14T04:05:06.000Z');
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'audit-priority.jsonl');
+  const line = jsonLine({ role: 'user', content: 'bulk' });
+  const initial = line.repeat(50000);
+  await writeSessionFile(sourcePath, [initial]);
+  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
+  await fs.writeFile(paths.auditStatePath, JSON.stringify({
+    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  }));
+  let releaseRead;
+  let announceRead;
+  const readStarted = new Promise((resolve) => { announceRead = resolve; });
+  const readRelease = new Promise((resolve) => { releaseRead = resolve; });
+  let paused = false;
+  const auditor = new BackupIntegrityAuditor({
+    paths,
+    instrumentation: {
+      didReadChunk: async () => {
+        if (paused) return;
+        paused = true;
+        announceRead();
+        await readRelease;
+      },
+    },
+  });
+  let interruptionSignals = 0;
+  const agent = new BackupAgent({
+    paths,
+    now: () => now,
+    instrumentation: { auditInterruptionSet: () => { interruptionSignals += 1; } },
+    integrityAuditorFactory: () => auditor,
+  });
+
+  const auditPromise = agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001');
+  await readStarted;
+  const interruptionSignalsBeforeQueuedScan = interruptionSignals;
+  const appended = jsonLine({ role: 'assistant', content: 'new' });
+  await fs.appendFile(sourcePath, appended);
+  const scanPromise = agent.performOneShotScan();
+  releaseRead();
+
+  assert.deepEqual(await auditPromise, { outcome: 'interrupted', checked: 0, repaired: 0 });
+  await scanPromise;
+  assert.equal(interruptionSignals, interruptionSignalsBeforeQueuedScan + 1);
+  assert.ok((await fs.readFile(paths.backupFilePath(sourcePath), 'utf8')).endsWith(appended));
+});
+
+test('incremental scan recovers pending repair journal before appending', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-14T04:05:06.000Z');
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'wal-before-scan.jsonl');
+  const one = jsonLine({ role: 'user', content: 'one' });
+  const two = jsonLine({ role: 'assistant', content: 'two' });
+  await writeSessionFile(sourcePath, [one]);
+  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
+  await fs.writeFile(paths.auditStatePath, JSON.stringify({
+    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  }));
+  const targetPath = paths.backupFilePath(sourcePath);
+  const corrupted = Buffer.from(await fs.readFile(targetPath));
+  corrupted[0] ^= 0x01;
+  await fs.writeFile(targetPath, corrupted);
+  const injected = new Error('crash after formal replace');
+  const crashAuditor = new BackupIntegrityAuditor({
+    paths,
+    instrumentation: {
+      checkpoint: (value) => {
+        if (value === 'afterFormalReplaceBeforeInstalledJournalCommit') throw injected;
+      },
+    },
+  });
+  const crashAgent = new BackupAgent({
+    paths,
+    now: () => now,
+    integrityAuditorFactory: () => crashAuditor,
+  });
+  await assert.rejects(
+    crashAgent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001'),
+    injected,
+  );
+  const pendingRepairPath = path.join(paths.stateRoot, 'integrity-repair-pending.json');
+  assert.equal(await fileExists(pendingRepairPath), true);
+
+  await fs.appendFile(sourcePath, two);
+  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
+
+  assert.equal(await fileExists(pendingRepairPath), false);
+  assert.equal(await fs.readFile(targetPath, 'utf8'), one + two);
+  assert.equal(JSON.parse(await fs.readFile(paths.auditStatePath, 'utf8')).repairedCount, 1);
+  assert.equal(JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8')).repairCount, 1);
 });
