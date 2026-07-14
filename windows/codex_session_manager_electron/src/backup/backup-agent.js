@@ -102,6 +102,7 @@ class BackupAgent {
     await cursorStore.open();
 
     try {
+      const cursorMap = cursorStore.all();
       const manifest = loadOrCreateManifest(this.paths, scanDate);
       let manifestChanged = !manifestExisted;
       for (const [key, value] of [
@@ -135,7 +136,8 @@ class BackupAgent {
         processedSessionIds.add(sessionId);
 
         const result = await this.processSessionFile({
-          cursorStore,
+          currentCursor: cursorMap.get(sourcePath) || null,
+          cursorMap,
           manifest,
           scanDate,
           sessionId,
@@ -144,6 +146,7 @@ class BackupAgent {
         manifestChanged ||= result.manifestChanged;
         if (result.cursor) {
           updatedCursors.push(result.cursor);
+          cursorMap.set(sourcePath, result.cursor);
         }
         if (result.lastError) {
           scanErrors.push(result.lastError);
@@ -161,9 +164,7 @@ class BackupAgent {
         manifest.updatedAt = scanDate.toISOString();
         await saveManifest(this.paths, manifest);
       }
-      for (const { store, cursor } of updatedCursors) {
-        await store.upsert(cursor);
-      }
+      await cursorStore.upsertMany(updatedCursors);
 
       const lastError = scanErrors[0] || null;
       await this.writeStatus(manifest, lastError ? 'error' : 'running', lastError, scanDate);
@@ -206,11 +207,10 @@ class BackupAgent {
       .map((entry) => entry.filePath);
   }
 
-  async processSessionFile({ sourcePath, sessionId, scanDate, manifest, cursorStore }) {
+  async processSessionFile({ sourcePath, sessionId, scanDate, manifest, currentCursor, cursorMap }) {
     const sourceStats = await trustedSourceMetadata(sourcePath);
     const existingRecord = manifest.sessions[sessionId] || null;
-    const currentCursor = await cursorStore.get(sourcePath);
-    const baselineCursor = currentCursor || await this.migratedCursor(existingRecord, sourcePath, cursorStore);
+    const baselineCursor = currentCursor || this.migratedCursor(existingRecord, sourcePath, cursorMap);
     const mappedBackupPath = this.paths.backupFilePath(sourcePath);
     const backupPath = this.backupFilePathFor(sourcePath, existingRecord, baselineCursor);
     const relativeBackupPath = this.validatedRelativeBackupPath(backupPath);
@@ -323,16 +323,16 @@ class BackupAgent {
       manifestChanged,
       cursor: sameCursor(currentCursor, updatedCursor)
         ? null
-        : { store: cursorStore, cursor: updatedCursor },
+        : updatedCursor,
       lastError: tailResult.blockedError || null,
     };
   }
 
-  async migratedCursor(existingRecord, sourcePath, cursorStore) {
+  migratedCursor(existingRecord, sourcePath, cursorMap) {
     if (!existingRecord?.sourcePath || existingRecord.sourcePath === sourcePath) {
       return null;
     }
-    return cursorStore.get(existingRecord.sourcePath);
+    return cursorMap.get(existingRecord.sourcePath) || null;
   }
 
   backupFilePathFor(sourcePath, existingRecord, baselineCursor) {

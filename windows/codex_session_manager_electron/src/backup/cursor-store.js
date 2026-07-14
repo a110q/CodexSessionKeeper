@@ -41,6 +41,79 @@ function numberValue(value) {
   return Number(value ?? 0);
 }
 
+const CURSOR_COLUMNS = `
+  session_id AS sessionId,
+  source_path AS sourcePath,
+  backup_path AS backupPath,
+  last_byte_offset AS lastByteOffset,
+  last_source_size AS lastSourceSize,
+  last_source_modified_at AS lastSourceModifiedAt,
+  line_count AS lineCount,
+  pending_partial_line AS pendingPartialLine,
+  status,
+  last_error AS lastError,
+  updated_at AS updatedAt
+`;
+
+const UPSERT_CURSOR = `
+  INSERT INTO backup_cursors (
+    source_path,
+    session_id,
+    backup_path,
+    last_byte_offset,
+    last_source_size,
+    last_source_modified_at,
+    line_count,
+    pending_partial_line,
+    status,
+    last_error,
+    updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(source_path) DO UPDATE SET
+    session_id = excluded.session_id,
+    backup_path = excluded.backup_path,
+    last_byte_offset = excluded.last_byte_offset,
+    last_source_size = excluded.last_source_size,
+    last_source_modified_at = excluded.last_source_modified_at,
+    line_count = excluded.line_count,
+    pending_partial_line = excluded.pending_partial_line,
+    status = excluded.status,
+    last_error = excluded.last_error,
+    updated_at = excluded.updated_at;
+`;
+
+function cursorFromRow(row) {
+  return {
+    sessionId: row.sessionId,
+    sourcePath: row.sourcePath,
+    backupPath: row.backupPath,
+    lastByteOffset: numberValue(row.lastByteOffset),
+    lastSourceSize: numberValue(row.lastSourceSize),
+    lastSourceModifiedAt: numberValue(row.lastSourceModifiedAt),
+    lineCount: numberValue(row.lineCount),
+    pendingPartialLine: decodePendingPartialLine(row.pendingPartialLine),
+    status: row.status,
+    lastError: row.lastError ?? null,
+    updatedAt: numberValue(row.updatedAt),
+  };
+}
+
+function cursorValues(cursor) {
+  return [
+    cursor.sourcePath,
+    cursor.sessionId,
+    cursor.backupPath,
+    Number(cursor.lastByteOffset ?? 0),
+    Number(cursor.lastSourceSize ?? 0),
+    Number(cursor.lastSourceModifiedAt ?? 0),
+    Number(cursor.lineCount ?? 0),
+    encodePendingPartialLine(cursor.pendingPartialLine),
+    cursor.status,
+    cursor.lastError ?? null,
+    Number(cursor.updatedAt ?? 0),
+  ];
+}
+
 class CursorStore {
   constructor({ paths, SQL, locateFile } = {}) {
     if (!paths || !paths.cursorDatabasePath) {
@@ -98,17 +171,7 @@ class CursorStore {
 
     const statement = this.db.prepare(`
       SELECT
-        session_id AS sessionId,
-        source_path AS sourcePath,
-        backup_path AS backupPath,
-        last_byte_offset AS lastByteOffset,
-        last_source_size AS lastSourceSize,
-        last_source_modified_at AS lastSourceModifiedAt,
-        line_count AS lineCount,
-        pending_partial_line AS pendingPartialLine,
-        status,
-        last_error AS lastError,
-        updated_at AS updatedAt
+        ${CURSOR_COLUMNS}
       FROM backup_cursors
       WHERE source_path = ?
       LIMIT 1;
@@ -120,66 +183,70 @@ class CursorStore {
         return null;
       }
 
-      const row = statement.getAsObject();
-      return {
-        sessionId: row.sessionId,
-        sourcePath: row.sourcePath,
-        backupPath: row.backupPath,
-        lastByteOffset: numberValue(row.lastByteOffset),
-        lastSourceSize: numberValue(row.lastSourceSize),
-        lastSourceModifiedAt: numberValue(row.lastSourceModifiedAt),
-        lineCount: numberValue(row.lineCount),
-        pendingPartialLine: decodePendingPartialLine(row.pendingPartialLine),
-        status: row.status,
-        lastError: row.lastError ?? null,
-        updatedAt: numberValue(row.updatedAt),
-      };
+      return cursorFromRow(statement.getAsObject());
+    } finally {
+      statement.free();
+    }
+  }
+
+  all() {
+    this.ensureOpen();
+
+    const statement = this.db.prepare(`
+      SELECT
+        ${CURSOR_COLUMNS}
+      FROM backup_cursors;
+    `);
+    const cursors = new Map();
+
+    try {
+      while (statement.step()) {
+        const cursor = cursorFromRow(statement.getAsObject());
+        cursors.set(cursor.sourcePath, cursor);
+      }
+      return cursors;
     } finally {
       statement.free();
     }
   }
 
   async upsert(cursor) {
+    return this.upsertMany([cursor]);
+  }
+
+  async upsertMany(cursors) {
     this.ensureOpen();
 
-    this.db.run(`
-      INSERT INTO backup_cursors (
-        source_path,
-        session_id,
-        backup_path,
-        last_byte_offset,
-        last_source_size,
-        last_source_modified_at,
-        line_count,
-        pending_partial_line,
-        status,
-        last_error,
-        updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(source_path) DO UPDATE SET
-        session_id = excluded.session_id,
-        backup_path = excluded.backup_path,
-        last_byte_offset = excluded.last_byte_offset,
-        last_source_size = excluded.last_source_size,
-        last_source_modified_at = excluded.last_source_modified_at,
-        line_count = excluded.line_count,
-        pending_partial_line = excluded.pending_partial_line,
-        status = excluded.status,
-        last_error = excluded.last_error,
-        updated_at = excluded.updated_at;
-    `, [
-      cursor.sourcePath,
-      cursor.sessionId,
-      cursor.backupPath,
-      Number(cursor.lastByteOffset ?? 0),
-      Number(cursor.lastSourceSize ?? 0),
-      Number(cursor.lastSourceModifiedAt ?? 0),
-      Number(cursor.lineCount ?? 0),
-      encodePendingPartialLine(cursor.pendingPartialLine),
-      cursor.status,
-      cursor.lastError ?? null,
-      Number(cursor.updatedAt ?? 0),
-    ]);
+    const batch = Array.from(cursors);
+    if (batch.length === 0) {
+      return;
+    }
+
+    const statement = this.db.prepare(UPSERT_CURSOR);
+    let transactionStarted = false;
+
+    try {
+      this.db.run('BEGIN IMMEDIATE;');
+      transactionStarted = true;
+      for (const cursor of batch) {
+        statement.bind(cursorValues(cursor));
+        statement.step();
+        statement.reset();
+      }
+      this.db.run('COMMIT;');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          this.db.run('ROLLBACK;');
+        } catch {
+          // Preserve the original SQL failure.
+        }
+      }
+      throw error;
+    } finally {
+      statement.free();
+    }
 
     await this.flush();
   }

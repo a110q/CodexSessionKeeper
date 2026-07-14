@@ -61,6 +61,38 @@ function makeClock() {
   return () => new Date(Date.UTC(2026, 0, 2, 3, 4, tick++));
 }
 
+function cursorFor(paths, sourceName, overrides = {}) {
+  const sourcePath = path.join(paths.codexRoot, 'sessions', sourceName);
+  return {
+    sessionId: path.basename(sourceName, '.jsonl'),
+    sourcePath,
+    backupPath: path.join('sessions', sourceName),
+    lastByteOffset: 10,
+    lastSourceSize: 10,
+    lastSourceModifiedAt: 1770000000.25,
+    lineCount: 1,
+    pendingPartialLine: '',
+    status: 'active',
+    lastError: null,
+    updatedAt: 1770000001.5,
+    ...overrides,
+  };
+}
+
+function spyOnDatabaseExport(store) {
+  const originalExport = store.db.export.bind(store.db);
+  let calls = 0;
+  store.db.export = (...args) => {
+    calls += 1;
+    return originalExport(...args);
+  };
+  return {
+    get calls() {
+      return calls;
+    },
+  };
+}
+
 test('initial scan backs up existing jsonl and records manifest title and line count', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'alpha.jsonl');
@@ -261,6 +293,57 @@ test('no-op scan does not rewrite the cursor database', async (t) => {
 
   assert.equal(cursorDatabaseWriteCount, 0);
   assert.equal(afterHash, beforeHash);
+});
+
+test('scan batches many changed cursors into one database export', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const seedStore = new CursorStore({ paths });
+  await seedStore.open();
+  await seedStore.close();
+  await writeSessionFile(path.join(paths.codexRoot, 'sessions', 'batch-one.jsonl'), [
+    jsonLine({ role: 'user', content: 'One' }),
+  ]);
+  await writeSessionFile(path.join(paths.codexRoot, 'sessions', 'batch-two.jsonl'), [
+    jsonLine({ role: 'user', content: 'Two' }),
+  ]);
+
+  const originalOpen = CursorStore.prototype.open;
+  const originalAll = CursorStore.prototype.all;
+  const originalUpsertMany = CursorStore.prototype.upsertMany;
+  let allCalls = 0;
+  let upsertManyCalls = 0;
+  let exportCalls = 0;
+  CursorStore.prototype.open = async function (...args) {
+    const result = await originalOpen.apply(this, args);
+    const originalExport = this.db.export.bind(this.db);
+    this.db.export = (...exportArgs) => {
+      exportCalls += 1;
+      return originalExport(...exportArgs);
+    };
+    return result;
+  };
+  CursorStore.prototype.all = function (...args) {
+    allCalls += 1;
+    return originalAll.apply(this, args);
+  };
+  CursorStore.prototype.upsertMany = async function (...args) {
+    upsertManyCalls += 1;
+    return originalUpsertMany.apply(this, args);
+  };
+
+  try {
+    await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+  } finally {
+    CursorStore.prototype.open = originalOpen;
+    if (originalAll) CursorStore.prototype.all = originalAll;
+    else delete CursorStore.prototype.all;
+    if (originalUpsertMany) CursorStore.prototype.upsertMany = originalUpsertMany;
+    else delete CursorStore.prototype.upsertMany;
+  }
+
+  assert.equal(allCalls, 1);
+  assert.equal(upsertManyCalls, 1);
+  assert.equal(exportCalls, 1);
 });
 
 test('partial trailing line is not backed up until completed', async (t) => {
@@ -597,6 +680,109 @@ test('cursor store preserves tricky values and pending partial line', async (t) 
 
   await store.upsert(cursor);
   assert.deepEqual(await store.get(sourcePath), cursor);
+});
+
+test('cursor store materializes all cursors and exports a changed batch once', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const store = new CursorStore({ paths });
+  await store.open();
+  t.after(async () => {
+    await store.close();
+  });
+  const one = cursorFor(paths, 'batch-one.jsonl');
+  const two = cursorFor(paths, 'batch-two.jsonl', {
+    lastByteOffset: 20,
+    lastSourceSize: 20,
+    lineCount: 2,
+    pendingPartialLine: 'partial',
+  });
+  const exportSpy = spyOnDatabaseExport(store);
+
+  await store.upsertMany([one, two]);
+
+  const cursors = store.all();
+  assert.equal(exportSpy.calls, 1);
+  assert.ok(cursors instanceof Map);
+  assert.equal(cursors.size, 2);
+  assert.deepEqual(cursors.get(one.sourcePath), one);
+  assert.deepEqual(cursors.get(two.sourcePath), two);
+});
+
+test('empty cursor batch does not export the database', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const store = new CursorStore({ paths });
+  await store.open();
+  t.after(async () => {
+    await store.close();
+  });
+  const exportSpy = spyOnDatabaseExport(store);
+
+  await store.upsertMany([]);
+
+  assert.equal(exportSpy.calls, 0);
+  assert.equal(store.all().size, 0);
+});
+
+test('SQL failure rolls back the cursor batch without a durable replacement', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const store = new CursorStore({ paths });
+  await store.open();
+  t.after(async () => {
+    await store.close();
+  });
+  const durableHash = await fileHash(paths.cursorDatabasePath);
+  store.db.run(`
+    CREATE TRIGGER reject_bad_cursor
+    BEFORE INSERT ON backup_cursors
+    WHEN NEW.source_path LIKE '%bad.jsonl'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected SQL failure');
+    END;
+  `);
+  const exportSpy = spyOnDatabaseExport(store);
+
+  await assert.rejects(
+    store.upsertMany([
+      cursorFor(paths, 'good.jsonl'),
+      cursorFor(paths, 'bad.jsonl'),
+    ]),
+    /injected SQL failure/,
+  );
+
+  assert.equal(exportSpy.calls, 0);
+  assert.equal(store.all().size, 0);
+  assert.equal(await fileHash(paths.cursorDatabasePath), durableHash);
+});
+
+test('durable cursor replacement failure leaves the previous database readable', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const store = new CursorStore({ paths });
+  await store.open();
+  const original = cursorFor(paths, 'durable.jsonl');
+  await store.upsert(original);
+  const exportSpy = spyOnDatabaseExport(store);
+  const originalRename = fs.rename;
+  fs.rename = async () => {
+    throw new Error('injected durable replacement failure');
+  };
+
+  try {
+    await assert.rejects(
+      store.upsertMany([cursorFor(paths, 'durable.jsonl', { lastByteOffset: 99 })]),
+      /injected durable replacement failure/,
+    );
+  } finally {
+    fs.rename = originalRename;
+    await store.close();
+  }
+
+  const reopened = new CursorStore({ paths });
+  await reopened.open();
+  t.after(async () => {
+    await reopened.close();
+  });
+  assert.equal(exportSpy.calls, 1);
+  assert.deepEqual(await reopened.get(original.sourcePath), original);
 });
 
 test('session tailer reads across chunks until complete lines are exhausted', async (t) => {
