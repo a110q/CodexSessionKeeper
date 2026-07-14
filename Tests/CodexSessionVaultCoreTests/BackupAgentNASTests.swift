@@ -170,6 +170,49 @@ struct BackupAgentNASTests {
     }
 
     @Test
+    func nextIncrementalScanRecoversPreparedRepairJournalBeforeAppending() throws {
+        let fixture = try DirectNASBackupFixture()
+        defer { fixture.cleanup() }
+        let initial = fixture.line("one")
+        let source = try fixture.writeActiveSession(name: "wal-before-scan.jsonl", contents: initial)
+        try fixture.makeAgent().performOneShotScan()
+        try fixture.writeAuditState(IntegrityAuditState(
+            lastCompletedAt: fixture.now.addingTimeInterval(-86_401),
+            lastResult: "previous",
+            repairedCount: 0
+        ))
+        let target = try fixture.paths.backupFileURL(for: source)
+        var corrupted = try Data(contentsOf: target)
+        corrupted[corrupted.startIndex] ^= 0x01
+        try corrupted.write(to: target)
+        let crashAuditor = BackupIntegrityAuditor(
+            paths: fixture.paths,
+            chunkSize: 1_048_576,
+            instrumentation: IntegrityAuditInstrumentation(checkpoint: { checkpoint in
+                if checkpoint == .afterFormalReplaceBeforeInstalledJournalCommit {
+                    throw DirectNASBackupTestError.injectedTargetFailure
+                }
+            })
+        )
+        let crashAgent = fixture.makeAgent(integrityAuditorFactory: { _ in crashAuditor })
+
+        #expect(throws: DirectNASBackupTestError.injectedTargetFailure) {
+            _ = try crashAgent.performIntegrityAuditIfDue(deviceID: fixture.deviceID)
+        }
+        let pendingJournal = fixture.paths.stateRoot.appendingPathComponent("integrity-repair-pending.json")
+        #expect(FileManager.default.fileExists(atPath: pendingJournal.path))
+
+        try fixture.append(fixture.line("two"), to: source)
+        try fixture.makeAgent().performOneShotScan()
+
+        #expect(FileManager.default.fileExists(atPath: pendingJournal.path) == false)
+        #expect(try String(contentsOf: target, encoding: .utf8) == initial + fixture.line("two"))
+        #expect(try fixture.loadAuditState().repairedCount == 1)
+        #expect(try fixture.loadLocalStatus().repairCount == 1)
+        #expect(try fixture.loadLocalStatus().lastRepairAt == fixture.now)
+    }
+
+    @Test
     func missingTargetRootIsNotRecreatedLocallyAndWritesLocalErrorStatus() throws {
         let fixture = try DirectNASBackupFixture(createBackupRoot: false)
         defer { fixture.cleanup() }

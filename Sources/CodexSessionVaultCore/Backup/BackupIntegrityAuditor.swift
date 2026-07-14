@@ -6,6 +6,9 @@ enum IntegrityAuditCheckpoint: Equatable, Sendable {
     case beforeQuarantineCopy
     case beforeReplace
     case beforePostReplaceVerification
+    case beforePreparedRepairJournalFlush
+    case afterPreparedJournalCommitBeforeFormalReplace
+    case afterFormalReplaceBeforeInstalledJournalCommit
     case beforeMetadataCommit
     case afterManifestCommit
     case afterCursorCommit
@@ -123,7 +126,9 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         }
 
         try BackupTargetValidator(backupRoot: paths.backupRoot, fileManager: fileManager).validateTarget()
-        try cleanupQuarantine(now: now)
+        if pendingRepair == nil {
+            try cleanupQuarantine(now: now)
+        }
         let manifestStore = BackupManifestStore(
             manifestURL: paths.manifestURL,
             createParentDirectories: false
@@ -134,13 +139,13 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             now: now
         )
         if let pendingRepair {
-            try commitRepairMetadata(
+            try resolvePendingRepairMetadata(
                 pendingRepair,
                 manifest: &manifest,
                 manifestStore: manifestStore,
                 state: &state
             )
-            try removePendingRepairMetadata()
+            try cleanupQuarantine(now: now)
         }
         if let lastCompletedAt = state.lastCompletedAt,
            now.timeIntervalSince(lastCompletedAt) < Self.auditInterval {
@@ -218,6 +223,31 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         state.lastCompletedAt = date
         state.lastResult = "seeded"
         try saveAuditState(state)
+    }
+
+    func recoverPendingRepairIfNeeded(now: Date) throws {
+        guard let pendingRepair = try loadPendingRepairMetadata() else { return }
+        try BackupTargetValidator(
+            backupRoot: paths.backupRoot,
+            fileManager: fileManager
+        ).validateTarget()
+        let manifestStore = BackupManifestStore(
+            manifestURL: paths.manifestURL,
+            createParentDirectories: false
+        )
+        var manifest = try manifestStore.loadOrCreate(
+            codexRoot: paths.codexRoot.path,
+            backupRoot: paths.backupRoot.path,
+            now: now
+        )
+        var state = try loadAuditState()
+        try resolvePendingRepairMetadata(
+            pendingRepair,
+            manifest: &manifest,
+            manifestStore: manifestStore,
+            state: &state
+        )
+        try cleanupQuarantine(now: now)
     }
 
     private static func digestWord(deviceID: UUID, range: Range<Int>) -> UInt64 {
@@ -371,8 +401,32 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         } catch IntegrityAuditControl.interrupted {
             return .interrupted
         }
+        guard let quarantineBackupPath = paths.relativeBackupPath(for: quarantine.url) else {
+            throw IntegrityAuditError.unsafeCursor(quarantine.url.path)
+        }
+        var pendingRepair = PendingRepairMetadata(
+            phase: .prepared,
+            sessionID: revalidated.cursor.sessionId,
+            sourcePath: revalidated.cursor.sourcePath,
+            backupPath: revalidated.cursor.backupPath,
+            byteCount: revalidated.cursor.lastByteOffset,
+            contentHash: repairHash,
+            originalByteCount: quarantine.byteCount,
+            originalContentHash: quarantine.hash,
+            quarantineBackupPath: quarantineBackupPath,
+            repairedAt: now,
+            repairedCount: state.repairedCount + 1
+        )
+        try savePendingRepairMetadata(pendingRepair)
+        try instrumentation.checkpoint(.afterPreparedJournalCommitBeforeFormalReplace)
+        if interruptionRequested() {
+            try removePendingRepairMetadata()
+            return .interrupted
+        }
+
         _ = try fileManager.replaceItemAt(revalidated.target, withItemAt: repairTemporary)
         synchronizeParentDirectory(revalidated.target.deletingLastPathComponent())
+        try instrumentation.checkpoint(.afterFormalReplaceBeforeInstalledJournalCommit)
 
         do {
             try instrumentation.checkpoint(.beforePostReplaceVerification)
@@ -386,6 +440,7 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         } catch {
             do {
                 try restore(quarantine: quarantine, to: revalidated.target)
+                try removePendingRepairMetadata()
             } catch {
                 throw IntegrityAuditError.restoreFailed(revalidated.target.path)
             }
@@ -395,17 +450,9 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             throw error
         }
 
-        let pendingRepair = PendingRepairMetadata(
-            sessionID: revalidated.cursor.sessionId,
-            sourcePath: revalidated.cursor.sourcePath,
-            backupPath: revalidated.cursor.backupPath,
-            byteCount: revalidated.cursor.lastByteOffset,
-            contentHash: repairHash,
-            repairedAt: now,
-            repairedCount: state.repairedCount + 1
-        )
+        pendingRepair = pendingRepair.withPhase(.installed)
         try savePendingRepairMetadata(pendingRepair)
-        try cleanupQuarantine(now: now)
+        try cleanupQuarantine(now: now, protecting: quarantine.url)
         try instrumentation.checkpoint(.beforeMetadataCommit)
         try commitRepairMetadata(
             pendingRepair,
@@ -415,6 +462,149 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         )
         try removePendingRepairMetadata()
         return .repaired(hash: repairHash)
+    }
+
+    private func resolvePendingRepairMetadata(
+        _ pendingRepair: PendingRepairMetadata,
+        manifest: inout BackupManifest,
+        manifestStore: BackupManifestStore,
+        state: inout IntegrityAuditState
+    ) throws {
+        let record = try requiredRecord(pendingRepair.sessionID, in: manifest)
+        guard record.sourcePath == pendingRepair.sourcePath,
+              record.backupPath == pendingRepair.backupPath else {
+            throw IntegrityAuditError.unsafeCursor(pendingRepair.sourcePath)
+        }
+        let target = try trustedPendingURL(
+            relativePath: pendingRepair.backupPath,
+            allowedRoots: [paths.sessionsRoot, paths.archivedSessionsRoot]
+        )
+        let targetState = try pendingTargetState(pendingRepair, target: target)
+
+        switch targetState {
+        case .installed:
+            let installedRepair = pendingRepair.withPhase(.installed)
+            if pendingRepair.phase != .installed {
+                try savePendingRepairMetadata(installedRepair)
+            }
+            try commitRepairMetadata(
+                installedRepair,
+                manifest: &manifest,
+                manifestStore: manifestStore,
+                state: &state
+            )
+        case .original:
+            break
+        case .unknown:
+            let metadataWasAdvanced = try repairMetadataWasAdvanced(
+                pendingRepair,
+                manifest: manifest
+            )
+            if pendingRepair.phase == .installed, metadataWasAdvanced {
+                try commitRepairMetadata(
+                    pendingRepair,
+                    manifest: &manifest,
+                    manifestStore: manifestStore,
+                    state: &state
+                )
+            } else if !metadataWasAdvanced {
+                let quarantineURL = try trustedPendingURL(
+                    relativePath: pendingRepair.quarantineBackupPath,
+                    allowedRoots: [paths.repairQuarantineRoot]
+                )
+                try verifyFile(
+                    quarantineURL,
+                    expectedByteCount: pendingRepair.originalByteCount,
+                    expectedHash: pendingRepair.originalContentHash
+                )
+                try restore(
+                    quarantine: QuarantineCopy(
+                        url: quarantineURL,
+                        byteCount: pendingRepair.originalByteCount,
+                        hash: pendingRepair.originalContentHash
+                    ),
+                    to: target
+                )
+            }
+        }
+        try removePendingRepairMetadata()
+    }
+
+    private func pendingTargetState(
+        _ pendingRepair: PendingRepairMetadata,
+        target: URL
+    ) throws -> PendingRepairTargetState {
+        if try fileMatches(
+            target,
+            expectedByteCount: pendingRepair.byteCount,
+            expectedHash: pendingRepair.contentHash
+        ) {
+            return .installed
+        }
+        if try fileMatches(
+            target,
+            expectedByteCount: pendingRepair.originalByteCount,
+            expectedHash: pendingRepair.originalContentHash
+        ) {
+            return .original
+        }
+        return .unknown
+    }
+
+    private func fileMatches(
+        _ url: URL,
+        expectedByteCount: Int64,
+        expectedHash: String
+    ) throws -> Bool {
+        try RestoreFilesystemValidator.validateDestination(url, under: paths.backupRoot)
+        guard fileManager.fileExists(atPath: url.path) else { return false }
+        do {
+            try verifyFile(
+                url,
+                expectedByteCount: expectedByteCount,
+                expectedHash: expectedHash
+            )
+            return true
+        } catch IntegrityAuditError.verificationFailed {
+            return false
+        }
+    }
+
+    private func repairMetadataWasAdvanced(
+        _ pendingRepair: PendingRepairMetadata,
+        manifest: BackupManifest
+    ) throws -> Bool {
+        guard let record = manifest.sessions[pendingRepair.sessionID] else { return false }
+        if record.lastBackedUpAt.map({ $0 > pendingRepair.repairedAt }) == true {
+            return true
+        }
+        let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
+        try cursorStore.open()
+        guard let cursor = try cursorStore.cursor(sourcePath: pendingRepair.sourcePath) else {
+            return false
+        }
+        return cursor.updatedAt > pendingRepair.repairedAt.timeIntervalSince1970
+    }
+
+    private func trustedPendingURL(
+        relativePath: String,
+        allowedRoots: [URL]
+    ) throws -> URL {
+        let candidate = paths.backupRoot.appendingPathComponent(
+            relativePath,
+            isDirectory: false
+        ).standardizedFileURL
+        guard paths.relativeBackupPath(for: candidate) == relativePath,
+              let containingRoot = allowedRoots.first(where: { root in
+                  let rootComponents = root.standardizedFileURL.pathComponents
+                  let candidateComponents = candidate.pathComponents
+                  return candidateComponents.starts(with: rootComponents)
+                      && candidateComponents.count > rootComponents.count
+              }) else {
+            throw IntegrityAuditError.unsafeCursor(relativePath)
+        }
+        try RestoreFilesystemValidator.validateDestination(candidate, under: containingRoot)
+        return candidate
     }
 
     private func commitRepairMetadata(
@@ -586,13 +776,17 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             }
         }
         let hash = Self.hexDigest(digest.finalize())
-        try verifyFile(
-            quarantineURL,
-            expectedByteCount: byteCount,
-            expectedHash: hash,
-            phase: .quarantineVerification,
-            interruptionRequested: interruptionRequested
-        )
+        let verification = Result<Void, Error> {
+            try verifyFile(
+                quarantineURL,
+                expectedByteCount: byteCount,
+                expectedHash: hash,
+                phase: .quarantineVerification,
+                interruptionRequested: interruptionRequested
+            )
+        }
+        try cleanupQuarantine(now: now, protecting: quarantineURL)
+        try verification.get()
         return QuarantineCopy(url: quarantineURL, byteCount: byteCount, hash: hash)
     }
 
@@ -688,7 +882,7 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         }
     }
 
-    private func cleanupQuarantine(now: Date) throws {
+    private func cleanupQuarantine(now: Date, protecting protectedURL: URL? = nil) throws {
         guard fileManager.fileExists(atPath: paths.repairQuarantineRoot.path) else { return }
         try RestoreFilesystemValidator.validateSource(paths.repairQuarantineRoot, under: paths.backupRoot)
         let sessionDirectories = try fileManager.contentsOfDirectory(
@@ -722,11 +916,17 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
                     return nil
                 }
                 return OwnedQuarantineCopy(url: entry, modifiedAt: modifiedAt)
-            }.sorted { $0.modifiedAt > $1.modifiedAt }
+            }.sorted { lhs, rhs in
+                if lhs.url == protectedURL { return true }
+                if rhs.url == protectedURL { return false }
+                if lhs.modifiedAt != rhs.modifiedAt { return lhs.modifiedAt > rhs.modifiedAt }
+                return lhs.url.path > rhs.url.path
+            }
 
             for (index, copy) in owned.enumerated() where
-                index >= Self.maximumQuarantineCopiesPerSession
-                || now.timeIntervalSince(copy.modifiedAt) > Self.retentionInterval {
+                copy.url != protectedURL
+                && (index >= Self.maximumQuarantineCopiesPerSession
+                    || now.timeIntervalSince(copy.modifiedAt) > Self.retentionInterval) {
                 try fileManager.removeItem(at: copy.url)
             }
         }
@@ -772,6 +972,9 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         )
         guard pending.version == PendingRepairMetadata.currentVersion,
               pending.byteCount >= 0,
+              pending.originalByteCount >= 0,
+              Self.isSHA256(pending.contentHash),
+              Self.isSHA256(pending.originalContentHash),
               pending.repairedCount > 0 else {
             throw IntegrityAuditError.unsafeCursor(pending.sourcePath)
         }
@@ -782,7 +985,13 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        try DurableAtomicWriter(fileManager: fileManager, synchronize: synchronize).write(
+        let writer = DurableAtomicWriter(fileManager: fileManager, synchronize: { handle in
+            if pendingRepair.phase == .prepared {
+                try instrumentation.checkpoint(.beforePreparedRepairJournalFlush)
+            }
+            try synchronize(handle)
+        })
+        try writer.write(
             try encoder.encode(pendingRepair),
             to: pendingRepairMetadataURL,
             createParentDirectories: true
@@ -865,6 +1074,13 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
     private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
         digest.map { String(format: "%02x", $0) }.joined()
     }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        return bytes.count == 64 && bytes.allSatisfy { byte in
+            (0x30...0x39).contains(byte) || (0x61...0x66).contains(byte)
+        }
+    }
 }
 
 private struct ValidatedAuditFile {
@@ -889,35 +1105,74 @@ private enum IntegrityAuditControl: Error {
     case interrupted
 }
 
+private enum PendingRepairTargetState {
+    case installed
+    case original
+    case unknown
+}
+
+private enum PendingRepairPhase: String, Codable {
+    case prepared
+    case installed
+}
+
 private struct PendingRepairMetadata: Codable, Equatable {
-    static let currentVersion = 1
+    static let currentVersion = 2
 
     let version: Int
+    let phase: PendingRepairPhase
     let sessionID: String
     let sourcePath: String
     let backupPath: String
     let byteCount: Int64
     let contentHash: String
+    let originalByteCount: Int64
+    let originalContentHash: String
+    let quarantineBackupPath: String
     let repairedAt: Date
     let repairedCount: Int
 
     init(
+        phase: PendingRepairPhase,
         sessionID: String,
         sourcePath: String,
         backupPath: String,
         byteCount: Int64,
         contentHash: String,
+        originalByteCount: Int64,
+        originalContentHash: String,
+        quarantineBackupPath: String,
         repairedAt: Date,
         repairedCount: Int
     ) {
         version = Self.currentVersion
+        self.phase = phase
         self.sessionID = sessionID
         self.sourcePath = sourcePath
         self.backupPath = backupPath
         self.byteCount = byteCount
         self.contentHash = contentHash
+        self.originalByteCount = originalByteCount
+        self.originalContentHash = originalContentHash
+        self.quarantineBackupPath = quarantineBackupPath
         self.repairedAt = repairedAt
         self.repairedCount = repairedCount
+    }
+
+    func withPhase(_ phase: PendingRepairPhase) -> PendingRepairMetadata {
+        PendingRepairMetadata(
+            phase: phase,
+            sessionID: sessionID,
+            sourcePath: sourcePath,
+            backupPath: backupPath,
+            byteCount: byteCount,
+            contentHash: contentHash,
+            originalByteCount: originalByteCount,
+            originalContentHash: originalContentHash,
+            quarantineBackupPath: quarantineBackupPath,
+            repairedAt: repairedAt,
+            repairedCount: repairedCount
+        )
     }
 }
 

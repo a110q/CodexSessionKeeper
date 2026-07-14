@@ -226,6 +226,133 @@ struct BackupIntegrityAuditorTests {
         #expect(state.repairedCount == 1)
     }
 
+    @Test
+    func preparedRepairJournalFlushFailureLeavesFormalTargetUntouched() throws {
+        let fixture = try IntegrityAuditFixture(
+            corrupted: true,
+            instrumentation: IntegrityAuditInstrumentation(checkpoint: { checkpoint in
+                if checkpoint == .beforePreparedRepairJournalFlush {
+                    throw IntegrityAuditTestError.injected(checkpoint)
+                }
+            })
+        )
+        defer { fixture.cleanup() }
+        let manifestBefore = try fixture.loadManifest()
+        let stateBefore = try fixture.loadAuditState()
+
+        #expect(throws: IntegrityAuditTestError.injected(.beforePreparedRepairJournalFlush)) {
+            _ = try fixture.auditor.runIfDue(
+                now: fixture.dueDate,
+                deviceID: fixture.deviceID,
+                cursors: fixture.cursors,
+                interruptionRequested: { false }
+            )
+        }
+
+        #expect(try fixture.nasTargetData() == fixture.corruptedNASData)
+        #expect(FileManager.default.fileExists(atPath: fixture.pendingRepairJournalURL.path) == false)
+        #expect(try fixture.loadManifest() == manifestBefore)
+        #expect(try fixture.loadAuditState() == stateBefore)
+    }
+
+    @Test
+    func crashAfterFormalReplaceWithPreparedJournalConvergesAccountingExactlyOnce() throws {
+        let fixture = try IntegrityAuditFixture(
+            corrupted: true,
+            instrumentation: IntegrityAuditInstrumentation(checkpoint: { checkpoint in
+                if checkpoint == .afterFormalReplaceBeforeInstalledJournalCommit {
+                    throw IntegrityAuditTestError.injected(checkpoint)
+                }
+            })
+        )
+        defer { fixture.cleanup() }
+        try fixture.writeStatus()
+        let manifestBefore = try fixture.loadManifest()
+        let stateBefore = try fixture.loadAuditState()
+
+        #expect(throws: IntegrityAuditTestError.injected(.afterFormalReplaceBeforeInstalledJournalCommit)) {
+            _ = try fixture.auditor.runIfDue(
+                now: fixture.dueDate,
+                deviceID: fixture.deviceID,
+                cursors: fixture.cursors,
+                interruptionRequested: { false }
+            )
+        }
+
+        #expect(try fixture.nasTargetData() == fixture.committedLocalPrefix)
+        #expect(try fixture.pendingRepairJournalPhase() == "prepared")
+        #expect(try fixture.loadManifest() == manifestBefore)
+        #expect(try fixture.loadAuditState() == stateBefore)
+
+        let recoveryOutcome = try fixture.makeAuditor().runIfDue(
+            now: fixture.dueDate,
+            deviceID: fixture.deviceID,
+            cursors: fixture.cursors,
+            interruptionRequested: { false }
+        )
+
+        #expect(recoveryOutcome == .completed(checked: 1, repaired: 0))
+        #expect(FileManager.default.fileExists(atPath: fixture.pendingRepairJournalURL.path) == false)
+        #expect(try fixture.nasTargetData() == fixture.committedLocalPrefix)
+        #expect(try fixture.loadManifest().sessions[fixture.sessionID]?.contentHash == sha256(fixture.committedLocalPrefix))
+        #expect(try fixture.loadAuditState().repairedCount == 1)
+        #expect(try fixture.loadStatus().repairCount == 1)
+        #expect(try fixture.loadStatus().lastRepairAt == fixture.dueDate)
+
+        let retryOutcome = try fixture.makeAuditor().runIfDue(
+            now: fixture.dueDate.addingTimeInterval(1),
+            deviceID: fixture.deviceID,
+            cursors: fixture.cursors,
+            interruptionRequested: { false }
+        )
+        #expect(retryOutcome == .notDue)
+        #expect(try fixture.loadAuditState().repairedCount == 1)
+        #expect(try fixture.loadStatus().repairCount == 1)
+    }
+
+    @Test
+    func preparedJournalWithOriginalFormalBytesDoesNotCommitRepairAccounting() throws {
+        let fixture = try IntegrityAuditFixture(
+            corrupted: true,
+            instrumentation: IntegrityAuditInstrumentation(checkpoint: { checkpoint in
+                if checkpoint == .afterPreparedJournalCommitBeforeFormalReplace {
+                    throw IntegrityAuditTestError.injected(checkpoint)
+                }
+            })
+        )
+        defer { fixture.cleanup() }
+        let manifestBefore = try fixture.loadManifest()
+
+        #expect(throws: IntegrityAuditTestError.injected(.afterPreparedJournalCommitBeforeFormalReplace)) {
+            _ = try fixture.auditor.runIfDue(
+                now: fixture.dueDate,
+                deviceID: fixture.deviceID,
+                cursors: fixture.cursors,
+                interruptionRequested: { false }
+            )
+        }
+        #expect(try fixture.pendingRepairJournalPhase() == "prepared")
+        #expect(try fixture.nasTargetData() == fixture.corruptedNASData)
+        try fixture.writeAuditState(IntegrityAuditState(
+            lastCompletedAt: fixture.dueDate,
+            lastResult: "completed",
+            repairedCount: 0
+        ))
+
+        let recoveryOutcome = try fixture.makeAuditor().runIfDue(
+            now: fixture.dueDate,
+            deviceID: fixture.deviceID,
+            cursors: fixture.cursors,
+            interruptionRequested: { false }
+        )
+
+        #expect(recoveryOutcome == .notDue)
+        #expect(FileManager.default.fileExists(atPath: fixture.pendingRepairJournalURL.path) == false)
+        #expect(try fixture.nasTargetData() == fixture.corruptedNASData)
+        #expect(try fixture.loadManifest() == manifestBefore)
+        #expect(try fixture.loadAuditState().repairedCount == 0)
+    }
+
     @Test(arguments: [
         IntegrityAuditCheckpoint.beforeTemporaryFlush,
         .beforeQuarantineCopy,
@@ -260,7 +387,9 @@ struct BackupIntegrityAuditorTests {
             #expect(try fixture.nasTargetData() == fixture.corruptedNASData)
         case .beforeMetadataCommit:
             #expect(try fixture.nasTargetData() == fixture.committedLocalPrefix)
-        case .afterManifestCommit, .afterCursorCommit, .afterAuditStateCommit, .afterRuntimeStatusCommit:
+        case .beforePreparedRepairJournalFlush, .afterPreparedJournalCommitBeforeFormalReplace,
+             .afterFormalReplaceBeforeInstalledJournalCommit,
+             .afterManifestCommit, .afterCursorCommit, .afterAuditStateCommit, .afterRuntimeStatusCommit:
             Issue.record("Unexpected post-commit checkpoint in pre-commit failure matrix")
         }
         #expect(try fixture.loadManifest() == manifestBefore)
@@ -475,6 +604,69 @@ struct BackupIntegrityAuditorTests {
         #expect(try Data(contentsOf: unrelatedNAS) == Data("other".utf8))
     }
 
+    @Test(arguments: [
+        IntegrityAuditStreamPhase.quarantineVerification,
+        .formalPreReplacementVerification
+    ])
+    func quarantineCreationEnforcesNewestThreeBeforeVerificationInterruption(
+        phase: IntegrityAuditStreamPhase
+    ) throws {
+        let committed = IntegrityAuditFixture.multiChunkJSONL()
+        var corrupted = committed
+        corrupted[corrupted.startIndex] ^= 0x01
+        let observations = StreamPhaseObservations()
+        let fixture = try IntegrityAuditFixture(
+            committedLocalPrefix: committed,
+            nasData: corrupted,
+            instrumentation: IntegrityAuditInstrumentation(didStreamChunk: { observed, _, offset, _ in
+                observations.append(phase: observed, offset: offset)
+            })
+        )
+        defer { fixture.cleanup() }
+        let retention = try fixture.seedRetentionCopies(sessionID: fixture.sessionID, days: [3, 2, 1])
+
+        let outcome = try fixture.auditor.runIfDue(
+            now: fixture.dueDate,
+            deviceID: fixture.deviceID,
+            cursors: fixture.cursors,
+            interruptionRequested: { observations.contains(phase) }
+        )
+
+        #expect(outcome == .interrupted)
+        #expect(try fixture.ownedQuarantineURLs(sessionID: fixture.sessionID).count == 3)
+        #expect(FileManager.default.fileExists(atPath: retention.owned[0].url.path) == false)
+        #expect(try fixture.nasTargetData() == corrupted)
+        #expect(FileManager.default.fileExists(atPath: retention.unrelated.path))
+        #expect(try Data(contentsOf: retention.formal) == Data("formal".utf8))
+    }
+
+    @Test
+    func quarantineCreationEnforcesNewestThreeBeforeLaterFailure() throws {
+        let fixture = try IntegrityAuditFixture(
+            corrupted: true,
+            instrumentation: IntegrityAuditInstrumentation(checkpoint: { checkpoint in
+                if checkpoint == .beforeReplace { throw IntegrityAuditTestError.injected(checkpoint) }
+            })
+        )
+        defer { fixture.cleanup() }
+        let retention = try fixture.seedRetentionCopies(sessionID: fixture.sessionID, days: [3, 2, 1])
+
+        #expect(throws: IntegrityAuditTestError.injected(.beforeReplace)) {
+            _ = try fixture.auditor.runIfDue(
+                now: fixture.dueDate,
+                deviceID: fixture.deviceID,
+                cursors: fixture.cursors,
+                interruptionRequested: { false }
+            )
+        }
+
+        #expect(try fixture.ownedQuarantineURLs(sessionID: fixture.sessionID).count == 3)
+        #expect(FileManager.default.fileExists(atPath: retention.owned[0].url.path) == false)
+        #expect(try fixture.nasTargetData() == fixture.corruptedNASData)
+        #expect(FileManager.default.fileExists(atPath: retention.unrelated.path))
+        #expect(try Data(contentsOf: retention.formal) == Data("formal".utf8))
+    }
+
     @Test
     func durableRepairRunsRetentionBeforeLaterFileInterrupts() throws {
         let observations = StreamPhaseObservations()
@@ -581,6 +773,13 @@ private final class IntegrityAuditFixture {
 
     var pendingRepairJournalURL: URL {
         paths.auditStateURL.deletingLastPathComponent().appendingPathComponent("integrity-repair-pending.json")
+    }
+
+    func pendingRepairJournalPhase() throws -> String? {
+        let object = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: pendingRepairJournalURL)) as? [String: Any]
+        )
+        return object["phase"] as? String
     }
 
     init(
@@ -799,12 +998,13 @@ private final class IntegrityAuditFixture {
     }
 
     func seedRetentionCopies(
-        sessionID: String
+        sessionID: String,
+        days: [Int] = [40, 20, 10, 5, 1]
     ) throws -> (owned: [(url: URL, date: Date)], unrelated: URL, formal: URL) {
         let sessionDirectory = paths.repairQuarantineRoot.appendingPathComponent(sessionID, isDirectory: true)
         try FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
         var owned: [(url: URL, date: Date)] = []
-        for day in [40, 20, 10, 5, 1] {
+        for day in days {
             let date = dueDate.addingTimeInterval(TimeInterval(-day * 86_400))
             let name = "repair-\(sessionID)-\(day)-00000000-0000-0000-0000-00000000000\(day % 10).jsonl"
             let url = sessionDirectory.appendingPathComponent(name)
@@ -817,6 +1017,20 @@ private final class IntegrityAuditFixture {
         let formal = paths.sessionsRoot.appendingPathComponent("formal.jsonl")
         try Data("formal".utf8).write(to: formal)
         return (owned, unrelated, formal)
+    }
+
+    func ownedQuarantineURLs(sessionID: String) throws -> [URL] {
+        let sessionDirectory = paths.repairQuarantineRoot.appendingPathComponent(sessionID, isDirectory: true)
+        return try FileManager.default.contentsOfDirectory(
+            at: sessionDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ).filter { url in
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            return values.isRegularFile == true
+                && values.isSymbolicLink != true
+                && url.pathExtension.lowercased() == "jsonl"
+                && url.lastPathComponent.hasPrefix("repair-\(sessionID)-")
+        }
     }
 
     func nasTargetData() throws -> Data {

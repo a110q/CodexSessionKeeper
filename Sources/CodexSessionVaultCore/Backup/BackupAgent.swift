@@ -169,6 +169,7 @@ public final class BackupAgent: @unchecked Sendable {
         try targetValidator.validateTarget()
         try ensureLocalStateDirectoriesExist()
         let scanDate = now()
+        try integrityAuditorFactory(paths).recoverPendingRepairIfNeeded(now: scanDate)
         let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
         try cursorStore.open()
         let cursorMap = try cursorStore.loadAll()
