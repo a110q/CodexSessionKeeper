@@ -46,6 +46,7 @@ class BackupIntegrityAuditor {
     directorySync = syncParentDirectory,
     instrumentation = {},
     cursorStoreFactory = (storePaths) => new CursorStore({ paths: storePaths }),
+    publishIfAbsent = publishSyncedTemporaryFileIfAbsent,
   } = {}) {
     if (!paths) throw new Error('BackupIntegrityAuditor requires paths.');
     this.paths = paths;
@@ -60,6 +61,7 @@ class BackupIntegrityAuditor {
     };
     this.instrumentation = instrumentation;
     this.cursorStoreFactory = cursorStoreFactory;
+    this.publishIfAbsent = publishIfAbsent;
   }
 
   async runIfDue({
@@ -489,7 +491,7 @@ class BackupIntegrityAuditor {
     await this.checkpoint('beforeReplace');
     let installed = false;
     try {
-      await publishSyncedTemporaryFileIfAbsent(repairTemporary, file.targetPath);
+      await this.publishIfAbsent(repairTemporary, file.targetPath);
       installed = true;
       await this.directorySync(targetParent);
       await this.checkpoint('afterFormalReplaceBeforeInstalledJournalCommit');

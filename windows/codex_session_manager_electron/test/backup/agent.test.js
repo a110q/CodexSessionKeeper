@@ -198,8 +198,15 @@ function spyOnAllCursorStoreExports() {
 function spyOnAllCursorStoreReads() {
   const originalAll = CursorStore.prototype.all;
   let calls = 0;
+  const waiters = [];
   CursorStore.prototype.all = function (...args) {
     calls += 1;
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      if (calls >= waiters[index].expected) {
+        waiters[index].event.resolve();
+        waiters.splice(index, 1);
+      }
+    }
     return originalAll.apply(this, args);
   };
   return {
@@ -208,6 +215,12 @@ function spyOnAllCursorStoreReads() {
     },
     reset() {
       calls = 0;
+    },
+    waitForCalls(expected) {
+      if (calls >= expected) return Promise.resolve();
+      const event = controlledPromise();
+      waiters.push({ expected, event });
+      return event.promise;
     },
     restore() {
       CursorStore.prototype.all = originalAll;
@@ -2104,6 +2117,7 @@ test('two no-change timer ticks do not interrupt a running audit or queue backup
   });
   let bodyReads = 0;
   let targetStats = 0;
+  let interruptionSignals = 0;
   const readSpy = spyOnAllCursorStoreReads();
   const exportSpy = spyOnAllCursorStoreExports();
   t.after(() => {
@@ -2114,6 +2128,7 @@ test('two no-change timer ticks do not interrupt a running audit or queue backup
     paths,
     now: () => now,
     instrumentation: {
+      auditInterruptionSet: () => { interruptionSignals += 1; },
       sourceBodyRead: () => { bodyReads += 1; },
       targetStat: () => { targetStats += 1; },
     },
@@ -2124,18 +2139,19 @@ test('two no-change timer ticks do not interrupt a running audit or queue backup
   const audit = agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001');
   await readStarted.promise;
   readSpy.reset();
+  const baselineSignals = interruptionSignals;
   const firstTick = agent.requestImmediateScan('timer');
-  const firstCompleted = await Promise.race([
-    firstTick.then(() => true, () => true),
-    new Promise((resolve) => setTimeout(() => resolve(false), 500)),
-  ]);
+  assert.equal(interruptionSignals, baselineSignals);
+  await readSpy.waitForCalls(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(interruptionSignals, baselineSignals);
+  await firstTick;
   const secondTick = agent.requestImmediateScan('timer');
-  const secondCompleted = firstCompleted
-    ? await Promise.race([
-      secondTick.then(() => true, () => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), 500)),
-    ])
-    : false;
+  assert.equal(interruptionSignals, baselineSignals);
+  await readSpy.waitForCalls(2);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(interruptionSignals, baselineSignals);
+  await secondTick;
   const preflightReads = readSpy.calls;
   const preflightExports = exportSpy.calls;
   const preflightBodyReads = bodyReads;
@@ -2144,8 +2160,6 @@ test('two no-change timer ticks do not interrupt a running audit or queue backup
   const outcome = await audit;
   await Promise.allSettled([firstTick, secondTick]);
 
-  assert.equal(firstCompleted, true);
-  assert.equal(secondCompleted, true);
   assert.equal(preflightReads, 2);
   assert.equal(preflightExports, 0);
   assert.equal(preflightBodyReads, 0);

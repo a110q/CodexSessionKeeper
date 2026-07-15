@@ -114,6 +114,27 @@ test('unsupported hard-link publication never invokes the racy rename fallback',
   await assert.rejects(fsp.readFile(destination), { code: 'ENOENT' });
 });
 
+for (const unlinkCode of ['EPERM', 'EINVAL', 'EIO']) {
+  test(`successful publication remains committed when temp unlink fails with ${unlinkCode}`, async (t) => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
+    t.after(() => fsp.rm(root, { recursive: true, force: true }));
+    const destination = path.join(root, 'session.jsonl');
+    const temporary = path.join(root, '.session.jsonl.repair-orphan');
+    await fsp.writeFile(temporary, 'backup');
+
+    await publishSyncedTemporaryFileIfAbsent(temporary, destination, {
+      unlink: async () => {
+        const error = new Error(`injected unlink failure: ${unlinkCode}`);
+        error.code = unlinkCode;
+        throw error;
+      },
+    });
+
+    assert.equal(await fsp.readFile(destination, 'utf8'), 'backup');
+    assert.equal(await fsp.readFile(temporary, 'utf8'), 'backup');
+  });
+}
+
 test('target appearing during an unsupported hard-link attempt is never overwritten', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));

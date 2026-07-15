@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { CursorStore } = require('../../src/backup/cursor-store');
+const { publishSyncedTemporaryFileIfAbsent } = require('../../src/backup/durable-write');
 const {
   BackupIntegrityAuditor,
   dailyOffsetSeconds,
@@ -430,6 +431,43 @@ test('due audit atomically recreates a deleted target without quarantine', async
   assert.equal(await fs.readFile(unrelated, 'utf8'), 'leave-me-alone');
   assert.equal((await fixture.quarantineCopies()).length, 0);
 });
+
+for (const unlinkCode of ['EPERM', 'EINVAL', 'EIO']) {
+  test(`published missing-target repair completes metadata when temp unlink fails with ${unlinkCode}`, async (t) => {
+    const fixture = await IntegrityFixture.create(t, { name: `unlink-${unlinkCode.toLowerCase()}` });
+    await fixture.writeStatus();
+    await fs.rm(fixture.targetPath);
+    let orphanPath;
+    fixture.auditor = fixture.makeAuditor({
+      publishIfAbsent: async (temporaryPath, destinationPath) => {
+        orphanPath = temporaryPath;
+        return publishSyncedTemporaryFileIfAbsent(temporaryPath, destinationPath, {
+          unlink: async () => {
+            const error = new Error(`injected unlink failure: ${unlinkCode}`);
+            error.code = unlinkCode;
+            throw error;
+          },
+        });
+      },
+    });
+
+    assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 1 });
+    assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.committed);
+    assert.equal(await exists(orphanPath), true);
+    assert.equal(
+      (await fixture.loadManifest()).sessions[fixture.sessionId].contentHash,
+      sha256(fixture.committed),
+    );
+    const cursor = await fixture.loadCursor();
+    assert.equal(cursor.updatedAt, fixture.now.getTime() / 1000);
+    assert.equal(cursor.lastError, null);
+    assert.equal((await fixture.loadAuditState()).repairedCount, 1);
+
+    assert.deepEqual(await fixture.run(), { outcome: 'not-due', checked: 0, repaired: 0 });
+    assert.equal(await exists(orphanPath), false);
+    assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.committed);
+  });
+}
 
 test('corruption in every bounded chunk is detected and repaired', async (t) => {
   const committed = multiChunkJSONL();

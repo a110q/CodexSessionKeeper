@@ -51,11 +51,10 @@ async function durableReplaceWithWriter(destination, writer, options = {}) {
 
 async function publishSyncedTemporaryFileIfAbsent(temporaryPath, destination, options = {}) {
   const link = options.link || fsp.link;
+  const unlink = options.unlink || fsp.unlink;
 
   try {
     await link(temporaryPath, destination);
-    await fsp.unlink(temporaryPath);
-    return;
   } catch (error) {
     const unsupported = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EINVAL']);
     if (!unsupported.has(error.code)) throw error;
@@ -65,6 +64,15 @@ async function publishSyncedTemporaryFileIfAbsent(temporaryPath, destination, op
     );
     publicationError.code = 'ATOMIC_NO_REPLACE_UNSUPPORTED';
     throw publicationError;
+  }
+
+  // The destination is committed once link succeeds. Temporary cleanup is
+  // best effort so a later unlink failure cannot be mistaken for a failed
+  // publication; caller-owned orphan cleanup can remove a surviving temp.
+  try {
+    await unlink(temporaryPath);
+  } catch {
+    // Publication already succeeded; cleanup is deferred.
   }
 }
 
