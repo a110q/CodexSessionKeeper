@@ -49,53 +49,48 @@ async function durableReplaceWithWriter(destination, writer, options = {}) {
   }
 }
 
+async function publishSyncedTemporaryFileIfAbsent(temporaryPath, destination, options = {}) {
+  const link = options.link || fsp.link;
+  const rename = options.rename || fsp.rename;
+
+  try {
+    await link(temporaryPath, destination);
+    await fsp.unlink(temporaryPath);
+    return;
+  } catch (error) {
+    const unsupported = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EINVAL']);
+    if (!unsupported.has(error.code)) throw error;
+  }
+
+  try {
+    await fsp.lstat(destination);
+    const existsError = new Error(`Destination already exists: ${destination}`);
+    existsError.code = 'EEXIST';
+    throw existsError;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  await rename(temporaryPath, destination);
+}
+
 async function replaceFileDurably(destination, data, options = {}) {
   return durableReplaceWithWriter(destination, (handle) => handle.writeFile(data), options);
 }
 
 async function writeFileDurably(destination, data, options = {}) {
   const temporaryPath = await writeSyncedTemporaryFile(destination, data, options);
-  const link = options.link || fsp.link;
-  const rename = options.rename || fsp.rename;
 
   try {
-    // A same-directory hard link publishes the fully synced inode and fails if
-    // another writer already created the destination.
-    await link(temporaryPath, destination);
-    await fsp.unlink(temporaryPath);
+    await publishSyncedTemporaryFileIfAbsent(temporaryPath, destination, options);
   } catch (error) {
-    const unsupported = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EINVAL']);
-    if (!unsupported.has(error.code)) {
-      await fsp.rm(temporaryPath, { force: true }).catch(() => {});
-      throw error;
-    }
-
-    // SMB servers commonly reject hard links. The temporary file is already
-    // synchronized and lives beside the destination, so an absent destination
-    // can be published with an atomic same-directory rename.
-    try {
-      await fsp.lstat(destination);
-      const existsError = new Error(`Destination already exists: ${destination}`);
-      existsError.code = 'EEXIST';
-      throw existsError;
-    } catch (destinationError) {
-      if (destinationError.code !== 'ENOENT') {
-        await fsp.rm(temporaryPath, { force: true }).catch(() => {});
-        throw destinationError;
-      }
-    }
-
-    try {
-      await rename(temporaryPath, destination);
-    } catch (renameError) {
-      await fsp.rm(temporaryPath, { force: true }).catch(() => {});
-      throw renameError;
-    }
+    await fsp.rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
   }
 }
 
 module.exports = {
   durableReplaceWithWriter,
+  publishSyncedTemporaryFileIfAbsent,
   replaceFileDurably,
   writeFileDurably,
 };

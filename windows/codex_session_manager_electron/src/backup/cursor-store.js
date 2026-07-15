@@ -214,15 +214,21 @@ class CursorStore {
     return this.upsertMany([cursor]);
   }
 
-  async upsertMany(cursors) {
+  async upsertMany(cursors, { deletingSourcePaths = [] } = {}) {
     this.ensureOpen();
 
     const batch = Array.from(cursors);
-    if (batch.length === 0) {
+    const upsertedSourcePaths = new Set(batch.map((cursor) => cursor.sourcePath));
+    const deletions = [...new Set(deletingSourcePaths)]
+      .filter((sourcePath) => !upsertedSourcePaths.has(sourcePath));
+    if (batch.length === 0 && deletions.length === 0) {
       return;
     }
 
-    const statement = this.db.prepare(UPSERT_CURSOR);
+    const statement = batch.length > 0 ? this.db.prepare(UPSERT_CURSOR) : null;
+    const deleteStatement = deletions.length > 0
+      ? this.db.prepare('DELETE FROM backup_cursors WHERE source_path = ?;')
+      : null;
     let transactionStarted = false;
     let transactionError = null;
     let rollbackFailed = false;
@@ -230,6 +236,11 @@ class CursorStore {
     try {
       this.db.run('BEGIN IMMEDIATE;');
       transactionStarted = true;
+      for (const sourcePath of deletions) {
+        deleteStatement.bind([sourcePath]);
+        deleteStatement.step();
+        deleteStatement.reset();
+      }
       for (const cursor of batch) {
         statement.bind(cursorValues(cursor));
         statement.step();
@@ -247,7 +258,8 @@ class CursorStore {
         }
       }
     } finally {
-      statement.free();
+      deleteStatement?.free();
+      statement?.free();
     }
 
     if (transactionError) {

@@ -134,16 +134,25 @@ public final class BackupCursorStore {
         try upsertMany([cursor])
     }
 
-    public func upsertMany(_ cursors: [BackupCursor]) throws {
-        guard !cursors.isEmpty else {
+    public func upsertMany(
+        _ cursors: [BackupCursor],
+        deletingSourcePaths: [String] = []
+    ) throws {
+        let upsertedSourcePaths = Set(cursors.map(\.sourcePath))
+        let deletedSourcePaths = Set(deletingSourcePaths).subtracting(upsertedSourcePaths)
+        guard !cursors.isEmpty || !deletedSourcePaths.isEmpty else {
             return
         }
 
+        let deletions = deletedSourcePaths.sorted().map { sourcePath in
+            "DELETE FROM backup_cursors WHERE source_path = \(Self.sqlText(sourcePath));"
+        }.joined(separator: "\n")
         let statements = cursors.map(Self.upsertStatement).joined(separator: "\n")
         try execute("""
         .bail on
         .timeout 5000
         BEGIN IMMEDIATE;
+        \(deletions)
         \(statements)
         COMMIT;
         """)

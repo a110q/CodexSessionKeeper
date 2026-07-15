@@ -365,6 +365,72 @@ test('equal multi-chunk audit stops at the committed offset and ignores a partia
   assert.equal((await fixture.loadAuditState()).lastCompletedAt, fixture.now.toISOString());
 });
 
+test('legacy moved-session cursor is removed while the current cursor is audited', async (t) => {
+  const fixture = await IntegrityFixture.create(t);
+  const staleSourcePath = path.join(
+    fixture.paths.codexRoot,
+    'archived_sessions',
+    `${fixture.sessionId}.jsonl`,
+  );
+  const stale = fixture.makeCursor({
+    sourcePath: staleSourcePath,
+  });
+  fixture.cursors.set(staleSourcePath, stale);
+  await fixture.saveCursor(stale);
+
+  assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 0 });
+  const store = new CursorStore({ paths: fixture.paths });
+  await store.open();
+  const stored = store.all();
+  await store.close();
+  assert.equal(stored.size, 1);
+  assert.deepEqual(stored.get(fixture.sourcePath), fixture.cursor);
+  assert.equal(stored.has(staleSourcePath), false);
+});
+
+test('moved-session cursor for a different backup destination fails closed', async (t) => {
+  const fixture = await IntegrityFixture.create(t);
+  const staleSourcePath = path.join(
+    fixture.paths.codexRoot,
+    'archived_sessions',
+    `${fixture.sessionId}.jsonl`,
+  );
+  const unrelated = fixture.makeCursor({
+    sourcePath: staleSourcePath,
+    backupPath: path.join('archived_sessions', `${fixture.sessionId}.jsonl`),
+  });
+  fixture.cursors.set(staleSourcePath, unrelated);
+  await fixture.saveCursor(unrelated);
+
+  await assert.rejects(fixture.run(), /unsafe|cursor|path/i);
+  const store = new CursorStore({ paths: fixture.paths });
+  await store.open();
+  const stored = store.all();
+  await store.close();
+  assert.equal(stored.size, 2);
+});
+
+test('due audit atomically recreates a deleted target without quarantine', async (t) => {
+  const fixture = await IntegrityFixture.create(t);
+  await fixture.writeStatus();
+  const unrelated = path.join(fixture.paths.sessionsRoot, 'unrelated.txt');
+  await fs.writeFile(unrelated, 'leave-me-alone');
+  await fs.rm(fixture.targetPath);
+
+  assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 1 });
+  const manifest = await fixture.loadManifest();
+  const cursor = await fixture.loadCursor();
+  const status = await readJson(fixture.paths.localStatusPath);
+  assert.deepEqual(await fs.readFile(fixture.targetPath), fixture.committed);
+  assert.equal(manifest.sessions[fixture.sessionId].contentHash, sha256(fixture.committed));
+  assert.equal(cursor.lastByteOffset, fixture.committed.length);
+  assert.equal(cursor.lastError, null);
+  assert.equal(status.lastRepairAt, fixture.now.toISOString());
+  assert.equal(status.repairCount, 1);
+  assert.equal(await fs.readFile(unrelated, 'utf8'), 'leave-me-alone');
+  assert.equal((await fixture.quarantineCopies()).length, 0);
+});
+
 test('corruption in every bounded chunk is detected and repaired', async (t) => {
   const committed = multiChunkJSONL();
   for (let chunkIndex = 0; chunkIndex < 3; chunkIndex += 1) {

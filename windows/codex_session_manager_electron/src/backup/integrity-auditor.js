@@ -5,11 +5,16 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 
 const { CursorStore } = require('./cursor-store');
-const { durableReplaceWithWriter, replaceFileDurably } = require('./durable-write');
+const {
+  durableReplaceWithWriter,
+  publishSyncedTemporaryFileIfAbsent,
+  replaceFileDurably,
+} = require('./durable-write');
 const { loadOrCreateManifest, saveManifest } = require('./manifest-store');
 const { INTEGRITY_REPAIR_JOURNAL_VERSION } = require('./models');
 const { assertSafeDestinationPath, assertSafeSourcePath } = require('./restore-filesystem');
 const { rebuildSessionCompleteLines } = require('./session-backup-streamer');
+const { sessionIdFromPath } = require('./session-identity');
 
 const MAXIMUM_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_CHUNK_SIZE = MAXIMUM_CHUNK_SIZE;
@@ -86,8 +91,27 @@ class BackupIntegrityAuditor {
     const bufferedHashes = new Map();
     let checked = 0;
     let repaired = 0;
+    const orderedCursors = normalizedCursors(cursors);
+    const currentCursorsBySession = new Map(orderedCursors.flatMap((cursor) => {
+      const record = manifest.sessions?.[cursor.sessionId];
+      return record
+        && cursor.sourcePath === record.sourcePath
+        && cursor.backupPath === record.backupPath
+        && cursor.lastByteOffset === record.bytesBackedUp
+        ? [[cursor.sessionId, cursor]]
+        : [];
+    }));
+    const staleCursorSourcePaths = new Set(orderedCursors.flatMap((cursor) => {
+      const record = manifest.sessions?.[cursor.sessionId];
+      return record
+        && currentCursorsBySession.has(cursor.sessionId)
+        && this.isProvenStaleCursor(cursor, record)
+        ? [cursor.sourcePath]
+        : [];
+    }));
     try {
-      for (const cursor of normalizedCursors(cursors)) {
+      for (const cursor of orderedCursors) {
+        if (staleCursorSourcePaths.has(cursor.sourcePath)) continue;
         this.requireNotInterrupted(interruptionRequested);
         const record = manifest.sessions?.[cursor.sessionId];
         if (!record) throw new Error(`Integrity audit has no manifest record for session: ${cursor.sessionId}`);
@@ -126,6 +150,17 @@ class BackupIntegrityAuditor {
     if (manifestChanged) {
       manifest.updatedAt = auditDate.toISOString();
       await saveManifest(this.paths, manifest);
+    }
+    if (staleCursorSourcePaths.size > 0) {
+      const store = this.cursorStoreFactory(this.paths);
+      await store.open();
+      try {
+        await store.upsertMany([], {
+          deletingSourcePaths: [...staleCursorSourcePaths],
+        });
+      } finally {
+        await store.close();
+      }
     }
 
     await this.cleanupQuarantine(auditDate);
@@ -180,6 +215,33 @@ class BackupIntegrityAuditor {
     assertSafeSourcePath(this.paths.backupRoot, path.dirname(this.paths.backupRoot));
   }
 
+  isProvenStaleCursor(cursor, record) {
+    if (cursor.sessionId !== record.sessionId
+      || cursor.sourcePath === record.sourcePath
+      || cursor.backupPath !== record.backupPath) return false;
+    try {
+      validateWindowsSourceNamespace(cursor.sourcePath);
+      const sourcePath = path.resolve(cursor.sourcePath);
+      const sourceRoot = sourceRootFor(this.paths, sourcePath);
+      assertSafeSourcePath(sourcePath, sourceRoot, { allowMissing: true });
+      if (sessionIdFromPath(sourcePath) !== cursor.sessionId) return false;
+
+      const relativeBackupPath = validateRelativeBackupPath(cursor.backupPath);
+      if (!['sessions', 'archived_sessions'].includes(relativeBackupPath.split('/')[0])) return false;
+      const currentBackupPath = validateRelativeBackupPath(record.backupPath);
+      if (relativeBackupPath !== currentBackupPath) return false;
+
+      const targetPath = path.resolve(this.paths.backupRoot, ...relativeBackupPath.split('/'));
+      if (validateRelativeBackupPath(this.paths.relativeBackupPath(targetPath)) !== relativeBackupPath) {
+        return false;
+      }
+      assertSafeDestinationPath(targetPath, this.paths.backupRoot);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async validate(cursor, record) {
     if (!Number.isSafeInteger(cursor.lastByteOffset) || cursor.lastByteOffset < 0
       || cursor.sessionId !== record.sessionId
@@ -202,21 +264,44 @@ class BackupIntegrityAuditor {
       throw new Error(`Integrity audit rejected unsafe source: ${sourcePath}`);
     }
 
-    const targetPath = path.resolve(this.paths.backupFilePath(sourcePath));
+    const targetPath = path.resolve(this.paths.backupRoot, ...relativeBackupPath.split('/'));
     const canonicalRelative = validateRelativeBackupPath(this.paths.relativeBackupPath(targetPath));
     if (canonicalRelative !== relativeBackupPath) {
       throw new Error(`Integrity audit rejected unsafe cursor metadata: ${cursor.backupPath}`);
     }
-    assertSafeSourcePath(targetPath, this.paths.backupRoot);
-    const targetStats = await fsp.lstat(targetPath);
-    if (!targetStats.isFile() || targetStats.isSymbolicLink()) {
-      throw new Error(`Integrity audit rejected unsafe target: ${targetPath}`);
+    assertSafeDestinationPath(targetPath, this.paths.backupRoot);
+    const targetParent = path.dirname(targetPath);
+    assertSafeSourcePath(targetParent, this.paths.backupRoot);
+    const parentStats = await fsp.lstat(targetParent);
+    if (!parentStats.isDirectory() || parentStats.isSymbolicLink()) {
+      throw new Error(`Integrity audit rejected unsafe target parent: ${targetParent}`);
     }
-    return { cursor, record, sourcePath, targetPath, targetByteCount: targetStats.size };
+    let targetStats = null;
+    try {
+      targetStats = await fsp.lstat(targetPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (targetStats) {
+      assertSafeSourcePath(targetPath, this.paths.backupRoot);
+      if (!targetStats.isFile() || targetStats.isSymbolicLink()) {
+        throw new Error(`Integrity audit rejected unsafe target: ${targetPath}`);
+      }
+    }
+    return {
+      cursor,
+      record,
+      sourcePath,
+      targetPath,
+      targetExists: Boolean(targetStats),
+      targetByteCount: targetStats?.size ?? 0,
+    };
   }
 
   async compareCommittedPrefix(file, interruptionRequested) {
-    if (file.targetByteCount !== file.cursor.lastByteOffset) return { matches: false };
+    if (!file.targetExists || file.targetByteCount !== file.cursor.lastByteOffset) {
+      return { matches: false };
+    }
     const sourceHandle = await fsp.open(file.sourcePath, 'r');
     let targetHandle;
     const digest = crypto.createHash('sha256');
@@ -283,6 +368,18 @@ class BackupIntegrityAuditor {
         interruptionRequested,
         validateJSON: true,
       });
+
+      if (!revalidated.targetExists) {
+        return await this.installMissingTarget({
+          file: revalidated,
+          repairTemporary,
+          repairHash,
+          now,
+          manifest,
+          state,
+          interruptionRequested,
+        });
+      }
 
       await this.checkpoint('beforeQuarantineCopy');
       quarantine = await this.quarantineCurrentTarget({
@@ -363,6 +460,66 @@ class BackupIntegrityAuditor {
     const committed = await this.commitRepairMetadata({ pendingRepair, manifest, state });
     await this.removePendingRepair();
     return committed;
+  }
+
+  async installMissingTarget({
+    file,
+    repairTemporary,
+    repairHash,
+    now,
+    manifest,
+    state,
+    interruptionRequested,
+  }) {
+    this.requireNotInterrupted(interruptionRequested);
+    assertSafeDestinationPath(file.targetPath, this.paths.backupRoot);
+    const targetParent = path.dirname(file.targetPath);
+    assertSafeSourcePath(targetParent, this.paths.backupRoot);
+    const parentStats = await fsp.lstat(targetParent);
+    if (!parentStats.isDirectory() || parentStats.isSymbolicLink()) {
+      throw new Error(`Integrity audit rejected unsafe target parent: ${targetParent}`);
+    }
+    try {
+      await fsp.lstat(file.targetPath);
+      throw new Error(`Integrity audit refused to replace newly-created target: ${file.targetPath}`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+
+    await this.checkpoint('beforeReplace');
+    let installed = false;
+    try {
+      await publishSyncedTemporaryFileIfAbsent(repairTemporary, file.targetPath);
+      installed = true;
+      await this.directorySync(targetParent);
+      await this.checkpoint('afterFormalReplaceBeforeInstalledJournalCommit');
+      await this.checkpoint('beforePostReplaceVerification');
+      await this.verifyFile(file.targetPath, {
+        expectedByteCount: file.cursor.lastByteOffset,
+        expectedHash: repairHash,
+        phase: 'installedVerification',
+        interruptionRequested,
+      });
+    } catch (error) {
+      if (installed) {
+        await fsp.rm(file.targetPath, { force: true }).catch(() => {});
+        await this.directorySync(targetParent);
+      }
+      throw error;
+    }
+
+    await this.checkpoint('beforeMetadataCommit');
+    return this.commitRepairValues({
+      sessionId: file.cursor.sessionId,
+      sourcePath: file.cursor.sourcePath,
+      backupPath: file.cursor.backupPath,
+      byteCount: file.cursor.lastByteOffset,
+      contentHash: repairHash,
+      repairedAt: now,
+      repairedCount: Number(state.repairedCount || 0) + 1,
+      manifest,
+      state,
+    });
   }
 
   async quarantineCurrentTarget({ targetPath, sessionId, now, interruptionRequested }) {
@@ -583,34 +740,59 @@ class BackupIntegrityAuditor {
   }
 
   async commitRepairMetadata({ pendingRepair, manifest, state }) {
-    let record = requiredRecord(manifest, pendingRepair.sessionId);
-    if (record.sourcePath !== pendingRepair.sourcePath || record.backupPath !== pendingRepair.backupPath) {
-      throw new Error(`Integrity audit rejected unsafe cursor metadata: ${pendingRepair.sourcePath}`);
+    return this.commitRepairValues({
+      sessionId: pendingRepair.sessionId,
+      sourcePath: pendingRepair.sourcePath,
+      backupPath: pendingRepair.backupPath,
+      byteCount: pendingRepair.byteCount,
+      contentHash: pendingRepair.contentHash,
+      repairedAt: new Date(pendingRepair.repairedAt),
+      repairedCount: pendingRepair.repairedCount,
+      manifest,
+      state,
+    });
+  }
+
+  async commitRepairValues({
+    sessionId,
+    sourcePath,
+    backupPath,
+    byteCount,
+    contentHash,
+    repairedAt,
+    repairedCount,
+    manifest,
+    state,
+  }) {
+    const repairedAtDate = dateValue(repairedAt);
+    let record = requiredRecord(manifest, sessionId);
+    if (record.sourcePath !== sourcePath || record.backupPath !== backupPath) {
+      throw new Error(`Integrity audit rejected unsafe cursor metadata: ${sourcePath}`);
     }
-    const notAdvanced = record.bytesBackedUp === pendingRepair.byteCount
-      && (!record.lastBackedUpAt || new Date(record.lastBackedUpAt) <= new Date(pendingRepair.repairedAt));
+    const notAdvanced = record.bytesBackedUp === byteCount
+      && (!record.lastBackedUpAt || new Date(record.lastBackedUpAt) <= repairedAtDate);
     if (notAdvanced) {
       record = {
         ...record,
-        contentHash: pendingRepair.contentHash,
-        lastBackedUpAt: pendingRepair.repairedAt,
+        contentHash,
+        lastBackedUpAt: repairedAtDate.toISOString(),
       };
     }
-    manifest.sessions[pendingRepair.sessionId] = record;
-    manifest.updatedAt = maxIso(manifest.updatedAt, pendingRepair.repairedAt);
+    manifest.sessions[sessionId] = record;
+    manifest.updatedAt = maxIso(manifest.updatedAt, repairedAtDate.toISOString());
     await saveManifest(this.paths, manifest);
     await this.checkpoint('afterManifestCommit');
 
     const store = this.cursorStoreFactory(this.paths);
     await store.open();
     try {
-      const cursor = await store.get(pendingRepair.sourcePath);
-      if (!cursor || cursor.sessionId !== pendingRepair.sessionId || cursor.backupPath !== pendingRepair.backupPath) {
-        throw new Error(`Integrity audit rejected unsafe cursor metadata: ${pendingRepair.sourcePath}`);
+      const cursor = await store.get(sourcePath);
+      if (!cursor || cursor.sessionId !== sessionId || cursor.backupPath !== backupPath) {
+        throw new Error(`Integrity audit rejected unsafe cursor metadata: ${sourcePath}`);
       }
-      const repairedAt = new Date(pendingRepair.repairedAt).getTime() / 1000;
-      if (cursor.lastByteOffset === pendingRepair.byteCount && cursor.updatedAt <= repairedAt) {
-        await store.upsert({ ...cursor, updatedAt: repairedAt, lastError: null });
+      const repairedAtSeconds = repairedAtDate.getTime() / 1000;
+      if (cursor.lastByteOffset === byteCount && cursor.updatedAt <= repairedAtSeconds) {
+        await store.upsert({ ...cursor, updatedAt: repairedAtSeconds, lastError: null });
       }
     } finally {
       await store.close();
@@ -619,13 +801,13 @@ class BackupIntegrityAuditor {
 
     state = {
       ...state,
-      repairedCount: Math.max(Number(state.repairedCount || 0), pendingRepair.repairedCount),
+      repairedCount: Math.max(Number(state.repairedCount || 0), repairedCount),
       lastResult: 'repaired',
     };
     await this.saveAuditState(state);
     await this.checkpoint('afterAuditStateCommit');
     await this.updatePersistedStatus({
-      lastRepairAt: new Date(pendingRepair.repairedAt),
+      lastRepairAt: repairedAtDate,
       repairCount: state.repairedCount,
     });
     await this.checkpoint('afterRuntimeStatusCommit');

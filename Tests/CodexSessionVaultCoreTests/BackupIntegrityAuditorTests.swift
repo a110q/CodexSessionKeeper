@@ -68,6 +68,97 @@ struct BackupIntegrityAuditorTests {
     }
 
     @Test
+    func legacyMovedSessionCursorIsRemovedWhileCurrentCursorIsAudited() throws {
+        let fixture = try IntegrityAuditFixture()
+        defer { fixture.cleanup() }
+        let current = try #require(fixture.cursors[fixture.source.path])
+        let staleSource = fixture.paths.codexRoot.appendingPathComponent(
+            "archived_sessions/\(fixture.sessionID).jsonl",
+            isDirectory: false
+        )
+        var stale = current
+        stale.sourcePath = staleSource.path
+        var cursors = fixture.cursors
+        cursors[stale.sourcePath] = stale
+        try fixture.saveCursor(stale)
+
+        let outcome = try fixture.auditor.runIfDue(
+            now: fixture.dueDate,
+            deviceID: fixture.deviceID,
+            cursors: cursors,
+            interruptionRequested: { false }
+        )
+        let store = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+        try store.open()
+        let stored = try store.loadAll()
+
+        #expect(outcome == .completed(checked: 1, repaired: 0))
+        #expect(stored.count == 1)
+        #expect(stored[fixture.source.path] == current)
+        #expect(stored[stale.sourcePath] == nil)
+    }
+
+    @Test
+    func movedSessionCursorForDifferentBackupDestinationFailsClosed() throws {
+        let fixture = try IntegrityAuditFixture()
+        defer { fixture.cleanup() }
+        let current = try #require(fixture.cursors[fixture.source.path])
+        let staleSource = fixture.paths.codexRoot.appendingPathComponent(
+            "archived_sessions/\(fixture.sessionID).jsonl",
+            isDirectory: false
+        )
+        var unrelated = current
+        unrelated.sourcePath = staleSource.path
+        unrelated.backupPath = "archived_sessions/\(fixture.sessionID).jsonl"
+        var cursors = fixture.cursors
+        cursors[unrelated.sourcePath] = unrelated
+        try fixture.saveCursor(unrelated)
+
+        #expect(throws: (any Error).self) {
+            _ = try fixture.auditor.runIfDue(
+                now: fixture.dueDate,
+                deviceID: fixture.deviceID,
+                cursors: cursors,
+                interruptionRequested: { false }
+            )
+        }
+        let store = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+        try store.open()
+        #expect(try store.loadAll().count == 2)
+    }
+
+    @Test
+    func dueAuditAtomicallyRecreatesDeletedTargetWithoutQuarantine() throws {
+        let fixture = try IntegrityAuditFixture()
+        defer { fixture.cleanup() }
+        try fixture.writeStatus()
+        let unrelated = fixture.paths.sessionsRoot.appendingPathComponent("unrelated.txt")
+        let unrelatedData = Data("leave-me-alone".utf8)
+        try unrelatedData.write(to: unrelated)
+        try FileManager.default.removeItem(at: fixture.target)
+
+        let outcome = try fixture.auditor.runIfDue(
+            now: fixture.dueDate,
+            deviceID: fixture.deviceID,
+            cursors: fixture.cursors,
+            interruptionRequested: { false }
+        )
+        let manifest = try fixture.loadManifest()
+        let cursor = try #require(try fixture.loadCursor())
+        let status = try fixture.loadStatus()
+
+        #expect(outcome == .completed(checked: 1, repaired: 1))
+        #expect(try fixture.nasTargetData() == fixture.committedLocalPrefix)
+        #expect(manifest.sessions[fixture.sessionID]?.contentHash == sha256(fixture.committedLocalPrefix))
+        #expect(cursor.lastByteOffset == Int64(fixture.committedLocalPrefix.count))
+        #expect(cursor.lastError == nil)
+        #expect(status.lastRepairAt == fixture.dueDate)
+        #expect(status.repairCount == 1)
+        #expect(try Data(contentsOf: unrelated) == unrelatedData)
+        #expect(try fixture.quarantineCopies().isEmpty)
+    }
+
+    @Test
     func corruptionInAnyChunkIsDetectedAndRepaired() throws {
         let committed = IntegrityAuditFixture.multiChunkJSONL()
         for chunkIndex in 0..<3 {

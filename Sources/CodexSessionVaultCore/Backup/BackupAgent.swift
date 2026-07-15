@@ -86,6 +86,7 @@ public final class BackupAgent: @unchecked Sendable {
     private struct ProcessSessionFileResult {
         var manifestChanged: Bool
         var cursor: BackupCursor?
+        var staleCursorSourcePath: String?
         var lastError: String?
     }
 
@@ -281,6 +282,7 @@ public final class BackupAgent: @unchecked Sendable {
         let phase: BackupProgressPhase = manifestExisted ? .scanning : .seeding
         var processedSessionIDs = Set<String>()
         var updatedCursors: [BackupCursor] = []
+        var staleCursorSourcePaths: [String] = []
         var scanErrors: [String] = []
         var completed = 0
         var interrupted = false
@@ -315,6 +317,9 @@ public final class BackupAgent: @unchecked Sendable {
             if let cursor = result.cursor {
                 updatedCursors.append(cursor)
             }
+            if let staleCursorSourcePath = result.staleCursorSourcePath {
+                staleCursorSourcePaths.append(staleCursorSourcePath)
+            }
             if let lastError = result.lastError {
                 scanErrors.append(lastError)
             }
@@ -333,8 +338,11 @@ public final class BackupAgent: @unchecked Sendable {
             manifest.updatedAt = scanDate
             try manifestStore.save(manifest)
         }
-        if !updatedCursors.isEmpty {
-            try cursorStore.upsertMany(updatedCursors)
+        if !updatedCursors.isEmpty || !staleCursorSourcePaths.isEmpty {
+            try cursorStore.upsertMany(
+                updatedCursors,
+                deletingSourcePaths: staleCursorSourcePaths
+            )
         }
         if interrupted {
             let pending = try interruptedPendingSources(
@@ -583,10 +591,7 @@ public final class BackupAgent: @unchecked Sendable {
         stateLock.unlock()
     }
 
-    private func requestScheduledAudit(
-        timerGeneration: UInt64,
-        baselineEpoch: UInt64
-    ) {
+    private func requestScheduledAudit(timerGeneration: UInt64) {
         stateLock.lock()
         guard timerGeneration == auditTimerGeneration else {
             stateLock.unlock()
@@ -597,6 +602,7 @@ public final class BackupAgent: @unchecked Sendable {
             stateLock.unlock()
             return
         }
+        let baselineEpoch = auditInterruptionEpoch
         if workerActive {
             pendingAuditBaselineEpoch = baselineEpoch
         } else {
@@ -633,14 +639,10 @@ public final class BackupAgent: @unchecked Sendable {
         auditTimerTask = nil
         auditTimerGeneration &+= 1
         let timerGeneration = auditTimerGeneration
-        let baselineEpoch = auditInterruptionEpoch
         let currentDate = now()
         let delay = auditDelayProvider(currentDate, cachedStatus?.lastAuditAt, deviceID)
         auditTimerTask = auditTimerScheduler(delay) { [weak self] in
-            self?.requestScheduledAudit(
-                timerGeneration: timerGeneration,
-                baselineEpoch: baselineEpoch
-            )
+            self?.requestScheduledAudit(timerGeneration: timerGeneration)
         }
         stateLock.unlock()
         existingTask?.cancel()
@@ -695,15 +697,23 @@ public final class BackupAgent: @unchecked Sendable {
         let sourcePath = canonicalSourcePath(sourceURL)
         let existingRecord = manifest.sessions[sessionID]
         let currentCursor = cursorMap[sourcePath] ?? cursorMap[sourceURL.path]
-        let baselineCursor = currentCursor ?? migratedCursor(
+        let migratedCursor = migratedCursor(
             for: existingRecord,
             currentSourcePath: sourcePath,
             cursorMap: cursorMap
         )
-        let targetURL = try paths.backupFileURL(for: sourceURL)
+        let baselineCursor = currentCursor ?? migratedCursor
+        let mirroredTargetURL = try paths.backupFileURL(for: sourceURL)
+        let targetURL = trustedRecordedBackupURL(
+            existingRecord?.backupPath ?? baselineCursor?.backupPath
+        ) ?? mirroredTargetURL
         guard let relativeBackupPath = paths.relativeBackupPath(for: targetURL) else {
             throw BackupTargetValidationError.unsafeTarget(targetURL.path)
         }
+        let staleCursorSourcePath = currentCursor == nil
+            && migratedCursor?.backupPath == relativeBackupPath
+            ? migratedCursor?.sourcePath
+            : nil
         let sourceMetadata = try fileCommitter.inspectSource(sourceURL)
         if scanIsStrictlyUnchanged(
             sourcePath: sourcePath,
@@ -715,6 +725,7 @@ public final class BackupAgent: @unchecked Sendable {
             return ProcessSessionFileResult(
                 manifestChanged: false,
                 cursor: nil,
+                staleCursorSourcePath: nil,
                 lastError: currentCursor?.lastError
             )
         }
@@ -847,6 +858,7 @@ public final class BackupAgent: @unchecked Sendable {
         return ProcessSessionFileResult(
             manifestChanged: manifestChanged,
             cursor: cursorNeedsUpsert(currentCursor: currentCursor, updatedCursor: updatedCursor) ? updatedCursor : nil,
+            staleCursorSourcePath: staleCursorSourcePath,
             lastError: blockedError
         )
     }
@@ -860,7 +872,39 @@ public final class BackupAgent: @unchecked Sendable {
               previousSourcePath != currentSourcePath else {
             return nil
         }
-        return cursorMap[previousSourcePath]
+        guard let cursor = cursorMap[previousSourcePath],
+              cursor.sessionId == existingRecord?.sessionId,
+              cursor.backupPath == existingRecord?.backupPath else {
+            return nil
+        }
+        return cursor
+    }
+
+    private func trustedRecordedBackupURL(_ relativePath: String?) -> URL? {
+        guard let relativePath else { return nil }
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard components.count > 1,
+              ["sessions", "archived_sessions"].contains(components[0]),
+              components.allSatisfy({ component in
+                  !component.isEmpty
+                      && component != "."
+                      && component != ".."
+                      && !component.contains("\\")
+                      && !component.contains(":")
+                      && !component.contains("\0")
+              }) else {
+            return nil
+        }
+        let target = components.reduce(paths.backupRoot) { partial, component in
+            partial.appendingPathComponent(component, isDirectory: false)
+        }
+        guard paths.relativeBackupPath(for: target) == relativePath else {
+            return nil
+        }
+        guard (try? RestoreFilesystemValidator.validateDestination(target, under: paths.backupRoot)) != nil else {
+            return nil
+        }
+        return target
     }
 
     private func scanIsStrictlyUnchanged(

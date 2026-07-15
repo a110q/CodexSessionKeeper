@@ -529,21 +529,52 @@ test('moving a session from sessions to archived does not duplicate backup', asy
 
   const agent = new BackupAgent({ paths, now: makeClock() });
   await agent.performOneShotScan();
+  const initialManifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const initialBackupPath = initialManifest.sessions.moved.backupPath;
 
   await fs.mkdir(path.dirname(archivedPath), { recursive: true });
   await fs.rename(activePath, archivedPath);
-  await agent.performOneShotScan();
+  const migrationExportSpy = spyOnAllCursorStoreExports();
+  try {
+    await agent.performOneShotScan();
+  } finally {
+    migrationExportSpy.restore();
+  }
+  assert.equal(migrationExportSpy.calls, 1);
   await fs.appendFile(archivedPath, jsonLine({ role: 'assistant', content: 'After archive' }), 'utf8');
   await agent.performOneShotScan();
 
   const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
   const record = manifest.sessions.moved;
   assert.equal(record.sourcePath, archivedPath);
+  assert.equal(record.backupPath, initialBackupPath);
   assert.deepEqual(await readLines(path.join(paths.backupRoot, record.backupPath)), [
     JSON.stringify({ role: 'user', content: 'Original' }),
     JSON.stringify({ role: 'assistant', content: 'After archive' }),
   ]);
   assert.equal(record.lineCount, 2);
+
+  const cursorStore = new CursorStore({ paths });
+  await cursorStore.open();
+  const cursors = cursorStore.all();
+  await cursorStore.close();
+  assert.equal(cursors.size, 1);
+  assert.equal(cursors.has(activePath), false);
+  assert.equal(cursors.has(archivedPath), true);
+
+  const dueDate = new Date('2026-07-15T04:05:06.000Z');
+  await fs.writeFile(paths.auditStatePath, `${JSON.stringify({
+    lastCompletedAt: new Date(dueDate.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  })}\n`);
+  const auditOutcome = await new BackupIntegrityAuditor({ paths }).runIfDue({
+    now: dueDate,
+    deviceId: DEVICE_ID,
+    cursors,
+    interruptionRequested: () => false,
+  });
+  assert.deepEqual(auditOutcome, { outcome: 'completed', checked: 1, repaired: 0 });
 });
 
 test('active sessions are preferred over archived sessions with the same id', async (t) => {

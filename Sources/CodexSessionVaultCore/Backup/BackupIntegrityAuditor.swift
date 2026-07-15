@@ -154,8 +154,26 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         var bufferedHashes: [String: String] = [:]
         var checked = 0
         var repaired = 0
+        let orderedCursors = cursors.values.sorted(by: Self.cursorOrder)
+        let currentCursorsBySession = [String: BackupCursor](uniqueKeysWithValues: orderedCursors.compactMap { cursor in
+            guard let record = manifest.sessions[cursor.sessionId],
+                  cursor.sourcePath == record.sourcePath,
+                  cursor.backupPath == record.backupPath,
+                  cursor.lastByteOffset == record.bytesBackedUp else {
+                return nil
+            }
+            return (cursor.sessionId, cursor)
+        })
+        let staleCursorSourcePaths = Set<String>(orderedCursors.compactMap { cursor in
+            guard let record = manifest.sessions[cursor.sessionId],
+                  currentCursorsBySession[cursor.sessionId] != nil,
+                  isProvenStaleCursor(cursor, record: record) else {
+                return nil
+            }
+            return cursor.sourcePath
+        })
 
-        for cursor in cursors.values.sorted(by: Self.cursorOrder) {
+        for cursor in orderedCursors where !staleCursorSourcePaths.contains(cursor.sourcePath) {
             guard !interruptionRequested() else { return .interrupted }
             guard let record = manifest.sessions[cursor.sessionId] else {
                 throw IntegrityAuditError.missingManifestRecord(cursor.sessionId)
@@ -202,6 +220,14 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         if manifestChanged {
             manifest.updatedAt = now
             try manifestStore.save(manifest)
+        }
+        if !staleCursorSourcePaths.isEmpty {
+            let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
+            try cursorStore.open()
+            try cursorStore.upsertMany(
+                [],
+                deletingSourcePaths: Array(staleCursorSourcePaths)
+            )
         }
 
         try cleanupQuarantine(now: now)
@@ -262,6 +288,35 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         return lhs.sourcePath < rhs.sourcePath
     }
 
+    private func isProvenStaleCursor(
+        _ cursor: BackupCursor,
+        record: BackupSessionRecord
+    ) -> Bool {
+        guard cursor.sessionId == record.sessionId,
+              cursor.sourcePath != record.sourcePath,
+              cursor.backupPath == record.backupPath else {
+            return false
+        }
+        let source = URL(fileURLWithPath: cursor.sourcePath, isDirectory: false).standardizedFileURL
+        guard SessionIdentity.sessionID(from: source) == cursor.sessionId,
+              let trustedSourceRoot = sourceRootIfTrusted(for: source) else {
+            return false
+        }
+        do {
+            try RestoreFilesystemValidator.validateSource(
+                source,
+                under: trustedSourceRoot,
+                allowMissing: true
+            )
+            let target = paths.backupRoot.appendingPathComponent(cursor.backupPath, isDirectory: false)
+            guard paths.relativeBackupPath(for: target) == cursor.backupPath else { return false }
+            try RestoreFilesystemValidator.validateDestination(target, under: paths.backupRoot)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func validate(
         cursor: BackupCursor,
         record: BackupSessionRecord
@@ -275,19 +330,20 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         }
 
         let source = URL(fileURLWithPath: cursor.sourcePath, isDirectory: false).standardizedFileURL
-        let expectedTarget = try paths.backupFileURL(for: source).standardizedFileURL
-        guard paths.relativeBackupPath(for: expectedTarget) == cursor.backupPath else {
-            throw IntegrityAuditError.unsafeCursor(cursor.backupPath)
+        guard source.pathExtension.lowercased() == "jsonl",
+              let trustedSourceRoot = sourceRootIfTrusted(for: source) else {
+            throw BackupPathsError.unsafeSource(source.path)
         }
-        try RestoreFilesystemValidator.validateSource(source, under: sourceRoot(for: source))
-        try RestoreFilesystemValidator.validateSource(expectedTarget, under: paths.backupRoot)
+        let expectedTarget = try trustedPendingURL(
+            relativePath: cursor.backupPath,
+            allowedRoots: [paths.sessionsRoot, paths.archivedSessionsRoot]
+        )
+        try RestoreFilesystemValidator.validateSource(source, under: trustedSourceRoot)
+        try RestoreFilesystemValidator.validateDestination(expectedTarget, under: paths.backupRoot)
+        let targetParent = expectedTarget.deletingLastPathComponent()
+        try RestoreFilesystemValidator.validateSource(targetParent, under: paths.backupRoot)
 
         let sourceValues = try source.resourceValues(forKeys: [
-            .isRegularFileKey,
-            .isSymbolicLinkKey,
-            .fileSizeKey
-        ])
-        let targetValues = try expectedTarget.resourceValues(forKeys: [
             .isRegularFileKey,
             .isSymbolicLinkKey,
             .fileSizeKey
@@ -297,31 +353,50 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
               Int64(sourceValues.fileSize ?? -1) >= cursor.lastByteOffset else {
             throw BackupPathsError.unsafeSource(source.path)
         }
-        guard targetValues.isRegularFile == true, targetValues.isSymbolicLink != true else {
-            throw BackupTargetValidationError.unsafeTarget(expectedTarget.path)
+        let targetValues: URLResourceValues?
+        do {
+            targetValues = try expectedTarget.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey
+            ])
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            targetValues = nil
+        }
+        if let targetValues {
+            try RestoreFilesystemValidator.validateSource(expectedTarget, under: paths.backupRoot)
+            guard targetValues.isRegularFile == true, targetValues.isSymbolicLink != true else {
+                throw BackupTargetValidationError.unsafeTarget(expectedTarget.path)
+            }
         }
 
         return ValidatedAuditFile(
             cursor: cursor,
             source: source,
             target: expectedTarget,
-            targetByteCount: Int64(targetValues.fileSize ?? -1)
+            targetExists: targetValues != nil,
+            targetByteCount: Int64(targetValues?.fileSize ?? 0)
         )
     }
 
-    private func sourceRoot(for source: URL) -> URL {
+    private func sourceRootIfTrusted(for source: URL) -> URL? {
         let archived = paths.codexRoot.appendingPathComponent("archived_sessions", isDirectory: true)
         if source.pathComponents.starts(with: archived.standardizedFileURL.pathComponents) {
             return archived
         }
-        return paths.codexRoot.appendingPathComponent("sessions", isDirectory: true)
+        let sessions = paths.codexRoot.appendingPathComponent("sessions", isDirectory: true)
+        if source.pathComponents.starts(with: sessions.standardizedFileURL.pathComponents) {
+            return sessions
+        }
+        return nil
     }
 
     private func compareCommittedPrefix(
         _ file: ValidatedAuditFile,
         interruptionRequested: @Sendable () -> Bool
     ) throws -> ComparisonResult {
-        guard file.targetByteCount == file.cursor.lastByteOffset else { return .mismatch }
+        guard file.targetExists,
+              file.targetByteCount == file.cursor.lastByteOffset else { return .mismatch }
         let sourceHandle = try FileHandle(forReadingFrom: file.source)
         let targetHandle = try FileHandle(forReadingFrom: file.target)
         defer {
@@ -381,6 +456,19 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
                 phase: .repairTemporaryVerification,
                 interruptionRequested: interruptionRequested
             )
+
+            if !revalidated.targetExists {
+                return try installMissingTarget(
+                    revalidated,
+                    repairTemporary: repairTemporary,
+                    repairHash: repairHash,
+                    now: now,
+                    manifest: &manifest,
+                    manifestStore: manifestStore,
+                    state: &state,
+                    interruptionRequested: interruptionRequested
+                )
+            }
 
             try instrumentation.checkpoint(.beforeQuarantineCopy)
             quarantine = try quarantineCurrentTarget(
@@ -462,6 +550,66 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         )
         try removePendingRepairMetadata()
         return .repaired(hash: repairHash)
+    }
+
+    private func installMissingTarget(
+        _ file: ValidatedAuditFile,
+        repairTemporary: URL,
+        repairHash: String,
+        now: Date,
+        manifest: inout BackupManifest,
+        manifestStore: BackupManifestStore,
+        state: inout IntegrityAuditState,
+        interruptionRequested: @Sendable () -> Bool
+    ) throws -> RepairResult {
+        do {
+            try requireNotInterrupted(interruptionRequested)
+            try RestoreFilesystemValidator.validateDestination(file.target, under: paths.backupRoot)
+            try RestoreFilesystemValidator.validateSource(
+                file.target.deletingLastPathComponent(),
+                under: paths.backupRoot
+            )
+            do {
+                _ = try file.target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                throw BackupTargetValidationError.unsafeTarget(file.target.path)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                // The missing leaf is the only recoverable target state.
+            }
+            try instrumentation.checkpoint(.beforeReplace)
+            try fileManager.moveItem(at: repairTemporary, to: file.target)
+            synchronizeParentDirectory(file.target.deletingLastPathComponent())
+            try instrumentation.checkpoint(.afterFormalReplaceBeforeInstalledJournalCommit)
+            do {
+                try instrumentation.checkpoint(.beforePostReplaceVerification)
+                try verifyFile(
+                    file.target,
+                    expectedByteCount: file.cursor.lastByteOffset,
+                    expectedHash: repairHash,
+                    phase: .installedVerification,
+                    interruptionRequested: interruptionRequested
+                )
+            } catch {
+                try? fileManager.removeItem(at: file.target)
+                synchronizeParentDirectory(file.target.deletingLastPathComponent())
+                throw error
+            }
+            try instrumentation.checkpoint(.beforeMetadataCommit)
+            try commitRepairMetadata(
+                sessionID: file.cursor.sessionId,
+                sourcePath: file.cursor.sourcePath,
+                backupPath: file.cursor.backupPath,
+                byteCount: file.cursor.lastByteOffset,
+                contentHash: repairHash,
+                repairedAt: now,
+                repairedCount: state.repairedCount + 1,
+                manifest: &manifest,
+                manifestStore: manifestStore,
+                state: &state
+            )
+            return .repaired(hash: repairHash)
+        } catch IntegrityAuditControl.interrupted {
+            return .interrupted
+        }
     }
 
     private func resolvePendingRepairMetadata(
@@ -613,45 +761,71 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         manifestStore: BackupManifestStore,
         state: inout IntegrityAuditState
     ) throws {
-        var repairedRecord = try requiredRecord(pendingRepair.sessionID, in: manifest)
-        guard repairedRecord.sourcePath == pendingRepair.sourcePath,
-              repairedRecord.backupPath == pendingRepair.backupPath else {
-            throw IntegrityAuditError.unsafeCursor(pendingRepair.sourcePath)
+        try commitRepairMetadata(
+            sessionID: pendingRepair.sessionID,
+            sourcePath: pendingRepair.sourcePath,
+            backupPath: pendingRepair.backupPath,
+            byteCount: pendingRepair.byteCount,
+            contentHash: pendingRepair.contentHash,
+            repairedAt: pendingRepair.repairedAt,
+            repairedCount: pendingRepair.repairedCount,
+            manifest: &manifest,
+            manifestStore: manifestStore,
+            state: &state
+        )
+    }
+
+    private func commitRepairMetadata(
+        sessionID: String,
+        sourcePath: String,
+        backupPath: String,
+        byteCount: Int64,
+        contentHash: String,
+        repairedAt: Date,
+        repairedCount: Int,
+        manifest: inout BackupManifest,
+        manifestStore: BackupManifestStore,
+        state: inout IntegrityAuditState
+    ) throws {
+        var repairedRecord = try requiredRecord(sessionID, in: manifest)
+        guard repairedRecord.sourcePath == sourcePath,
+              repairedRecord.backupPath == backupPath else {
+            throw IntegrityAuditError.unsafeCursor(sourcePath)
         }
-        let recordWasNotAdvanced = repairedRecord.bytesBackedUp == pendingRepair.byteCount
-            && repairedRecord.lastBackedUpAt.map { $0 <= pendingRepair.repairedAt } != false
+        let recordWasNotAdvanced = repairedRecord.bytesBackedUp == byteCount
+            && repairedRecord.lastBackedUpAt.map { $0 <= repairedAt } != false
         if recordWasNotAdvanced {
-            repairedRecord.contentHash = pendingRepair.contentHash
-            repairedRecord.lastBackedUpAt = pendingRepair.repairedAt
+            repairedRecord.contentHash = contentHash
+            repairedRecord.lastBackedUpAt = repairedAt
         }
-        manifest.sessions[pendingRepair.sessionID] = repairedRecord
-        manifest.updatedAt = max(manifest.updatedAt, pendingRepair.repairedAt)
+        manifest.sessions[sessionID] = repairedRecord
+        manifest.updatedAt = max(manifest.updatedAt, repairedAt)
         try manifestStore.save(manifest)
         try instrumentation.checkpoint(.afterManifestCommit)
 
         let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
         try cursorStore.open()
-        guard var repairedCursor = try cursorStore.cursor(sourcePath: pendingRepair.sourcePath),
-              repairedCursor.sessionId == pendingRepair.sessionID,
-              repairedCursor.backupPath == pendingRepair.backupPath else {
-            throw IntegrityAuditError.unsafeCursor(pendingRepair.sourcePath)
+        guard var repairedCursor = try cursorStore.cursor(sourcePath: sourcePath),
+              repairedCursor.sessionId == sessionID,
+              repairedCursor.backupPath == backupPath else {
+            throw IntegrityAuditError.unsafeCursor(sourcePath)
         }
-        if repairedCursor.lastByteOffset == pendingRepair.byteCount,
-           repairedCursor.updatedAt <= pendingRepair.repairedAt.timeIntervalSince1970 {
-            repairedCursor.updatedAt = pendingRepair.repairedAt.timeIntervalSince1970
+        if repairedCursor.lastByteOffset == byteCount,
+           repairedCursor.updatedAt <= repairedAt.timeIntervalSince1970 {
+            repairedCursor.updatedAt = repairedAt.timeIntervalSince1970
             repairedCursor.lastError = nil
         }
         try cursorStore.upsert(repairedCursor)
         try instrumentation.checkpoint(.afterCursorCommit)
 
-        state.repairedCount = max(state.repairedCount, pendingRepair.repairedCount)
+        state.repairedCount = max(state.repairedCount, repairedCount)
         state.lastResult = "repaired"
         try saveAuditState(state)
         try instrumentation.checkpoint(.afterAuditStateCommit)
         try updatePersistedStatus(
             lastAuditAt: nil,
             lastAuditResult: nil,
-            lastRepairAt: pendingRepair.repairedAt,
+            lastRepairAt: repairedAt,
             repairCount: state.repairedCount
         )
         try instrumentation.checkpoint(.afterRuntimeStatusCommit)
@@ -1087,6 +1261,7 @@ private struct ValidatedAuditFile {
     let cursor: BackupCursor
     let source: URL
     let target: URL
+    let targetExists: Bool
     let targetByteCount: Int64
 }
 

@@ -533,6 +533,8 @@ func movingSessionToArchivedDirectoryDoesNotDuplicateExistingBackup() throws {
     )
     let agent = fixture.makeAgent()
     try agent.performOneShotScan()
+    let initialRecord = try #require(try fixture.loadManifest().sessions[sessionID])
+    let initialBackupURL = fixture.paths.backupRoot.appendingPathComponent(initialRecord.backupPath)
 
     let archivedDirectory = fixture.paths.codexRoot
         .appendingPathComponent("archived_sessions", isDirectory: true)
@@ -540,8 +542,10 @@ func movingSessionToArchivedDirectoryDoesNotDuplicateExistingBackup() throws {
     try FileManager.default.createDirectory(at: archivedDirectory, withIntermediateDirectories: true)
     let archivedSourceURL = archivedDirectory.appendingPathComponent("\(sessionID).jsonl")
     try FileManager.default.moveItem(at: activeSourceURL, to: archivedSourceURL)
+    fixture.resetSpies()
 
     try agent.performOneShotScan()
+    #expect(fixture.cursorWriteBatchCount == 1)
 
     let manifest = try fixture.loadManifest()
     let record = try #require(manifest.sessions[sessionID])
@@ -549,8 +553,18 @@ func movingSessionToArchivedDirectoryDoesNotDuplicateExistingBackup() throws {
     let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
     try cursorStore.open()
     let currentCursor = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+    let cursorsAfterMove = try cursorStore.loadAll()
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: fixture.now.addingTimeInterval(-86_401),
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+    let auditOutcome = try agent.performIntegrityAuditIfDue(deviceID: deviceID)
 
     #expect(record.sourcePath.hasSuffix("/.codex/archived_sessions/2026/07/\(sessionID).jsonl"))
+    #expect(record.backupPath == initialRecord.backupPath)
+    #expect(backupURL == initialBackupURL)
     #expect(try String(contentsOf: backupURL, encoding: .utf8) == """
     {"role":"user","content":"Moved once"}
 
@@ -563,6 +577,9 @@ func movingSessionToArchivedDirectoryDoesNotDuplicateExistingBackup() throws {
     #expect(currentCursor.lastByteOffset == Int64(fixture.lineBytes([
         #"{"role":"user","content":"Moved once"}"#
     ])))
+    #expect(cursorsAfterMove.count == 1)
+    #expect(cursorsAfterMove[activeSourceURL.path] == nil)
+    #expect(auditOutcome == .completed(checked: 1, repaired: 0))
 }
 
 @Test
@@ -939,7 +956,45 @@ func stoppedAgentCannotEraseAuditInterruptionWhenAuditStartsLater() throws {
 }
 
 @Test
-func triggerAfterAuditSchedulingInterruptsThatAuditGeneration() throws {
+func periodicScanWhileAuditTimerWaitsDoesNotStarveScheduledAudit() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    var initialStatus = try fixture.loadStatus()
+    initialStatus.lastAuditAt = previousAudit
+    initialStatus.lastAuditResult = "previous"
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000009a"))
+    let timers = ControlledAuditTimerScheduler()
+    let outcomes = LockedAuditOutcomeRecorder()
+    let scansFinished = DispatchSemaphore(value: 0)
+    let agent = fixture.makeAgent(
+        deviceID: deviceID,
+        initialStatus: initialStatus,
+        auditDelayProvider: { _, _, _ in 0 },
+        auditTimerScheduler: { delay, action in timers.schedule(delay: delay, action: action) },
+        auditDidFinish: { outcomes.append($0) },
+        statusHandler: { _ in scansFinished.signal() }
+    )
+    defer { agent.stop() }
+
+    agent.requestImmediateScan(.startup)
+    #expect(scansFinished.wait(timeout: .now() + 5) == .success)
+    #expect(timers.waitForScheduledCount(1))
+    agent.requestImmediateScan(.timer)
+    #expect(scansFinished.wait(timeout: .now() + 5) == .success)
+    timers.fire(at: 0)
+
+    #expect(outcomes.waitForCount(1))
+    #expect(outcomes.values.first == .completed(checked: 1, repaired: 0))
+}
+
+@Test
+func scanAfterScheduledAuditCallbackBeginsInterruptsAudit() throws {
     let fixture = try BackupAgentFixture.seededSession()
     defer { fixture.cleanup() }
     let previousAudit = fixture.now.addingTimeInterval(-86_401)

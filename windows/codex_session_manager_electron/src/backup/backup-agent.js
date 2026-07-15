@@ -326,6 +326,7 @@ class BackupAgent {
       });
       const processedSessionIds = new Set();
       const updatedCursors = [];
+      const staleCursorSourcePaths = [];
       const scanErrors = [];
       let completedFiles = 0;
       let interrupted = false;
@@ -356,6 +357,10 @@ class BackupAgent {
           updatedCursors.push(result.cursor);
           cursorMap.set(sourcePath, result.cursor);
         }
+        if (result.staleCursorSourcePath) {
+          staleCursorSourcePaths.push(result.staleCursorSourcePath);
+          cursorMap.delete(result.staleCursorSourcePath);
+        }
         if (result.lastError) {
           scanErrors.push(result.lastError);
         }
@@ -377,7 +382,9 @@ class BackupAgent {
         manifest.updatedAt = scanDate.toISOString();
         await saveManifest(this.paths, manifest);
       }
-      await cursorStore.upsertMany(updatedCursors);
+      await cursorStore.upsertMany(updatedCursors, {
+        deletingSourcePaths: staleCursorSourcePaths,
+      });
 
       if (interrupted) {
         const pending = await this.pendingRecordsForSources(remainingSources);
@@ -453,9 +460,14 @@ class BackupAgent {
   async processSessionFile({ sourcePath, sessionId, scanDate, manifest, currentCursor, cursorMap }) {
     const sourceStats = await trustedSourceMetadata(sourcePath);
     const existingRecord = manifest.sessions[sessionId] || null;
-    const baselineCursor = currentCursor || this.migratedCursor(existingRecord, sourcePath, cursorMap);
+    const migratedCursor = this.migratedCursor(existingRecord, sourcePath, cursorMap);
+    const baselineCursor = currentCursor || migratedCursor;
     const backupPath = this.backupFilePathFor(sourcePath, existingRecord, baselineCursor);
     const relativeBackupPath = this.validatedRelativeBackupPath(backupPath);
+    const staleCursorSourcePath = !currentCursor
+      && migratedCursor?.backupPath === relativeBackupPath
+      ? migratedCursor.sourcePath
+      : null;
     if (scanIsStrictlyUnchanged({
       sourcePath,
       relativeBackupPath,
@@ -466,6 +478,7 @@ class BackupAgent {
       return {
         manifestChanged: false,
         cursor: null,
+        staleCursorSourcePath: null,
         lastError: currentCursor?.lastError || null,
       };
     }
@@ -610,6 +623,7 @@ class BackupAgent {
       cursor: sameCursor(currentCursor, updatedCursor)
         ? null
         : updatedCursor,
+      staleCursorSourcePath,
       lastError: streamed.blockedError || null,
     };
   }
@@ -618,7 +632,13 @@ class BackupAgent {
     if (!existingRecord?.sourcePath || existingRecord.sourcePath === sourcePath) {
       return null;
     }
-    return cursorMap.get(existingRecord.sourcePath) || null;
+    const cursor = cursorMap.get(existingRecord.sourcePath) || null;
+    if (!cursor
+      || cursor.sessionId !== existingRecord.sessionId
+      || cursor.backupPath !== existingRecord.backupPath) {
+      return null;
+    }
+    return cursor;
   }
 
   backupFilePathFor(sourcePath, existingRecord, baselineCursor) {
