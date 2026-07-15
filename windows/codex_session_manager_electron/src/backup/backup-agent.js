@@ -68,6 +68,7 @@ class BackupAgent {
     this.scanQueued = false;
     this.auditPromise = null;
     this.auditScanDeferred = null;
+    this.timerPreflightPromise = null;
     this.auditInterruptionEpoch = 0;
     this.auditTimer = null;
     this.auditTimerGeneration = 0;
@@ -110,7 +111,7 @@ class BackupAgent {
 
   async stopAndAwaitQuiescence(timeoutMs = 100) {
     this.stop();
-    const active = [this.scanPromise, this.auditPromise].filter(Boolean);
+    const active = [this.scanPromise, this.auditPromise, this.timerPreflightPromise].filter(Boolean);
     if (active.length === 0) return true;
     let timeout;
     try {
@@ -129,12 +130,64 @@ class BackupAgent {
   requestImmediateScan(trigger) {
     if (this.stopped) return Promise.resolve(null);
     this.instrumentation.scanRequested?.(trigger);
-    const scan = this.performOneShotScan();
+    const scan = trigger === 'timer' && this.auditPromise
+      ? this.requestTimerScanDuringAudit()
+      : this.performOneShotScan();
     return scan.finally(() => {
       if (this.stopped) return;
       if (trigger === 'wake') this.scheduleAudit(true);
       else this.ensureAuditScheduled();
     });
+  }
+
+  requestTimerScanDuringAudit() {
+    if (this.timerPreflightPromise) return this.timerPreflightPromise;
+    const preflight = (async () => {
+      let hasPendingWork;
+      try {
+        hasPendingWork = await this.timerPreflightHasPendingWork();
+      } catch {
+        hasPendingWork = true;
+      }
+      if (!hasPendingWork || this.stopped) return null;
+      if (this.auditScanDeferred) return this.auditScanDeferred.promise;
+      return this.performOneShotScan();
+    })();
+    this.timerPreflightPromise = preflight;
+    preflight.then(
+      () => {
+        if (this.timerPreflightPromise === preflight) this.timerPreflightPromise = null;
+      },
+      () => {
+        if (this.timerPreflightPromise === preflight) this.timerPreflightPromise = null;
+      },
+    );
+    return preflight;
+  }
+
+  async timerPreflightHasPendingWork() {
+    const store = new CursorStore({ paths: this.paths });
+    await store.open();
+    try {
+      const cursors = store.all();
+      const processedSessionIds = new Set();
+      for (const sourcePath of await this.discoverSessionFiles()) {
+        const sessionId = sessionIdFromPath(sourcePath);
+        if (!sessionId || processedSessionIds.has(sessionId)) continue;
+        processedSessionIds.add(sessionId);
+        const sourceStats = await trustedSourceMetadata(sourcePath);
+        if (!timerPreflightIsUnchanged({
+          sourcePath,
+          sourceStats,
+          cursor: cursors.get(sourcePath) || null,
+        })) {
+          return true;
+        }
+      }
+      return false;
+    } finally {
+      await store.close();
+    }
   }
 
   async performOneShotScan() {
@@ -903,6 +956,22 @@ function scanIsStrictlyUnchanged({
     return false;
   }
 
+  const hasUncommittedBytes = sourceStats.size > cursor.lastByteOffset;
+  if (hasUncommittedBytes) {
+    return Boolean(cursor.pendingPartialLine) || cursor.lastError != null;
+  }
+  return !cursor.pendingPartialLine && cursor.lastError == null;
+}
+
+function timerPreflightIsUnchanged({ sourcePath, sourceStats, cursor }) {
+  if (!cursor
+    || cursor.sourcePath !== sourcePath
+    || cursor.lastByteOffset < 0
+    || cursor.lastByteOffset > sourceStats.size
+    || cursor.lastSourceSize !== sourceStats.size
+    || cursor.lastSourceModifiedAt !== sourceStats.modifiedAt) {
+    return false;
+  }
   const hasUncommittedBytes = sourceStats.size > cursor.lastByteOffset;
   if (hasUncommittedBytes) {
     return Boolean(cursor.pendingPartialLine) || cursor.lastError != null;

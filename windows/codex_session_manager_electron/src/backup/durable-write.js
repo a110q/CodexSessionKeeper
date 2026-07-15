@@ -51,7 +51,6 @@ async function durableReplaceWithWriter(destination, writer, options = {}) {
 
 async function publishSyncedTemporaryFileIfAbsent(temporaryPath, destination, options = {}) {
   const link = options.link || fsp.link;
-  const rename = options.rename || fsp.rename;
 
   try {
     await link(temporaryPath, destination);
@@ -60,17 +59,13 @@ async function publishSyncedTemporaryFileIfAbsent(temporaryPath, destination, op
   } catch (error) {
     const unsupported = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EINVAL']);
     if (!unsupported.has(error.code)) throw error;
+    const publicationError = new Error(
+      `Atomic no-replace publication is unsupported for: ${destination}`,
+      { cause: error },
+    );
+    publicationError.code = 'ATOMIC_NO_REPLACE_UNSUPPORTED';
+    throw publicationError;
   }
-
-  try {
-    await fsp.lstat(destination);
-    const existsError = new Error(`Destination already exists: ${destination}`);
-    existsError.code = 'EEXIST';
-    throw existsError;
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-  await rename(temporaryPath, destination);
 }
 
 async function replaceFileDurably(destination, data, options = {}) {

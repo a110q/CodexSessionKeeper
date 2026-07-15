@@ -433,6 +433,11 @@ public final class BackupAgent: @unchecked Sendable {
     }
 
     public func requestImmediateScan(_ trigger: BackupScanTrigger) {
+        if trigger == .timer, auditIsRunning() {
+            let hasPendingWork = (try? timerPreflightHasPendingWork()) ?? true
+            guard hasPendingWork else { return }
+        }
+
         stateLock.lock()
         guard !stopped else {
             stateLock.unlock()
@@ -449,6 +454,59 @@ public final class BackupAgent: @unchecked Sendable {
         if trigger == .wake {
             scheduleAudit(replacingExisting: true)
         }
+    }
+
+    private func auditIsRunning() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return !stopped && isAuditing
+    }
+
+    private func timerPreflightHasPendingWork() throws -> Bool {
+        let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
+        let cursorMap = try cursorStore.loadAllReadOnly()
+        var processedSessionIDs = Set<String>()
+        for source in try discoverSessionFiles() {
+            guard let sessionID = SessionIdentity.sessionID(from: source),
+                  processedSessionIDs.insert(sessionID).inserted else {
+                continue
+            }
+            let sourcePath = canonicalSourcePath(source)
+            let cursor = cursorMap[sourcePath] ?? cursorMap[source.path]
+            let metadata = try metadata(for: source)
+            let sourceMetadata = BackupSourceMetadata(
+                byteCount: metadata.size,
+                modifiedAt: metadata.modifiedAt
+            )
+            guard timerPreflightIsUnchanged(
+                sourcePath: sourcePath,
+                sourceMetadata: sourceMetadata,
+                cursor: cursor
+            ) else {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func timerPreflightIsUnchanged(
+        sourcePath: String,
+        sourceMetadata: BackupSourceMetadata,
+        cursor: BackupCursor?
+    ) -> Bool {
+        guard let cursor,
+              cursor.sourcePath == sourcePath,
+              cursor.lastByteOffset >= 0,
+              cursor.lastByteOffset <= sourceMetadata.byteCount,
+              cursor.lastSourceSize == sourceMetadata.byteCount,
+              cursor.lastSourceModifiedAt == sourceMetadata.modifiedAt else {
+            return false
+        }
+        let hasUncommittedBytes = sourceMetadata.byteCount > cursor.lastByteOffset
+        if hasUncommittedBytes {
+            return !cursor.pendingPartialLine.isEmpty || cursor.lastError != nil
+        }
+        return cursor.pendingPartialLine.isEmpty && cursor.lastError == nil
     }
 
     public func stop() {

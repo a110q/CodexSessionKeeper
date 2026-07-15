@@ -195,6 +195,26 @@ function spyOnAllCursorStoreExports() {
   };
 }
 
+function spyOnAllCursorStoreReads() {
+  const originalAll = CursorStore.prototype.all;
+  let calls = 0;
+  CursorStore.prototype.all = function (...args) {
+    calls += 1;
+    return originalAll.apply(this, args);
+  };
+  return {
+    get calls() {
+      return calls;
+    },
+    reset() {
+      calls = 0;
+    },
+    restore() {
+      CursorStore.prototype.all = originalAll;
+    },
+  };
+}
+
 test('initial scan backs up existing jsonl and records manifest title and line count', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'alpha.jsonl');
@@ -1772,7 +1792,7 @@ test('wake replaces an audit timer and a stale callback cannot clear or run the 
   assert.equal(timers.length, 3);
 });
 
-test('scan interruption of a scheduled audit is followed by a replacement schedule', async (t) => {
+test('explicit activation interruption of a scheduled audit is followed by a replacement schedule', async (t) => {
   const { paths } = await makeTestPaths(t);
   const timers = [];
   const auditEntered = controlledPromise();
@@ -1808,7 +1828,7 @@ test('scan interruption of a scheduled audit is followed by a replacement schedu
   await agent.requestImmediateScan('startup');
   const scheduledAudit = timers[0].action();
   await auditEntered.promise;
-  const queuedScan = agent.requestImmediateScan('timer');
+  const queuedScan = agent.requestImmediateScan('activation');
   releaseAudit.resolve();
 
   assert.deepEqual(
@@ -2054,6 +2074,150 @@ test('queued incremental scan interrupts audit at a chunk boundary and catches u
   assert.deepEqual(await auditPromise, { outcome: 'interrupted', checked: 0, repaired: 0 });
   await scanPromise;
   assert.equal(interruptionSignals, interruptionSignalsBeforeQueuedScan + 1);
+  assert.ok((await fs.readFile(paths.backupFilePath(sourcePath), 'utf8')).endsWith(appended));
+});
+
+test('two no-change timer ticks do not interrupt a running audit or queue backup work', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-14T04:05:06.000Z');
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'timer-audit.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'steady' }).repeat(50000)]);
+  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
+  await fs.writeFile(paths.auditStatePath, JSON.stringify({
+    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  }));
+  const readStarted = controlledPromise();
+  const releaseRead = controlledPromise();
+  let paused = false;
+  const auditor = new BackupIntegrityAuditor({
+    paths,
+    instrumentation: {
+      didReadChunk: async () => {
+        if (paused) return;
+        paused = true;
+        readStarted.resolve();
+        await releaseRead.promise;
+      },
+    },
+  });
+  let bodyReads = 0;
+  let targetStats = 0;
+  const readSpy = spyOnAllCursorStoreReads();
+  const exportSpy = spyOnAllCursorStoreExports();
+  t.after(() => {
+    readSpy.restore();
+    exportSpy.restore();
+  });
+  const agent = new BackupAgent({
+    paths,
+    now: () => now,
+    instrumentation: {
+      sourceBodyRead: () => { bodyReads += 1; },
+      targetStat: () => { targetStats += 1; },
+    },
+    integrityAuditorFactory: () => auditor,
+  });
+  t.after(() => agent.stop());
+
+  const audit = agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001');
+  await readStarted.promise;
+  readSpy.reset();
+  const firstTick = agent.requestImmediateScan('timer');
+  const firstCompleted = await Promise.race([
+    firstTick.then(() => true, () => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 500)),
+  ]);
+  const secondTick = agent.requestImmediateScan('timer');
+  const secondCompleted = firstCompleted
+    ? await Promise.race([
+      secondTick.then(() => true, () => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 500)),
+    ])
+    : false;
+  const preflightReads = readSpy.calls;
+  const preflightExports = exportSpy.calls;
+  const preflightBodyReads = bodyReads;
+  const preflightTargetStats = targetStats;
+  releaseRead.resolve();
+  const outcome = await audit;
+  await Promise.allSettled([firstTick, secondTick]);
+
+  assert.equal(firstCompleted, true);
+  assert.equal(secondCompleted, true);
+  assert.equal(preflightReads, 2);
+  assert.equal(preflightExports, 0);
+  assert.equal(preflightBodyReads, 0);
+  assert.equal(preflightTargetStats, 0);
+  assert.deepEqual(outcome, { outcome: 'completed', checked: 1, repaired: 0 });
+});
+
+test('timer tick with a complete append interrupts audit and backs up the append', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-14T04:05:06.000Z');
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'timer-append.jsonl');
+  const initial = jsonLine({ role: 'user', content: 'steady' }).repeat(50000);
+  const appended = jsonLine({ role: 'assistant', content: 'new during audit' });
+  await writeSessionFile(sourcePath, [initial]);
+  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
+  await fs.writeFile(paths.auditStatePath, JSON.stringify({
+    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  }));
+  const readStarted = controlledPromise();
+  const releaseRead = controlledPromise();
+  let paused = false;
+  const auditor = new BackupIntegrityAuditor({
+    paths,
+    instrumentation: {
+      didReadChunk: async () => {
+        if (paused) return;
+        paused = true;
+        readStarted.resolve();
+        await releaseRead.promise;
+      },
+    },
+  });
+  let bodyReads = 0;
+  let targetStats = 0;
+  let interruptionSignals = 0;
+  const readSpy = spyOnAllCursorStoreReads();
+  const exportSpy = spyOnAllCursorStoreExports();
+  t.after(() => {
+    readSpy.restore();
+    exportSpy.restore();
+  });
+  const agent = new BackupAgent({
+    paths,
+    now: () => now,
+    instrumentation: {
+      auditInterruptionSet: () => { interruptionSignals += 1; },
+      sourceBodyRead: () => { bodyReads += 1; },
+      targetStat: () => { targetStats += 1; },
+    },
+    integrityAuditorFactory: () => auditor,
+  });
+  t.after(() => agent.stop());
+
+  const audit = agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001');
+  await readStarted.promise;
+  readSpy.reset();
+  const baselineSignals = interruptionSignals;
+  await fs.appendFile(sourcePath, appended);
+  const tick = agent.requestImmediateScan('timer');
+  await waitForCondition(() => interruptionSignals === baselineSignals + 1);
+
+  assert.equal(readSpy.calls, 1);
+  assert.equal(exportSpy.calls, 0);
+  assert.equal(bodyReads, 0);
+  assert.equal(targetStats, 0);
+  releaseRead.resolve();
+
+  assert.deepEqual(await audit, { outcome: 'interrupted', checked: 0, repaired: 0 });
+  await tick;
+  assert.equal(exportSpy.calls, 1);
   assert.ok((await fs.readFile(paths.backupFilePath(sourcePath), 'utf8')).endsWith(appended));
 });
 

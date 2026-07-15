@@ -994,7 +994,7 @@ func periodicScanWhileAuditTimerWaitsDoesNotStarveScheduledAudit() throws {
 }
 
 @Test
-func scanAfterScheduledAuditCallbackBeginsInterruptsAudit() throws {
+func explicitActivationAfterScheduledAuditCallbackBeginsInterruptsAudit() throws {
     let fixture = try BackupAgentFixture.seededSession()
     defer { fixture.cleanup() }
     let previousAudit = fixture.now.addingTimeInterval(-86_401)
@@ -1027,11 +1027,143 @@ func scanAfterScheduledAuditCallbackBeginsInterruptsAudit() throws {
     #expect(timers.waitForScheduledCount(1))
     timers.fire(at: 0)
     #expect(auditGate.waitForEntry() == .success)
-    agent.requestImmediateScan(.timer)
+    agent.requestImmediateScan(.activation)
     auditGate.release()
 
     #expect(outcomes.waitForCount(1))
     #expect(outcomes.values.first == .interrupted)
+}
+
+@Test
+func twoNoChangeTimerTicksDoNotInterruptRunningAuditOrQueueBackupWork() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    var initialStatus = try fixture.loadStatus()
+    initialStatus.lastAuditAt = previousAudit
+    initialStatus.lastAuditResult = "previous"
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000009a"))
+    let timers = ControlledAuditTimerScheduler()
+    let auditChunk = ControlledAuditStartBarrier()
+    let outcomes = LockedAuditOutcomeRecorder()
+    let agent = fixture.makeAgent(
+        deviceID: deviceID,
+        initialStatus: initialStatus,
+        auditDelayProvider: { _, _, _ in 0 },
+        auditTimerScheduler: { delay, action in timers.schedule(delay: delay, action: action) },
+        auditDidFinish: { outcomes.append($0) },
+        integrityAuditorFactory: { paths in
+            BackupIntegrityAuditor(
+                paths: paths,
+                chunkSize: 8,
+                instrumentation: IntegrityAuditInstrumentation(didReadChunk: { _, _, _ in
+                    auditChunk.enterAndWaitOnce()
+                })
+            )
+        }
+    )
+    defer {
+        auditChunk.release()
+        agent.stop()
+    }
+
+    agent.requestImmediateScan(.startup)
+    #expect(timers.waitForScheduledCount(1))
+    timers.fire(at: 0)
+    #expect(auditChunk.waitForEntry() == .success)
+    fixture.resetSpies()
+
+    agent.requestImmediateScan(.timer)
+    agent.requestImmediateScan(.timer)
+
+    #expect(fixture.cursorReadBatchCount == 2)
+    #expect(fixture.sqliteRunnerInvocationCount == 2)
+    #expect(fixture.sourceBodyReadCount == 0)
+    #expect(fixture.targetStatCount == 0)
+    #expect(fixture.cursorWriteBatchCount == 0)
+    auditChunk.release()
+    #expect(outcomes.waitForCount(1))
+    #expect(outcomes.values.first == .completed(checked: 1, repaired: 0))
+}
+
+@Test
+func timerTickWithCompleteAppendInterruptsAuditAndBacksUpAppend() throws {
+    let fixture = try BackupAgentFixture.seededSession()
+    defer { fixture.cleanup() }
+    let record = try #require(fixture.loadManifest().sessions.values.first)
+    let sourceURL = URL(fileURLWithPath: record.sourcePath)
+    let backupURL = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    let appended = #"{"role":"assistant","content":"new during audit"}"# + "\n"
+    let previousAudit = fixture.now.addingTimeInterval(-86_401)
+    try fixture.writeAuditState(IntegrityAuditState(
+        lastCompletedAt: previousAudit,
+        lastResult: "previous",
+        repairedCount: 0
+    ))
+    var initialStatus = try fixture.loadStatus()
+    initialStatus.lastAuditAt = previousAudit
+    initialStatus.lastAuditResult = "previous"
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000009a"))
+    let timers = ControlledAuditTimerScheduler()
+    let auditChunk = ControlledAuditStartBarrier()
+    let sessionStep = ControlledSessionStepBarrier()
+    let outcomes = LockedAuditOutcomeRecorder()
+    let scansFinished = DispatchSemaphore(value: 0)
+    let agent = fixture.makeAgent(
+        deviceID: deviceID,
+        initialStatus: initialStatus,
+        sessionStepBarrier: sessionStep,
+        auditDelayProvider: { _, _, _ in 0 },
+        auditTimerScheduler: { delay, action in timers.schedule(delay: delay, action: action) },
+        auditDidFinish: { outcomes.append($0) },
+        statusHandler: { _ in scansFinished.signal() },
+        integrityAuditorFactory: { paths in
+            BackupIntegrityAuditor(
+                paths: paths,
+                chunkSize: 8,
+                instrumentation: IntegrityAuditInstrumentation(didReadChunk: { _, _, _ in
+                    auditChunk.enterAndWaitOnce()
+                })
+            )
+        }
+    )
+    defer {
+        auditChunk.release()
+        sessionStep.release()
+        agent.stop()
+    }
+
+    agent.requestImmediateScan(.startup)
+    #expect(scansFinished.wait(timeout: .now() + 5) == .success)
+    #expect(timers.waitForScheduledCount(1))
+    timers.fire(at: 0)
+    #expect(auditChunk.waitForEntry() == .success)
+    fixture.resetSpies()
+    try fixture.append(appended, to: sourceURL)
+
+    agent.requestImmediateScan(.timer)
+
+    #expect(fixture.cursorReadBatchCount == 1)
+    #expect(fixture.sqliteRunnerInvocationCount == 1)
+    #expect(fixture.sourceBodyReadCount == 0)
+    #expect(fixture.targetStatCount == 0)
+    #expect(fixture.cursorWriteBatchCount == 0)
+    auditChunk.release()
+    #expect(outcomes.waitForCount(1))
+    #expect(outcomes.values.first == .interrupted)
+    #expect(sessionStep.waitForFirstSession() == .success)
+    while scansFinished.wait(timeout: .now()) == .success {}
+    sessionStep.release()
+    #expect(scansFinished.wait(timeout: .now() + 5) == .success)
+    #expect(try String(contentsOf: backupURL, encoding: .utf8).hasSuffix(appended))
+    #expect(fixture.sourceBodyReadCount > 0)
+    #expect(fixture.targetStatCount == 1)
+    #expect(fixture.cursorWriteBatchCount == 1)
 }
 
 @Test
@@ -1278,7 +1410,8 @@ private final class BackupAgentFixture {
         ) -> Task<Void, Never>)? = nil,
         auditWillStart: @escaping @Sendable () -> Void = {},
         auditDidFinish: @escaping @Sendable (IntegrityAuditOutcome) -> Void = { _ in },
-        statusHandler: (@Sendable (BackupStatus) -> Void)? = nil
+        statusHandler: (@Sendable (BackupStatus) -> Void)? = nil,
+        integrityAuditorFactory: ((BackupPaths) -> BackupIntegrityAuditor)? = nil
     ) -> BackupAgent {
         BackupAgent(
             paths: paths,
@@ -1331,7 +1464,8 @@ private final class BackupAgentFixture {
                 },
                 auditWillStart: auditWillStart,
                 auditDidFinish: auditDidFinish
-            )
+            ),
+            integrityAuditorFactory: integrityAuditorFactory ?? { BackupIntegrityAuditor(paths: $0) }
         )
     }
 

@@ -7,7 +7,11 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { replaceFileDurably, writeFileDurably } = require('../../src/backup/durable-write');
+const {
+  publishSyncedTemporaryFileIfAbsent,
+  replaceFileDurably,
+  writeFileDurably,
+} = require('../../src/backup/durable-write');
 
 test('durable replace syncs before rename and removes only its temporary file', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
@@ -50,27 +54,93 @@ test('writeFileDurably never overwrites an existing destination', async (t) => {
   assert.equal(await fsp.readFile(destination, 'utf8'), 'live');
 });
 
-test('writeFileDurably falls back to atomic rename when SMB rejects hard links', async (t) => {
+test('writeFileDurably fails closed and cleans its temp when SMB rejects hard links', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const destination = path.join(root, 'session.jsonl');
   let linkAttempts = 0;
 
-  await writeFileDurably(destination, 'backup', {
-    link: async () => {
-      linkAttempts += 1;
-      const error = new Error('SMB hard links are unsupported');
-      error.code = 'ENOTSUP';
-      throw error;
+  await assert.rejects(
+    writeFileDurably(destination, 'backup', {
+      link: async () => {
+        linkAttempts += 1;
+        const error = new Error('SMB hard links are unsupported');
+        error.code = 'ENOTSUP';
+        throw error;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, 'ATOMIC_NO_REPLACE_UNSUPPORTED');
+      assert.match(error.message, /atomic no-replace|unsupported/i);
+      return true;
     },
-  });
+  );
 
   assert.equal(linkAttempts, 1);
-  assert.equal(await fsp.readFile(destination, 'utf8'), 'backup');
-  assert.deepEqual(await fsp.readdir(root), ['session.jsonl']);
+  await assert.rejects(fsp.readFile(destination), { code: 'ENOENT' });
+  assert.deepEqual(await fsp.readdir(root), []);
 });
 
-test('SMB fallback still refuses an existing destination', async (t) => {
+test('unsupported hard-link publication never invokes the racy rename fallback', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const destination = path.join(root, 'session.jsonl');
+  const temporary = path.join(root, '.session.jsonl.synced-temp');
+  await fsp.writeFile(temporary, 'backup');
+  let renameCalled = false;
+
+  await assert.rejects(
+    publishSyncedTemporaryFileIfAbsent(temporary, destination, {
+      link: async () => {
+        const error = new Error('SMB hard links are unsupported');
+        error.code = 'ENOTSUP';
+        throw error;
+      },
+      rename: async (source, target) => {
+        renameCalled = true;
+        await fsp.writeFile(target, 'racer');
+        return fsp.rename(source, target);
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, 'ATOMIC_NO_REPLACE_UNSUPPORTED');
+      assert.match(error.message, /atomic no-replace|unsupported/i);
+      return true;
+    },
+  );
+
+  assert.equal(renameCalled, false);
+  assert.equal(await fsp.readFile(temporary, 'utf8'), 'backup');
+  await assert.rejects(fsp.readFile(destination), { code: 'ENOENT' });
+});
+
+test('target appearing during an unsupported hard-link attempt is never overwritten', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const destination = path.join(root, 'session.jsonl');
+  const temporary = path.join(root, '.session.jsonl.synced-temp');
+  await fsp.writeFile(temporary, 'backup');
+
+  await assert.rejects(
+    publishSyncedTemporaryFileIfAbsent(temporary, destination, {
+      link: async () => {
+        await fsp.writeFile(destination, 'racer');
+        const error = new Error('SMB hard links are unsupported');
+        error.code = 'ENOTSUP';
+        throw error;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, 'ATOMIC_NO_REPLACE_UNSUPPORTED');
+      return true;
+    },
+  );
+
+  assert.equal(await fsp.readFile(destination, 'utf8'), 'racer');
+  assert.equal(await fsp.readFile(temporary, 'utf8'), 'backup');
+});
+
+test('unsupported SMB no-replace publication preserves an existing destination', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'durable-write-test-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const destination = path.join(root, 'session.jsonl');

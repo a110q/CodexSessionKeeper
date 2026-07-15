@@ -91,6 +91,14 @@ public final class BackupCursorStore {
     }
 
     public func loadAll() throws -> [String: BackupCursor] {
+        try loadAll(readOnly: false)
+    }
+
+    func loadAllReadOnly() throws -> [String: BackupCursor] {
+        try loadAll(readOnly: true)
+    }
+
+    private func loadAll(readOnly: Bool) throws -> [String: BackupCursor] {
         let output = try queryJSON("""
         SELECT
             session_id,
@@ -106,7 +114,7 @@ public final class BackupCursorStore {
             updated_at
         FROM backup_cursors
         ORDER BY source_path COLLATE BINARY ASC;
-        """)
+        """, readOnly: readOnly)
 
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return [:]
@@ -205,8 +213,12 @@ public final class BackupCursorStore {
         _ = try runSQLite(arguments: baseSQLiteArguments + [databaseURL.path], input: sql)
     }
 
-    private func queryJSON(_ sql: String) throws -> String {
-        try runSQLite(arguments: baseSQLiteArguments + ["-json", databaseURL.path], input: sql)
+    private func queryJSON(_ sql: String, readOnly: Bool = false) throws -> String {
+        let mode = readOnly ? ["-readonly"] : []
+        return try runSQLite(
+            arguments: baseSQLiteArguments + mode + ["-json", databaseURL.path],
+            input: sql
+        )
     }
 
     private var baseSQLiteArguments: [String] {
