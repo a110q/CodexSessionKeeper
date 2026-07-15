@@ -730,19 +730,19 @@ nasRuntime.requestImmediateScan(trigger)
 
 Renderer-facing status continues to use the existing response shape, now backed entirely by cached runtime state.
 
-- [ ] **Step 1: Add failing zero-I/O status tests**
+- [x] **Step 1: Add failing zero-I/O status tests**
 
 Call the main/runtime status getter 100 times and assert zero reads of `status.json`, zero cursor calls, zero session enumeration, and zero NAS operations. Seed the cache once during initialization and assert later agent status events update it.
 
-- [ ] **Step 2: Add failing lifecycle and coalescing tests**
+- [x] **Step 2: Add failing lifecycle and coalescing tests**
 
 Assert production polling interval is 30,000 ms; startup and first activation request immediate scans; Electron `powerMonitor` `resume` requests `wake`; validated reconnection requests `reconnect`; and concurrent timer/wake/reconnect triggers cause one active scan plus at most one queued scan.
 
-- [ ] **Step 3: Add failing shutdown tests**
+- [x] **Step 3: Add failing shutdown tests**
 
 Assert `before-quit` stops future polling and cancels audit at the next chunk boundary. The app may finish the current atomic file operation but cannot hang indefinitely waiting for a full scan/audit.
 
-- [ ] **Step 4: Run focused tests and confirm failure**
+- [x] **Step 4: Run focused tests and confirm failure**
 
 ```bash
 cd windows/codex_session_manager_electron
@@ -751,19 +751,19 @@ node --test test/backup/nas-runtime.test.js test/backup/agent.test.js test/secur
 
 Expected: FAIL because main still rereads status JSON, polling is 10 seconds, and resume wiring is absent.
 
-- [ ] **Step 5: Make status reads pure cache reads**
+- [x] **Step 5: Make status reads pure cache reads**
 
 Load persisted agent status once during NAS runtime initialization. Update the cache from background agent events. Remove per-renderer-poll `status.json` reads from `readBackupStatus()` and do not compute pending counts in the request path.
 
-- [ ] **Step 6: Expose immediate scan and use the existing coalescer**
+- [x] **Step 6: Expose immediate scan and use the existing coalescer**
 
 Keep the existing `scanPromise`/`scanQueued` single-writer mechanism. Add trigger metadata for logging and audit cancellation, set periodic interval to 30,000 ms, and ensure a no-work queued trigger collapses into one follow-up scan.
 
-- [ ] **Step 7: Wire Electron resume, reconnect, and shutdown**
+- [x] **Step 7: Wire Electron resume, reconnect, and shutdown**
 
 Import `powerMonitor` only after Electron readiness, register one `resume` listener, and remove it during teardown. Request reconnect scans only after the target guard changes from unavailable to valid. Stop polling/auditing during `before-quit` without weakening the existing exit guard.
 
-- [ ] **Step 8: Run focused and full Windows verification**
+- [x] **Step 8: Run focused and full Windows verification**
 
 ```bash
 node --test test/backup/nas-runtime.test.js test/backup/agent.test.js test/security/nas-ui-contract.test.js
@@ -775,7 +775,7 @@ node --check src/main.js
 
 Expected: PASS. Repeated renderer polling has no filesystem side effects and all triggers remain serialized.
 
-- [ ] **Step 9: Commit the Windows runtime change**
+- [x] **Step 9: Commit the Windows runtime change**
 
 ```bash
 git add windows/codex_session_manager_electron/src/backup/nas-runtime.js windows/codex_session_manager_electron/src/backup/backup-agent.js windows/codex_session_manager_electron/src/main.js windows/codex_session_manager_electron/test/backup/nas-runtime.test.js windows/codex_session_manager_electron/test/backup/agent.test.js windows/codex_session_manager_electron/test/security/nas-ui-contract.test.js
@@ -795,7 +795,7 @@ git commit -m "perf: make Windows backup runtime idle"
 **Interfaces:**
 - No new public API.
 
-- [ ] **Step 1: Update user-facing behavior**
+- [x] **Step 1: Update user-facing behavior**
 
 Document:
 
@@ -807,7 +807,7 @@ Document:
 - no credentials, snapshots, account state, or live Codex database are uploaded;
 - status can report auditing, repair, interruption, NAS unavailable, and last successful audit.
 
-- [ ] **Step 2: Run all automated verification from a clean process state**
+- [x] **Step 2: Run all automated verification from a clean process state**
 
 ```bash
 swift test
@@ -828,7 +828,7 @@ git diff --check
 
 Expected: every command succeeds. Do not report macOS completion while the compiler/SDK mismatch remains.
 
-- [ ] **Step 3: Perform static regression searches**
+- [x] **Step 3: Perform static regression searches**
 
 ```bash
 rg -n "startPolling\(|10000|10_000" Sources windows/codex_session_manager_electron/src
@@ -838,7 +838,7 @@ rg -n "readFile\(.*jsonl|Data\(contentsOf:.*jsonl|db\.export\(\)" Sources window
 
 Expected: no production 10-second NAS polling; no UI status path invokes pending/session/SQLite work; no whole-session read remains in scan/audit/repair; `db.export()` appears only in the Windows cursor store's single batch flush.
 
-- [ ] **Step 4: Package Windows and verify required modules**
+- [x] **Step 4: Package Windows and verify required modules**
 
 Run the repository's existing Windows packaging command:
 
@@ -849,7 +849,7 @@ npm run package:win
 
 Inspect the unpacked app/asar using the existing package verification method and confirm it contains `cursor-store.js`, `session-backup-streamer.js`, `integrity-auditor.js`, `nas-runtime.js`, and the packaged SQLite/read dependencies already required by the app.
 
-- [ ] **Step 5: Commit documentation and any packaging metadata**
+- [x] **Step 5: Commit documentation and any packaging metadata**
 
 ```bash
 git add README.md docs/操作手册.md windows/codex_session_manager_electron/README_WIN10_EXE.md windows/codex_session_manager_electron/package.json windows/codex_session_manager_electron/package-lock.json
@@ -906,11 +906,11 @@ Acceptance targets:
 
 Shared targets: idle average CPU below 2%; zero SQLite child processes from status refresh; no-change scan has zero JSONL body reads and zero cursor writes; Windows no-change scan has zero exports and any changed scan has at most one export.
 
-- [ ] **Step 5: Stop or roll back if acceptance fails**
+- [x] **Step 5: Stop or roll back if acceptance fails**
 
 Do not widen rollout if files are missed/duplicated, cursor durability ordering is violated, repair lacks a usable quarantine copy, memory grows monotonically, or the platform exceeds its accepted ceiling without an explained temporary operation. Capture the exact reproduction and return to the responsible task rather than tuning unrelated UI code.
 
-- [ ] **Step 6: Final branch verification**
+- [x] **Step 6: Final branch verification**
 
 ```bash
 git status --short --branch
