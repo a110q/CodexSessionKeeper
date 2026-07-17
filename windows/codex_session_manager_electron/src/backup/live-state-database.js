@@ -1,4 +1,5 @@
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -36,7 +37,11 @@ function sqliteError(stderr, sqlitePath) {
     error.code = 'SQLITE_BUSY';
     return error;
   }
-  return new Error(detail || `sqlite3 执行失败：${sqlitePath}`);
+  const error = new Error(detail || `sqlite3 执行失败：${sqlitePath}`);
+  if (/unique constraint failed|primary key|constraint failed/i.test(detail)) {
+    error.code = 'SQLITE_RESTORE_CONFLICT';
+  }
+  return error;
 }
 
 function runSQLite(databasePath, sql, options = {}) {
@@ -80,14 +85,21 @@ function sessionIdList(allowedSessionIds) {
   return [...allowedSessionIds].map(quoteLiteral).join(', ');
 }
 
+function selectedPredicate(table, ids, alias = null) {
+  const column = (name) => `${alias ? `${quoteIdent(alias)}.` : ''}${quoteIdent(name)}`;
+  if (table === 'threads') return `${column('id')} IN (${ids})`;
+  if (table === 'thread_spawn_edges') {
+    return `${column('parent_thread_id')} IN (${ids}) OR ${column('child_thread_id')} IN (${ids})`;
+  }
+  if (table === 'agent_job_items') return `${column('assigned_thread_id')} IN (${ids})`;
+  return `${column('thread_id')} IN (${ids})`;
+}
+
 function sourceWhereClause(table, allowedSessionIds) {
   if (!allowedSessionIds) return '';
   if (allowedSessionIds.size === 0) return ' WHERE 0';
   const ids = sessionIdList(allowedSessionIds);
-  if (table === 'threads') return ` WHERE id IN (${ids})`;
-  if (table === 'thread_spawn_edges') return ` WHERE parent_thread_id IN (${ids}) OR child_thread_id IN (${ids})`;
-  if (table === 'agent_job_items') return ` WHERE assigned_thread_id IN (${ids})`;
-  return ` WHERE thread_id IN (${ids})`;
+  return ` WHERE ${selectedPredicate(table, ids)}`;
 }
 
 async function mergePlan(sourceDbPath, destinationDbPath, allowedSessionIds, options) {
@@ -102,11 +114,179 @@ async function mergePlan(sourceDbPath, destinationDbPath, allowedSessionIds, opt
     const columns = commonColumns.map(quoteIdent).join(', ');
     plan.push({
       table,
-      insert: `INSERT OR REPLACE INTO ${quoteIdent(table)} (${columns}) `
+      columns: commonColumns,
+      deleteSelected: allowedSessionIds
+        ? `DELETE FROM ${quoteIdent(table)}${sourceWhereClause(table, allowedSessionIds)};`
+        : `DELETE FROM ${quoteIdent(table)};`,
+      insert: `INSERT INTO ${quoteIdent(table)} (${columns}) `
         + `SELECT ${columns} FROM snapshot.${quoteIdent(table)}${sourceWhereClause(table, allowedSessionIds)};`,
     });
   }
   return plan;
+}
+
+async function uniqueKeys(databasePath, table, options) {
+  const info = await tableInfo(databasePath, table, options);
+  const primaryKey = info
+    .filter((column) => Number(column.pk || 0) > 0)
+    .sort((left, right) => Number(left.pk) - Number(right.pk))
+    .map((column) => column.name);
+  const keys = primaryKey.length ? [primaryKey] : [];
+  const indexes = await queryRows(databasePath, `PRAGMA index_list(${quoteIdent(table)});`, options);
+  for (const index of indexes) {
+    if (Number(index.unique || 0) !== 1 || typeof index.name !== 'string') continue;
+    const columns = (await queryRows(
+      databasePath,
+      `PRAGMA index_info(${quoteIdent(index.name)});`,
+      options,
+    )).map((column) => column.name).filter((name) => typeof name === 'string');
+    if (columns.length) keys.push(columns);
+  }
+  const seen = new Set();
+  return keys.filter((columns) => {
+    const key = columns.join('\0');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function preflightMergeStateDatabase(
+  sourceDbPath,
+  destinationDbPath,
+  allowedSessionIds,
+  options = {},
+) {
+  if (!allowedSessionIds || allowedSessionIds.size === 0) return;
+  if (!fs.existsSync(sourceDbPath) || !fs.existsSync(destinationDbPath)) return;
+  const ids = sessionIdList(allowedSessionIds);
+  const plan = await mergePlan(sourceDbPath, destinationDbPath, allowedSessionIds, options);
+  for (const item of plan) {
+    const keys = await uniqueKeys(destinationDbPath, item.table, options);
+    for (const key of keys) {
+      if (!key.every((column) => item.columns.includes(column))) continue;
+      const equality = key.map((column) => (
+        `${quoteIdent('incoming')}.${quoteIdent(column)} = ${quoteIdent('live')}.${quoteIdent(column)}`
+      )).join(' AND ');
+      const conflicts = await queryRows(destinationDbPath, `
+        ATTACH DATABASE ${quoteLiteral(sourceDbPath)} AS snapshot;
+        SELECT 1 AS conflict
+        FROM snapshot.${quoteIdent(item.table)} AS ${quoteIdent('incoming')}
+        JOIN main.${quoteIdent(item.table)} AS ${quoteIdent('live')} ON ${equality}
+        WHERE (${selectedPredicate(item.table, ids, 'incoming')})
+          AND NOT (${selectedPredicate(item.table, ids, 'live')})
+        LIMIT 1;
+        DETACH DATABASE snapshot;
+      `, options);
+      if (conflicts.length) {
+        const error = new Error(`SQLite 恢复发生跨会话唯一键冲突：${item.table}(${key.join(', ')})`);
+        error.code = 'SQLITE_RESTORE_CONFLICT';
+        throw error;
+      }
+    }
+  }
+}
+
+async function rolloutPathStatements(databasePath, updates = [], options = {}) {
+  if (!updates.length) return [];
+  const columns = await tableColumns(databasePath, 'threads', options);
+  if (!columns.includes('id') || !columns.includes('rollout_path')) return [];
+  const hasArchived = columns.includes('archived');
+  return updates.map((update) => {
+    const archived = hasArchived && update.archived !== null && update.archived !== undefined
+      ? `, archived = ${update.archived ? 1 : 0}`
+      : '';
+    return `UPDATE threads SET rollout_path = ${quoteLiteral(update.rolloutPath)}${archived} `
+      + `WHERE id = ${quoteLiteral(update.sessionId)};`;
+  });
+}
+
+function candidatePathFor(destinationDbPath) {
+  const nonce = `${process.pid}-${crypto.randomUUID()}`;
+  return path.join(path.dirname(destinationDbPath), `.${path.basename(destinationDbPath)}.candidate-${nonce}`);
+}
+
+function removeDatabaseArtifacts(databasePath) {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try {
+      fs.rmSync(`${databasePath}${suffix}`, { force: true });
+    } catch {
+      // Keep the original error; orphan cleanup is best effort.
+    }
+  }
+}
+
+async function candidateSanitizationPlan(candidatePath, allowedSessionIds, options) {
+  const statements = [];
+  if (allowedSessionIds) {
+    for (const table of conversationStateTables) {
+      if (!(await tableColumns(candidatePath, table, options)).length) continue;
+      if (allowedSessionIds.size === 0) {
+        statements.push(`DELETE FROM ${quoteIdent(table)};`);
+      } else {
+        const selected = sourceWhereClause(table, allowedSessionIds).replace(/^ WHERE /, '');
+        statements.push(`DELETE FROM ${quoteIdent(table)} WHERE NOT (${selected});`);
+      }
+    }
+  }
+  for (const table of ['device_key_bindings', 'remote_control_enrollments']) {
+    if ((await tableColumns(candidatePath, table, options)).length) {
+      statements.push(`DELETE FROM ${quoteIdent(table)};`);
+    }
+  }
+  statements.push(...await rolloutPathStatements(candidatePath, options.rolloutPathUpdates, options));
+  return statements;
+}
+
+async function validateCandidate(candidatePath, allowedSessionIds, options) {
+  const integrity = String(await runSQLite(candidatePath, 'PRAGMA integrity_check;', options)).trim();
+  if (integrity !== 'ok') throw new Error(`SQLite integrity_check 未通过：${integrity || '无结果'}`);
+
+  if (allowedSessionIds) {
+    for (const table of conversationStateTables) {
+      if (!(await tableColumns(candidatePath, table, options)).length) continue;
+      const selected = sourceWhereClause(table, allowedSessionIds).replace(/^ WHERE /, '');
+      const rows = await queryRows(
+        candidatePath,
+        `SELECT COUNT(*) AS count FROM ${quoteIdent(table)} WHERE NOT (${selected});`,
+        options,
+      );
+      if (Number(rows[0]?.count || 0) !== 0) {
+        throw new Error(`SQLite 候选库包含未选择会话：${table}`);
+      }
+    }
+  }
+  for (const table of ['device_key_bindings', 'remote_control_enrollments']) {
+    if (!(await tableColumns(candidatePath, table, options)).length) continue;
+    const rows = await queryRows(candidatePath, `SELECT COUNT(*) AS count FROM ${quoteIdent(table)};`, options);
+    if (Number(rows[0]?.count || 0) !== 0) throw new Error(`SQLite 候选库账号表未清空：${table}`);
+  }
+}
+
+async function publishSanitizedCandidate(sourceDbPath, destinationDbPath, allowedSessionIds, options) {
+  fs.mkdirSync(path.dirname(destinationDbPath), { recursive: true });
+  const candidatePath = candidatePathFor(destinationDbPath);
+  try {
+    await runSQLite(sourceDbPath, `VACUUM INTO ${quoteLiteral(candidatePath)};`, options);
+    const statements = await candidateSanitizationPlan(candidatePath, allowedSessionIds, options);
+    await runSQLite(candidatePath, `
+      PRAGMA foreign_keys = OFF;
+      BEGIN IMMEDIATE;
+      ${statements.join('\n')}
+      COMMIT;
+      PRAGMA foreign_keys = ON;
+    `, options);
+    await validateCandidate(candidatePath, allowedSessionIds, options);
+    const handle = fs.openSync(candidatePath, 'r+');
+    try {
+      fs.fsyncSync(handle);
+    } finally {
+      fs.closeSync(handle);
+    }
+    fs.linkSync(candidatePath, destinationDbPath);
+  } finally {
+    removeDatabaseArtifacts(candidatePath);
+  }
 }
 
 async function mergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds = null, options = {}) {
@@ -116,22 +296,31 @@ async function mergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessio
   }
 
   if (!fs.existsSync(destinationDbPath)) {
-    fs.mkdirSync(path.dirname(destinationDbPath), { recursive: true });
     try {
-      fs.copyFileSync(sourceDbPath, destinationDbPath, fs.constants.COPYFILE_EXCL);
-      await replaceStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds, options);
+      await publishSanitizedCandidate(sourceDbPath, destinationDbPath, allowedSessionIds, options);
       return 'SQLite 索引已恢复，并清理账号绑定表。';
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
     }
+    if (!fs.existsSync(destinationDbPath)) {
+      throw new Error('Codex 并发创建的 SQLite 数据库在合并前消失，已停止恢复。');
+    }
   }
 
+  await preflightMergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds, options);
   const plan = await mergePlan(sourceDbPath, destinationDbPath, allowedSessionIds, options);
+  const pathUpdates = await rolloutPathStatements(
+    destinationDbPath,
+    options.rolloutPathUpdates,
+    options,
+  );
   await runSQLite(destinationDbPath, `
     PRAGMA foreign_keys = OFF;
     ATTACH DATABASE ${quoteLiteral(sourceDbPath)} AS snapshot;
     BEGIN IMMEDIATE;
+    ${plan.map((item) => item.deleteSelected).join('\n')}
     ${plan.map((item) => item.insert).join('\n')}
+    ${pathUpdates.join('\n')}
     COMMIT;
     DETACH DATABASE snapshot;
     PRAGMA foreign_keys = ON;
@@ -142,26 +331,44 @@ async function mergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessio
 async function replaceStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds, options = {}) {
   if (!fs.existsSync(sourceDbPath)) return 'SQLite 索引未恢复：快照数据库缺失。';
   if (!fs.existsSync(destinationDbPath)) {
-    fs.mkdirSync(path.dirname(destinationDbPath), { recursive: true });
     try {
-      fs.copyFileSync(sourceDbPath, destinationDbPath, fs.constants.COPYFILE_EXCL);
+      await publishSanitizedCandidate(sourceDbPath, destinationDbPath, allowedSessionIds, options);
+      return 'SQLite 索引已完整恢复。';
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
+      if (!fs.existsSync(destinationDbPath)) {
+        throw new Error('Codex 并发创建的 SQLite 数据库在合并前消失，已停止恢复。');
+      }
+      // Codex won the no-replace publication race. Merge into its newly-created
+      // live database so its committed rows are never cleared by this restore.
+      return mergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds, options);
     }
   }
 
   const plan = await mergePlan(sourceDbPath, destinationDbPath, allowedSessionIds, options);
+  const destinationConversationTables = [];
+  for (const table of conversationStateTables) {
+    if ((await tableColumns(destinationDbPath, table, options)).length) {
+      destinationConversationTables.push(table);
+    }
+  }
   const accountTables = [];
   for (const table of ['device_key_bindings', 'remote_control_enrollments']) {
     if ((await tableColumns(destinationDbPath, table, options)).length) accountTables.push(table);
   }
 
+  const pathUpdates = await rolloutPathStatements(
+    destinationDbPath,
+    options.rolloutPathUpdates,
+    options,
+  );
   await runSQLite(destinationDbPath, `
     PRAGMA foreign_keys = OFF;
     ATTACH DATABASE ${quoteLiteral(sourceDbPath)} AS snapshot;
     BEGIN IMMEDIATE;
-    ${plan.map((item) => `DELETE FROM ${quoteIdent(item.table)};`).join('\n')}
+    ${destinationConversationTables.map((table) => `DELETE FROM ${quoteIdent(table)};`).join('\n')}
     ${plan.map((item) => item.insert).join('\n')}
+    ${pathUpdates.join('\n')}
     ${accountTables.map((table) => `DELETE FROM ${quoteIdent(table)};`).join('\n')}
     COMMIT;
     DETACH DATABASE snapshot;
@@ -329,6 +536,7 @@ module.exports = {
   ensureRecoveredThreadsInStateDatabase,
   mergeStateDatabase,
   mergeSingleSessionStateDb,
+  preflightMergeStateDatabase,
   repairStateDatabaseRolloutPaths,
   replaceStateDatabase,
   runSQLite,

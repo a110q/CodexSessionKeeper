@@ -42,6 +42,7 @@ async function durableReplaceWithWriter(destination, writer, options = {}) {
   const temporaryPath = await writeSyncedTemporaryFileWithWriter(destination, writer, options);
 
   try {
+    await options.verifyTemporary?.(temporaryPath);
     await fsp.rename(temporaryPath, destination);
   } catch (error) {
     await fsp.rm(temporaryPath, { force: true }).catch(() => {});

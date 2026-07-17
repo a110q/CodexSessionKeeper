@@ -8,13 +8,16 @@
     "start": "electron .",
     "test": "node --test",
     "prepare:sqlite-win": "bash ../../scripts/prepare_windows_sqlite.sh",
-    "package:win": "npm run prepare:sqlite-win && electron-packager . codex_session_manager --platform=win32 --arch=x64 --out=../../dist/win10-exe --overwrite --prune=true"
+    "package:win": "npm run prepare:sqlite-win && electron-packager . codex_session_manager --platform=win32 --arch=x64 --out=../../dist/win10-exe --overwrite --prune=true",
+    "dist:win": "npm run prepare:sqlite-win && electron-builder --win nsis --x64 --publish never",
+    "postdist:win": "node scripts/write-installer-checksum.js"
   },
   "dependencies": {
     "sql.js": "^1.10.3"
   },
   "devDependencies": {
     "@electron/packager": "^18.3.6",
-    "electron": "^43.1.0"
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3"
   }
 }

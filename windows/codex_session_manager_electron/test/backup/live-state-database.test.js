@@ -10,6 +10,7 @@ const {
   ensureRecoveredThreadsInStateDatabase,
   mergeStateDatabase,
   mergeSingleSessionStateDb,
+  preflightMergeStateDatabase,
   repairStateDatabaseRolloutPaths,
   replaceStateDatabase,
 } = require('../../src/backup/live-state-database');
@@ -333,6 +334,72 @@ test('replaceStateDatabase replaces conversation rows but preserves unrelated li
   assert.deepEqual(queryRows(destinationDbPath, 'SELECT id FROM device_key_bindings;'), []);
 });
 
+test('replaceStateDatabase clears live-only conversation tables', async (t) => {
+  const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+  createStateDatabase(destinationDbPath, [
+    { id: 'old-live-session', title: 'Old live', rolloutPath: 'C:\\old.jsonl' },
+  ]);
+  createStateDatabase(sourceDbPath, [
+    { id: 'snapshot-session', title: 'Snapshot', rolloutPath: 'C:\\snapshot.jsonl' },
+  ]);
+  runSql(destinationDbPath, `
+    CREATE TABLE agent_job_items (id TEXT PRIMARY KEY, assigned_thread_id TEXT, payload TEXT);
+    INSERT INTO agent_job_items VALUES ('live-only', 'old-live-session', 'stale');
+  `);
+
+  await replaceStateDatabase(
+    sourceDbPath,
+    destinationDbPath,
+    new Set(['snapshot-session']),
+    { sqlitePath },
+  );
+
+  assert.deepEqual(queryRows(destinationDbPath, 'SELECT id FROM agent_job_items;'), []);
+});
+
+test('mergeStateDatabase applies rollout updates in the merge transaction', async (t) => {
+  const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+  createStateDatabase(destinationDbPath, [
+    { id: 'session-a', title: 'Live', rolloutPath: 'C:\\old.jsonl' },
+  ]);
+  createStateDatabase(sourceDbPath, [
+    { id: 'session-a', title: 'Snapshot', rolloutPath: 'C:\\snapshot.jsonl' },
+  ]);
+
+  await mergeStateDatabase(sourceDbPath, destinationDbPath, new Set(['session-a']), {
+    sqlitePath,
+    rolloutPathUpdates: [{
+      sessionId: 'session-a',
+      rolloutPath: 'C:\\safe\\sessions\\session-a.jsonl',
+      archived: true,
+    }],
+  });
+
+  assert.deepEqual(
+    queryRows(destinationDbPath, 'SELECT rollout_path, archived FROM threads WHERE id = \'session-a\';'),
+    [{ rollout_path: 'C:\\safe\\sessions\\session-a.jsonl', archived: 1 }],
+  );
+});
+
+test('rollout updates tolerate an older threads schema without rollout_path', async (t) => {
+  const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+  runSql(destinationDbPath, `CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL);`);
+  runSql(sourceDbPath, `
+    CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+    INSERT INTO threads VALUES ('session-a', 'Snapshot');
+  `);
+
+  await mergeStateDatabase(sourceDbPath, destinationDbPath, new Set(['session-a']), {
+    sqlitePath,
+    rolloutPathUpdates: [{ sessionId: 'session-a', rolloutPath: 'C:\\safe.jsonl' }],
+  });
+
+  assert.deepEqual(
+    queryRows(destinationDbPath, 'SELECT id, title FROM threads;'),
+    [{ id: 'session-a', title: 'Snapshot' }],
+  );
+});
+
 test('replaceStateDatabase exclusively creates and sanitizes a missing live database', async (t) => {
   const { destinationDbPath, sourceDbPath } = await makeFixture(t);
   createStateDatabase(sourceDbPath, [
@@ -353,4 +420,232 @@ test('replaceStateDatabase exclusively creates and sanitizes a missing live data
 
   assert.deepEqual(queryRows(destinationDbPath, 'SELECT id FROM threads ORDER BY id;'), [{ id: 'allowed' }]);
   assert.deepEqual(queryRows(destinationDbPath, 'SELECT id FROM device_key_bindings;'), []);
+});
+
+test('replaceStateDatabase preserves a live database created during candidate publication', async (t) => {
+  const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+  createStateDatabase(sourceDbPath, [
+    { id: 'snapshot-session', title: 'Snapshot', rolloutPath: 'C:\\snapshot.jsonl' },
+  ]);
+  const fsSync = require('node:fs');
+  const linkSync = fsSync.linkSync;
+  let injected = false;
+  fsSync.linkSync = (sourcePath, targetPath) => {
+    if (!injected && targetPath === destinationDbPath && sourcePath.includes('.candidate-')) {
+      injected = true;
+      createStateDatabase(destinationDbPath, [
+        { id: 'codex-session', title: 'Created concurrently', rolloutPath: 'C:\\codex.jsonl' },
+      ]);
+      const error = new Error('destination exists');
+      error.code = 'EEXIST';
+      throw error;
+    }
+    return linkSync(sourcePath, targetPath);
+  };
+  try {
+    await replaceStateDatabase(
+      sourceDbPath,
+      destinationDbPath,
+      new Set(['snapshot-session']),
+      { sqlitePath },
+    );
+  } finally {
+    fsSync.linkSync = linkSync;
+  }
+
+  assert.deepEqual(
+    queryRows(destinationDbPath, 'SELECT id FROM threads ORDER BY id;'),
+    [{ id: 'codex-session' }, { id: 'snapshot-session' }],
+  );
+});
+
+test('replaceStateDatabase fails closed if the concurrently created database disappears', async (t) => {
+  const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+  createStateDatabase(sourceDbPath, [
+    { id: 'snapshot-session', title: 'Snapshot', rolloutPath: 'C:\\snapshot.jsonl' },
+  ]);
+  const fsSync = require('node:fs');
+  const linkSync = fsSync.linkSync;
+  let injected = false;
+  fsSync.linkSync = (sourcePath, targetPath) => {
+    if (!injected && targetPath === destinationDbPath && sourcePath.includes('.candidate-')) {
+      injected = true;
+      createStateDatabase(destinationDbPath, [
+        { id: 'codex-session', title: 'Created concurrently', rolloutPath: 'C:\\codex.jsonl' },
+      ]);
+      fsSync.rmSync(destinationDbPath, { force: true });
+      const error = new Error('destination existed and disappeared');
+      error.code = 'EEXIST';
+      throw error;
+    }
+    return linkSync(sourcePath, targetPath);
+  };
+  try {
+    await assert.rejects(
+      replaceStateDatabase(
+        sourceDbPath,
+        destinationDbPath,
+        new Set(['snapshot-session']),
+        { sqlitePath },
+      ),
+      /消失|disappear/,
+    );
+  } finally {
+    fsSync.linkSync = linkSync;
+  }
+
+  assert.equal(fsSync.existsSync(destinationDbPath), false);
+});
+
+test('selected-session relation conflict rolls back without overwriting an unselected owner', async (t) => {
+  const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+  createStateDatabase(destinationDbPath, [
+    { id: 'A', title: 'Live A', rolloutPath: 'C:\\live-a.jsonl' },
+    { id: 'B', title: 'Live B', rolloutPath: 'C:\\live-b.jsonl' },
+  ]);
+  createStateDatabase(sourceDbPath, [
+    { id: 'A', title: 'Snapshot A', rolloutPath: 'C:\\snapshot-a.jsonl' },
+  ]);
+  runSql(destinationDbPath, `
+    CREATE TABLE agent_job_items (id TEXT PRIMARY KEY, assigned_thread_id TEXT, payload TEXT);
+    INSERT INTO agent_job_items VALUES ('shared', 'B', 'live B');
+  `);
+  runSql(sourceDbPath, `
+    CREATE TABLE agent_job_items (id TEXT PRIMARY KEY, assigned_thread_id TEXT, payload TEXT);
+    INSERT INTO agent_job_items VALUES ('shared', 'A', 'snapshot A');
+  `);
+
+  await assert.rejects(
+    mergeSingleSessionStateDb(sourceDbPath, destinationDbPath, 'A', { sqlitePath }),
+    (error) => error.code === 'SQLITE_RESTORE_CONFLICT',
+  );
+
+  assert.deepEqual(
+    queryRows(destinationDbPath, 'SELECT id, title FROM threads ORDER BY id;'),
+    [{ id: 'A', title: 'Live A' }, { id: 'B', title: 'Live B' }],
+  );
+  assert.deepEqual(
+    queryRows(destinationDbPath, 'SELECT id, assigned_thread_id, payload FROM agent_job_items;'),
+    [{ id: 'shared', assigned_thread_id: 'B', payload: 'live B' }],
+  );
+});
+
+test('missing-destination merge failure never publishes the unsanitized source database', async (t) => {
+  const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+  createStateDatabase(sourceDbPath, [
+    { id: 'allowed', title: 'Allowed', rolloutPath: 'C:\\allowed.jsonl' },
+    { id: 'not-selected', title: 'Not selected', rolloutPath: 'C:\\other.jsonl' },
+  ]);
+  runSql(sourceDbPath, `
+    CREATE TABLE device_key_bindings (id TEXT PRIMARY KEY);
+    INSERT INTO device_key_bindings VALUES ('secret');
+  `);
+
+  await assert.rejects(
+    mergeStateDatabase(sourceDbPath, destinationDbPath, new Set(['allowed']), {
+      sqlitePath: path.join(path.dirname(destinationDbPath), 'missing-sqlite3'),
+    }),
+  );
+
+  assert.equal(require('node:fs').existsSync(destinationDbPath), false);
+  assert.equal(require('node:fs').existsSync(`${destinationDbPath}-wal`), false);
+  assert.equal(require('node:fs').existsSync(`${destinationDbPath}-shm`), false);
+});
+
+const relationConflictFixtures = [
+  {
+    table: 'threads',
+    setup(databasePath, owner, isSource) {
+      runSql(databasePath, `
+        CREATE UNIQUE INDEX IF NOT EXISTS threads_unique_title ON threads(title);
+        UPDATE threads SET title = ${isSource ? "'shared-title'" : owner === 'B' ? "'shared-title'" : "'live-a'"}
+        WHERE id = '${owner}';
+      `);
+    },
+  },
+  ...[
+    ['thread_goals', 'thread_id'],
+    ['thread_dynamic_tools', 'thread_id'],
+    ['stage1_outputs', 'thread_id'],
+    ['agent_job_items', 'assigned_thread_id'],
+  ].map(([table, ownerColumn]) => ({
+    table,
+    setup(databasePath, owner) {
+      runSql(databasePath, `
+        CREATE TABLE ${table} (id TEXT PRIMARY KEY, ${ownerColumn} TEXT, payload TEXT);
+        INSERT INTO ${table} VALUES ('shared-key', '${owner}', '${owner} payload');
+      `);
+    },
+  })),
+  {
+    table: 'thread_spawn_edges',
+    setup(databasePath, owner) {
+      runSql(databasePath, `
+        CREATE TABLE thread_spawn_edges (
+          id TEXT PRIMARY KEY,
+          parent_thread_id TEXT,
+          child_thread_id TEXT,
+          payload TEXT
+        );
+        INSERT INTO thread_spawn_edges VALUES ('shared-key', '${owner}', '${owner}', '${owner} payload');
+      `);
+    },
+  },
+];
+
+for (const fixture of relationConflictFixtures) {
+  test(`${fixture.table} cross-session unique conflict rolls back the selected restore`, async (t) => {
+    const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+    createStateDatabase(destinationDbPath, [
+      { id: 'A', title: 'Live A', rolloutPath: 'C:\\live-a.jsonl' },
+      { id: 'B', title: 'Live B', rolloutPath: 'C:\\live-b.jsonl' },
+    ]);
+    createStateDatabase(sourceDbPath, [
+      { id: 'A', title: 'Snapshot A', rolloutPath: 'C:\\snapshot-a.jsonl' },
+    ]);
+    if (fixture.table === 'threads') {
+      fixture.setup(destinationDbPath, 'A', false);
+      fixture.setup(destinationDbPath, 'B', false);
+      fixture.setup(sourceDbPath, 'A', true);
+    } else {
+      fixture.setup(destinationDbPath, 'B', false);
+      fixture.setup(sourceDbPath, 'A', true);
+    }
+
+    await assert.rejects(
+      preflightMergeStateDatabase(sourceDbPath, destinationDbPath, new Set(['A']), { sqlitePath }),
+      (error) => error.code === 'SQLITE_RESTORE_CONFLICT',
+    );
+    await assert.rejects(
+      mergeSingleSessionStateDb(sourceDbPath, destinationDbPath, 'A', { sqlitePath }),
+      (error) => error.code === 'SQLITE_RESTORE_CONFLICT',
+    );
+    assert.deepEqual(
+      queryRows(destinationDbPath, 'SELECT id FROM threads ORDER BY id;'),
+      [{ id: 'A' }, { id: 'B' }],
+    );
+  });
+}
+
+test('candidate sanitization trigger failure leaves no live database or sidecar', async (t) => {
+  const { destinationDbPath, sourceDbPath } = await makeFixture(t);
+  createStateDatabase(sourceDbPath, [
+    { id: 'allowed', title: 'Allowed', rolloutPath: 'C:\\allowed.jsonl' },
+    { id: 'not-selected', title: 'Other', rolloutPath: 'C:\\other.jsonl' },
+  ]);
+  runSql(sourceDbPath, `
+    CREATE TRIGGER reject_candidate_delete BEFORE DELETE ON threads
+    WHEN OLD.id = 'not-selected'
+    BEGIN
+      SELECT RAISE(ABORT, 'candidate cleaning rejected');
+    END;
+  `);
+
+  await assert.rejects(
+    mergeStateDatabase(sourceDbPath, destinationDbPath, new Set(['allowed']), { sqlitePath }),
+    /candidate cleaning rejected/,
+  );
+  assert.equal(require('node:fs').existsSync(destinationDbPath), false);
+  assert.equal(require('node:fs').existsSync(`${destinationDbPath}-wal`), false);
+  assert.equal(require('node:fs').existsSync(`${destinationDbPath}-shm`), false);
 });

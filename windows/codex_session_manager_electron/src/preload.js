@@ -9,6 +9,8 @@ contextBridge.exposeInMainWorld('codexManager', {
   listNasEmployees: (department) => ipcRenderer.invoke('list-nas-employees', department),
   activateNasBackup: (department, employee) => ipcRenderer.invoke('activate-nas-backup', department, employee),
   retryNasBackup: () => ipcRenderer.invoke('retry-nas-backup'),
+  retryLaunchAtLogin: () => ipcRenderer.invoke('retry-launch-at-login'),
+  openLoginItemSettings: () => ipcRenderer.invoke('open-login-item-settings'),
   listNasBackupDevices: () => ipcRenderer.invoke('list-nas-backup-devices'),
   loadIncrementalBackupSessions: (deviceId) => ipcRenderer.invoke('load-incremental-backup-sessions', deviceId),
   setAutoRestore: (enabled) => ipcRenderer.invoke('set-auto-restore', enabled),

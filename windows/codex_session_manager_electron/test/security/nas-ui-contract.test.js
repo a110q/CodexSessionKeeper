@@ -52,7 +52,7 @@ test('Electron backup lifecycle uses cached status, resume wiring, and prompt sh
     main.indexOf("app.on('second-instance'"),
   );
 
-  assert.match(statusGetter, /return nasRuntime\.backupStatus\(\)/);
+  assert.match(statusGetter, /nasRuntime\.backupStatus\(\)/);
   assert.doesNotMatch(statusGetter, /status\.json|readText|readFile|exists\(/);
   assert.doesNotMatch(main.split('\n')[0], /powerMonitor/);
   assert.match(main, /const \{ powerMonitor \} = require\('electron'\)/);
@@ -61,8 +61,30 @@ test('Electron backup lifecycle uses cached status, resume wiring, and prompt sh
   assert.match(main, /powerMonitor\.on\('resume', resumeHandler\)/);
   assert.match(main, /powerMonitor\.removeListener\('resume'/);
   assert.match(main, /app\.on\('activate',[\s\S]*requestImmediateScan\('activation'\)/);
-  assert.match(main, /let backupExitConfirmed = false/);
-  assert.match(main, /app\.on\('before-quit',[\s\S]*backupExitConfirmed[\s\S]*teardownBackupLifecycleListeners\(\)[\s\S]*nasRuntime\.stop\(\)/);
-  assert.match(main, /if \(result\.response === 1\) \{[\s\S]*backupExitConfirmed = true;[\s\S]*window\.close\(\)/);
-  assert.match(main, /installBackupExitGuard\(mainWindow\)/);
+  assert.match(main, /createLoginItemController/);
+  assert.match(main, /createBackgroundLifecycle/);
+  assert.match(main, /new Tray\(/);
+  assert.match(main, /backgroundLifecycle\.attachWindow\(mainWindow\)/);
+  assert.match(main, /app\.on\('before-quit',[\s\S]*backgroundLifecycle\.requestQuit\(\)[\s\S]*backgroundLifecycle\.beforeQuit\(\)/);
+  assert.match(main, /app\.on\('second-instance', \(_event, commandLine\)/);
+  assert.match(main, /backgroundLifecycle\.handleSecondInstance\(commandLine\)/);
+  assert.doesNotMatch(main, /app\.on\('window-all-closed',[\s\S]{0,120}app\.quit\(\)/);
+  assert.doesNotMatch(main, /installBackupExitGuard|backupExitConfirmed/);
+});
+
+test('launch-at-login warning and repair actions are exposed through guarded IPC', () => {
+  const sourceRoot = path.join(__dirname, '..', '..', 'src');
+  const main = fs.readFileSync(path.join(sourceRoot, 'main.js'), 'utf8');
+  const preload = fs.readFileSync(path.join(sourceRoot, 'preload.js'), 'utf8');
+  const html = fs.readFileSync(path.join(sourceRoot, 'index.html'), 'utf8');
+  const renderer = fs.readFileSync(path.join(sourceRoot, 'renderer.js'), 'utf8');
+
+  for (const channel of ['retry-launch-at-login', 'open-login-item-settings']) {
+    assert.match(main, new RegExp(`handleTrustedIpc\\('${channel}'`));
+    assert.match(preload, new RegExp(`ipcRenderer\\.invoke\\('${channel}'`));
+  }
+  assert.match(html, /id="launchAtLoginWarning"/);
+  assert.match(html, /id="retryLaunchAtLoginBtn"/);
+  assert.match(html, /id="openLoginItemSettingsBtn"/);
+  assert.match(renderer, /launchAtLogin\.enabled/);
 });

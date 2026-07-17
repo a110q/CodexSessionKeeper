@@ -14,6 +14,7 @@ const { CursorStore } = require('../../src/backup/cursor-store');
 const { BackupIntegrityAuditor } = require('../../src/backup/integrity-auditor');
 const { backupPaths } = require('../../src/backup/paths');
 const { readNewCompleteLines } = require('../../src/backup/session-tailer');
+const { loadVerification } = require('../../src/backup/verification-store');
 
 const DEVICE_ID = '00000000-0000-0000-0000-000000000001';
 
@@ -36,6 +37,17 @@ async function makeTestPaths(t) {
 
 function jsonLine(record) {
   return `${JSON.stringify(record)}\n`;
+}
+
+function fixedSizeJSONLine(byteCount, fillByte) {
+  const prefix = Buffer.from('{"role":"assistant","content":"');
+  const suffix = Buffer.from('"}\n');
+  assert.ok(byteCount > prefix.length + suffix.length);
+  return Buffer.concat([
+    prefix,
+    Buffer.alloc(byteCount - prefix.length - suffix.length, fillByte),
+    suffix,
+  ]);
 }
 
 async function writeSessionFile(filePath, lines) {
@@ -142,6 +154,7 @@ function cursorFor(paths, sourceName, overrides = {}) {
   return {
     sessionId: path.basename(sourceName, '.jsonl'),
     sourcePath,
+    sourceFileIdentity: null,
     backupPath: path.join('sessions', sourceName),
     lastByteOffset: 10,
     lastSourceSize: 10,
@@ -155,42 +168,39 @@ function cursorFor(paths, sourceName, overrides = {}) {
   };
 }
 
-function spyOnDatabaseExport(store) {
-  const originalExport = store.db.export.bind(store.db);
+function spyOnCursorStoreWriteTransactions(store) {
+  const originalRunSQLite = store.runSQLite;
   let calls = 0;
-  store.db.export = (...args) => {
-    calls += 1;
-    return originalExport(...args);
-  };
-  return {
-    get calls() {
-      return calls;
-    },
-  };
-}
-
-function spyOnAllCursorStoreExports() {
-  const originalFlush = CursorStore.prototype.flush;
-  let calls = 0;
-  CursorStore.prototype.flush = async function (...args) {
-    const database = this.db;
-    const originalExport = database.export;
-    database.export = (...exportArgs) => {
-      calls += 1;
-      return originalExport.apply(database, exportArgs);
-    };
-    try {
-      return await originalFlush.apply(this, args);
-    } finally {
-      database.export = originalExport;
-    }
+  store.runSQLite = function (sql, ...args) {
+    if (/^\s*BEGIN IMMEDIATE;/i.test(sql)) calls += 1;
+    return originalRunSQLite.call(this, sql, ...args);
   };
   return {
     get calls() {
       return calls;
     },
     restore() {
-      CursorStore.prototype.flush = originalFlush;
+      store.runSQLite = originalRunSQLite;
+    },
+  };
+}
+
+function spyOnAllCursorStoreWriteTransactions() {
+  const originalRunSQLite = CursorStore.prototype.runSQLite;
+  let calls = 0;
+  CursorStore.prototype.runSQLite = function (sql, ...args) {
+    if (/^\s*BEGIN IMMEDIATE;/i.test(sql)) calls += 1;
+    return originalRunSQLite.call(this, sql, ...args);
+  };
+  return {
+    get calls() {
+      return calls;
+    },
+    reset() {
+      calls = 0;
+    },
+    restore() {
+      CursorStore.prototype.runSQLite = originalRunSQLite;
     },
   };
 }
@@ -258,6 +268,169 @@ test('initial scan backs up existing jsonl and records manifest title and line c
   ]);
 });
 
+test('initial scan publishes a matching verification sidecar', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'verified.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'verified' })]);
+
+  await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const record = manifest.sessions.verified;
+  const verification = await loadVerification(paths.verificationPath);
+  const entry = verification.sessions.verified;
+  assert.equal(entry.backupPath, record.backupPath);
+  assert.equal(entry.byteCount, record.bytesBackedUp);
+  assert.equal(entry.lineCount, record.lineCount);
+  assert.ok(entry.chunkHashes.length > 0);
+  assert.equal(entry.verifiedAt, '2026-01-02T03:04:00.000Z');
+});
+
+test('upload readback reports the verifying progress phase', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'verification-progress.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'progress' })]);
+  const phases = [];
+
+  await new BackupAgent({
+    paths,
+    onProgress: (progress) => phases.push(progress.phase),
+  }).performOneShotScan();
+
+  assert.ok(phases.includes('verifying'));
+  assert.equal(phases.at(-1), 'seeding');
+});
+
+test('rebuild readback failure retries once then publishes a verified file', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'readback-retry.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'retry readback' })]);
+  let syncCount = 0;
+  const fileCommitter = createFileCommitter({
+    sync: async (handle) => {
+      syncCount += 1;
+      await handle.sync();
+      if (syncCount === 1) {
+        await handle.write(Buffer.from('x'), 0, 1, 0);
+        await handle.sync();
+      }
+    },
+  });
+
+  await new BackupAgent({ paths, fileCommitter, now: makeClock() }).performOneShotScan();
+
+  assert.equal(syncCount, 2);
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const record = manifest.sessions['readback-retry'];
+  assert.match(await fs.readFile(path.join(paths.backupRoot, record.backupPath), 'utf8'), /retry readback/);
+  const verification = await loadVerification(paths.verificationPath);
+  assert.equal(verification.sessions['readback-retry'].byteCount, record.bytesBackedUp);
+});
+
+test('two rebuild readback failures preserve the formal backup and metadata', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'readback-fails.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'old payload' })]);
+  await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+  const targetPath = paths.backupFilePath(sourcePath);
+  const before = await Promise.all([
+    fs.readFile(targetPath),
+    fs.readFile(paths.manifestPath),
+    fs.readFile(paths.cursorDatabasePath),
+    fs.readFile(paths.verificationPath),
+  ]);
+  await fs.writeFile(sourcePath, jsonLine({ role: 'user', content: 'new payload' }));
+  const later = new Date(Date.now() + 60000);
+  await fs.utimes(sourcePath, later, later);
+  let syncCount = 0;
+  const fileCommitter = createFileCommitter({
+    sync: async (handle) => {
+      syncCount += 1;
+      await handle.sync();
+      await handle.write(Buffer.from('x'), 0, 1, 0);
+      await handle.sync();
+    },
+  });
+
+  await assert.rejects(
+    new BackupAgent({ paths, fileCommitter }).performOneShotScan(),
+    (error) => /readback-fails\.jsonl/.test(error.message) && /JSONL/i.test(error.message),
+  );
+
+  assert.equal(syncCount, 2);
+  const after = await Promise.all([
+    fs.readFile(targetPath),
+    fs.readFile(paths.manifestPath),
+    fs.readFile(paths.cursorDatabasePath),
+    fs.readFile(paths.verificationPath),
+  ]);
+  assert.deepEqual(after, before);
+});
+
+test('two append readback failures roll back to the last verified length', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'append-readback-fails.jsonl');
+  const first = jsonLine({ role: 'user', content: 'first' });
+  const second = jsonLine({ role: 'assistant', content: 'second' });
+  await writeSessionFile(sourcePath, [first]);
+  await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+  const targetPath = paths.backupFilePath(sourcePath);
+  const before = await Promise.all([
+    fs.readFile(targetPath),
+    fs.readFile(paths.manifestPath),
+    fs.readFile(paths.cursorDatabasePath),
+    fs.readFile(paths.verificationPath),
+  ]);
+  const oldOffset = before[0].length;
+  await fs.appendFile(sourcePath, second);
+  let syncCount = 0;
+  const fileCommitter = createFileCommitter({
+    sync: async (handle) => {
+      syncCount += 1;
+      await handle.sync();
+      if (syncCount === 1 || syncCount === 3) {
+        await handle.write(Buffer.from('x'), 0, 1, oldOffset);
+        await handle.sync();
+      }
+    },
+  });
+
+  await assert.rejects(new BackupAgent({ paths, fileCommitter }).performOneShotScan());
+
+  assert.equal(syncCount, 3);
+  const after = await Promise.all([
+    fs.readFile(targetPath),
+    fs.readFile(paths.manifestPath),
+    fs.readFile(paths.cursorDatabasePath),
+    fs.readFile(paths.verificationPath),
+  ]);
+  assert.deepEqual(after, before);
+});
+
+test('append verification repairs an already-corrupted final chunk with one rebuild retry', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'append-repairs-old-chunk.jsonl');
+  const first = jsonLine({ role: 'user', content: 'first' });
+  const second = jsonLine({ role: 'assistant', content: 'second' });
+  await writeSessionFile(sourcePath, [first]);
+  await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+
+  const targetPath = paths.backupFilePath(sourcePath);
+  const corrupted = await fs.readFile(targetPath);
+  corrupted[0] ^= 0x01;
+  await fs.writeFile(targetPath, corrupted);
+  await fs.appendFile(sourcePath, second);
+
+  await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+
+  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const verification = await loadVerification(paths.verificationPath);
+  assert.equal(manifest.sessions['append-repairs-old-chunk'].bytesBackedUp, Buffer.byteLength(first + second));
+  assert.equal(verification.sessions['append-repairs-old-chunk'].byteCount, Buffer.byteLength(first + second));
+  assert.equal((await loadCursor(paths, sourcePath)).lastByteOffset, Buffer.byteLength(first + second));
+});
+
 test('second scan appends only new completed lines and repeated scan has no duplicate', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'append.jsonl');
@@ -265,10 +438,28 @@ test('second scan appends only new completed lines and repeated scan has no dupl
     jsonLine({ role: 'user', content: 'Start' }),
   ]);
 
-  const agent = new BackupAgent({ paths, now: makeClock() });
+  const baseCommitter = createFileCommitter();
+  let appendCount = 0;
+  let rebuildCount = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async appendCompleteLines(...args) {
+      appendCount += 1;
+      return baseCommitter.appendCompleteLines(...args);
+    },
+    async rebuildCompleteLines(...args) {
+      rebuildCount += 1;
+      return baseCommitter.rebuildCompleteLines(...args);
+    },
+  };
+  const agent = new BackupAgent({ paths, fileCommitter, now: makeClock() });
   await agent.performOneShotScan();
+  appendCount = 0;
+  rebuildCount = 0;
   await fs.appendFile(sourcePath, jsonLine({ role: 'assistant', content: 'New answer' }), 'utf8');
   await agent.performOneShotScan();
+  assert.equal(appendCount, 1);
+  assert.equal(rebuildCount, 0);
   await agent.performOneShotScan();
 
   const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
@@ -280,7 +471,7 @@ test('second scan appends only new completed lines and repeated scan has no dupl
   assert.equal(manifest.sessions.append.lineCount, 2);
 });
 
-test('steady-state scan reads new source bytes with the real bounded streamer', async (t) => {
+test('steady-state scan reads the append and revalidates from the final chunk boundary', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'cursor-offset.jsonl');
   const first = jsonLine({ role: 'user', content: 'one' });
@@ -302,9 +493,313 @@ test('steady-state scan reads new source bytes with the real bounded streamer', 
   const newOffset = oldOffset + Buffer.byteLength(second);
   assert.equal(initialRanges.get(sourcePath)[0].start, 0);
   assert.ok(appendedRanges.get(sourcePath).every(({ start, end }) => (
-    start >= oldOffset && end <= newOffset
+    start >= 0 && end <= newOffset
   )));
+  assert.ok(appendedRanges.get(sourcePath).some(({ start }) => start === oldOffset));
   assert.equal(await fs.readFile(paths.backupFilePath(sourcePath), 'utf8'), first + second);
+});
+
+test('growing full rewrite with changed first and middle anchors rebuilds the exact source', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'growing-anchor-rewrite.jsonl');
+  const chunkSize = 4 * 1024 * 1024;
+  const originalChunks = [0x61, 0x62, 0x63, 0x64, 0x65]
+    .map((fill) => fixedSizeJSONLine(chunkSize, fill));
+  await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+  await fs.writeFile(sourcePath, Buffer.concat(originalChunks));
+  await new BackupAgent({ paths }).performOneShotScan();
+
+  const replacementChunks = [...originalChunks];
+  replacementChunks[0] = fixedSizeJSONLine(chunkSize, 0x78);
+  replacementChunks[2] = fixedSizeJSONLine(chunkSize, 0x79);
+  const appended = Buffer.from(jsonLine({ role: 'assistant', content: 'growth' }));
+  const replacement = Buffer.concat([...replacementChunks, appended]);
+  await fs.writeFile(sourcePath, replacement);
+  const changedAt = new Date(Date.now() + 60_000);
+  await fs.utimes(sourcePath, changedAt, changedAt);
+
+  const baseCommitter = createFileCommitter();
+  let appendCount = 0;
+  let rebuildCount = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async appendCompleteLines(...args) {
+      appendCount += 1;
+      return baseCommitter.appendCompleteLines(...args);
+    },
+    async rebuildCompleteLines(...args) {
+      rebuildCount += 1;
+      return baseCommitter.rebuildCompleteLines(...args);
+    },
+  };
+
+  await new BackupAgent({ paths, fileCommitter }).performOneShotScan();
+
+  assert.equal(appendCount, 0);
+  assert.equal(rebuildCount, 1);
+  assert.deepEqual(await fs.readFile(paths.backupFilePath(sourcePath)), replacement);
+});
+
+test('source identity replacement rebuilds even when all old anchors still match', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'identity-replacement.jsonl');
+  const initial = Buffer.from(jsonLine({ role: 'assistant', content: 'stable prefix' }));
+  await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+  await fs.writeFile(sourcePath, initial);
+  await new BackupAgent({ paths }).performOneShotScan();
+  const beforeCursor = await loadCursor(paths, sourcePath);
+  assert.match(beforeCursor.sourceFileIdentity, /^\d+:\d+$/);
+
+  const replacementPath = `${sourcePath}.replacement`;
+  const replacement = Buffer.concat([
+    initial,
+    Buffer.from(jsonLine({ role: 'assistant', content: 'new line' })),
+  ]);
+  await fs.writeFile(replacementPath, replacement);
+  const changedAt = new Date(Date.now() + 60_000);
+  await fs.utimes(replacementPath, changedAt, changedAt);
+  await fs.rename(replacementPath, sourcePath);
+
+  const baseCommitter = createFileCommitter();
+  let appendCount = 0;
+  let rebuildCount = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async appendCompleteLines(...args) {
+      appendCount += 1;
+      return baseCommitter.appendCompleteLines(...args);
+    },
+    async rebuildCompleteLines(...args) {
+      rebuildCount += 1;
+      return baseCommitter.rebuildCompleteLines(...args);
+    },
+  };
+
+  await new BackupAgent({ paths, fileCommitter }).performOneShotScan();
+
+  assert.equal(appendCount, 0);
+  assert.equal(rebuildCount, 1);
+  assert.notEqual((await loadCursor(paths, sourcePath)).sourceFileIdentity, beforeCursor.sourceFileIdentity);
+  assert.deepEqual(await fs.readFile(paths.backupFilePath(sourcePath)), replacement);
+});
+
+test('legacy null source identity validates anchors, appends, and records the current identity', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'legacy-null-identity.jsonl');
+  const initial = jsonLine({ role: 'user', content: 'initial' });
+  const appended = jsonLine({ role: 'assistant', content: 'append' });
+  await writeSessionFile(sourcePath, [initial]);
+  await new BackupAgent({ paths }).performOneShotScan();
+  const store = new CursorStore({ paths });
+  await store.open();
+  const legacyCursor = await store.get(sourcePath);
+  await store.upsert({ ...legacyCursor, sourceFileIdentity: null });
+  await store.close();
+  await fs.appendFile(sourcePath, appended);
+
+  const baseCommitter = createFileCommitter();
+  let appendCount = 0;
+  let rebuildCount = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async appendCompleteLines(...args) {
+      appendCount += 1;
+      return baseCommitter.appendCompleteLines(...args);
+    },
+    async rebuildCompleteLines(...args) {
+      rebuildCount += 1;
+      return baseCommitter.rebuildCompleteLines(...args);
+    },
+  };
+
+  await new BackupAgent({ paths, fileCommitter }).performOneShotScan();
+
+  assert.equal(appendCount, 1);
+  assert.equal(rebuildCount, 0);
+  assert.match((await loadCursor(paths, sourcePath)).sourceFileIdentity, /^\d+:\d+$/);
+  assert.equal(await fs.readFile(paths.backupFilePath(sourcePath), 'utf8'), initial + appended);
+});
+
+test('unchanged legacy null identity does no body, target, rebuild, or cursor write work', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'legacy-null-unchanged.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'unchanged' })]);
+  await new BackupAgent({ paths }).performOneShotScan();
+  const store = new CursorStore({ paths });
+  await store.open();
+  const current = await store.get(sourcePath);
+  await store.upsert({ ...current, sourceFileIdentity: null });
+  await store.close();
+
+  const baseCommitter = createFileCommitter();
+  let targetInspections = 0;
+  let rebuildCount = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async inspectTarget(...args) {
+      targetInspections += 1;
+      return baseCommitter.inspectTarget(...args);
+    },
+    async rebuildCompleteLines(...args) {
+      rebuildCount += 1;
+      return baseCommitter.rebuildCompleteLines(...args);
+    },
+  };
+  const transactionSpy = spyOnAllCursorStoreWriteTransactions();
+  t.after(() => transactionSpy.restore());
+  const targetPath = paths.backupFilePath(sourcePath);
+
+  const ranges = await withTrackedReadRanges(
+    [sourcePath, targetPath],
+    () => new BackupAgent({ paths, fileCommitter }).performOneShotScan(),
+  );
+
+  assert.equal(targetInspections, 0);
+  assert.equal(rebuildCount, 0);
+  assert.deepEqual(ranges.get(sourcePath), []);
+  assert.deepEqual(ranges.get(targetPath), []);
+  assert.equal(transactionSpy.calls, 0);
+  assert.equal((await loadCursor(paths, sourcePath)).sourceFileIdentity, null);
+});
+
+test('idle pending count treats an unchanged legacy null identity as settled', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'legacy-null-idle.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'unchanged' })]);
+  await new BackupAgent({ paths }).performOneShotScan();
+  const store = new CursorStore({ paths });
+  await store.open();
+  const current = await store.get(sourcePath);
+  await store.upsert({ ...current, sourceFileIdentity: null });
+  await store.close();
+
+  assert.equal(await new BackupAgent({ paths }).pendingSessionCount(), 0);
+  assert.deepEqual(JSON.parse(await fs.readFile(paths.pendingSourcesPath, 'utf8')), { pending: [] });
+  assert.equal((await loadCursor(paths, sourcePath)).sourceFileIdentity, null);
+});
+
+test('source change during append truncates the target and leaves backup metadata unchanged', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'changes-during-append.jsonl');
+  const initial = jsonLine({ role: 'user', content: 'initial' });
+  const appended = jsonLine({ role: 'assistant', content: 'intended append' });
+  await writeSessionFile(sourcePath, [initial]);
+  await new BackupAgent({ paths }).performOneShotScan();
+  const targetPath = paths.backupFilePath(sourcePath);
+  const beforeTarget = await fs.readFile(targetPath);
+  const beforeManifest = await fs.readFile(paths.manifestPath);
+  const beforeVerification = await fs.readFile(paths.verificationPath);
+  const beforeCursor = await loadCursor(paths, sourcePath);
+  await fs.appendFile(sourcePath, appended);
+
+  const baseCommitter = createFileCommitter();
+  let sourceMutated = false;
+  const fileCommitter = {
+    ...baseCommitter,
+    async appendCompleteLines(...args) {
+      const result = await baseCommitter.appendCompleteLines(...args);
+      sourceMutated = true;
+      await fs.appendFile(sourcePath, jsonLine({ role: 'assistant', content: 'raced append' }));
+      const changedAt = new Date(Date.now() + 60_000);
+      await fs.utimes(sourcePath, changedAt, changedAt);
+      return result;
+    },
+  };
+
+  await assert.rejects(
+    new BackupAgent({ paths, fileCommitter }).performOneShotScan(),
+    /changed during backup/i,
+  );
+
+  assert.equal(sourceMutated, true);
+  assert.deepEqual(await fs.readFile(targetPath), beforeTarget);
+  assert.deepEqual(await fs.readFile(paths.manifestPath), beforeManifest);
+  assert.deepEqual(await fs.readFile(paths.verificationPath), beforeVerification);
+  assert.deepEqual(await loadCursor(paths, sourcePath), beforeCursor);
+});
+
+test('source metadata recheck failure after append restores the caller verification object before throwing', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'removed-during-append.jsonl');
+  const initial = jsonLine({ role: 'user', content: 'initial' });
+  const appended = jsonLine({ role: 'assistant', content: 'intended append' });
+  await writeSessionFile(sourcePath, [initial]);
+  await new BackupAgent({ paths }).performOneShotScan();
+  const targetPath = paths.backupFilePath(sourcePath);
+  const beforeTarget = await fs.readFile(targetPath);
+  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
+  const verification = await loadVerification(paths.verificationPath);
+  const beforeManifest = JSON.stringify(manifest);
+  const beforeVerification = JSON.stringify(verification);
+  const currentCursor = await loadCursor(paths, sourcePath);
+  await fs.appendFile(sourcePath, appended);
+
+  const baseCommitter = createFileCommitter();
+  const agent = new BackupAgent({ paths, fileCommitter: baseCommitter });
+  const originalLstat = fs.lstat;
+  let trustedMetadataReads = 0;
+  fs.lstat = async (filePath, options, ...args) => {
+    if (path.resolve(String(filePath)) === path.resolve(sourcePath) && options?.bigint === true) {
+      trustedMetadataReads += 1;
+      if (trustedMetadataReads > 1) throw new Error('injected source metadata recheck failure');
+    }
+    return originalLstat.call(fs, filePath, options, ...args);
+  };
+  try {
+    await assert.rejects(agent.processSessionFile({
+      sourcePath,
+      sessionId: 'removed-during-append',
+      scanDate: new Date('2026-07-16T06:00:00.000Z'),
+      manifest,
+      verification,
+      onVerifying: () => {},
+      currentCursor,
+      cursorMap: new Map([[sourcePath, currentCursor]]),
+    }), /injected source metadata recheck failure/);
+  } finally {
+    fs.lstat = originalLstat;
+  }
+
+  assert.deepEqual(await fs.readFile(targetPath), beforeTarget);
+  assert.equal(JSON.stringify(manifest), beforeManifest);
+  assert.equal(JSON.stringify(verification), beforeVerification);
+  assert.deepEqual(await loadCursor(paths, sourcePath), currentCursor);
+});
+
+test('daily audit repairs a growing rewrite that preserves all three append anchors', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'non-anchor-rewrite.jsonl');
+  const chunkSize = 4 * 1024 * 1024;
+  const chunks = [0x61, 0x62, 0x63, 0x64, 0x65]
+    .map((fill) => fixedSizeJSONLine(chunkSize, fill));
+  await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+  await fs.writeFile(sourcePath, Buffer.concat(chunks));
+  const now = new Date('2026-07-16T06:00:00.000Z');
+  const agent = new BackupAgent({ paths, now: () => now });
+  await agent.performOneShotScan();
+
+  const rewrittenChunks = [...chunks];
+  rewrittenChunks[1] = fixedSizeJSONLine(chunkSize, 0x78);
+  const rewritten = Buffer.concat([
+    ...rewrittenChunks,
+    Buffer.from(jsonLine({ role: 'assistant', content: 'growth' })),
+  ]);
+  await fs.writeFile(sourcePath, rewritten);
+  const changedAt = new Date(now.getTime() + 60_000);
+  await fs.utimes(sourcePath, changedAt, changedAt);
+  await agent.performOneShotScan();
+  const targetPath = paths.backupFilePath(sourcePath);
+  assert.notDeepEqual(await fs.readFile(targetPath), rewritten);
+
+  await fs.writeFile(paths.auditStatePath, `${JSON.stringify({
+    lastCompletedAt: new Date(now.getTime() - (86400 * 1000) - 1).toISOString(),
+    lastResult: 'completed',
+    repairedCount: 0,
+  })}\n`);
+  const outcome = await agent.performIntegrityAuditIfDue(DEVICE_ID);
+
+  assert.deepEqual(outcome, { outcome: 'completed', checked: 1, repaired: 1 });
+  assert.deepEqual(await fs.readFile(targetPath), rewritten);
 });
 
 test('backup agent does not execute the discarded legacy tailer side channel', async (t) => {
@@ -452,21 +947,21 @@ test('no-op scan does not rewrite the cursor database', async (t) => {
   assert.equal(afterHash, beforeHash);
 });
 
-test('fresh scan with no changed cursors performs zero total database exports', async (t) => {
+test('fresh scan with no changed cursors performs zero cursor write transactions', async (t) => {
   const { paths } = await makeTestPaths(t);
-  const exportSpy = spyOnAllCursorStoreExports();
+  const transactionSpy = spyOnAllCursorStoreWriteTransactions();
 
   try {
     await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
   } finally {
-    exportSpy.restore();
+    transactionSpy.restore();
   }
 
-  assert.equal(exportSpy.calls, 0);
-  assert.equal(await fileExists(paths.cursorDatabasePath), false);
+  assert.equal(transactionSpy.calls, 0);
+  assert.equal(await fileExists(paths.cursorDatabasePath), true);
 });
 
-test('fresh scan batches many changed cursors into one total database export', async (t) => {
+test('fresh scan batches many changed cursors into one native write transaction', async (t) => {
   const { paths } = await makeTestPaths(t);
   await writeSessionFile(path.join(paths.codexRoot, 'sessions', 'batch-one.jsonl'), [
     jsonLine({ role: 'user', content: 'One' }),
@@ -477,7 +972,7 @@ test('fresh scan batches many changed cursors into one total database export', a
 
   const originalAll = CursorStore.prototype.all;
   const originalUpsertMany = CursorStore.prototype.upsertMany;
-  const exportSpy = spyOnAllCursorStoreExports();
+  const transactionSpy = spyOnAllCursorStoreWriteTransactions();
   let allCalls = 0;
   let upsertManyCalls = 0;
   CursorStore.prototype.all = function (...args) {
@@ -492,7 +987,7 @@ test('fresh scan batches many changed cursors into one total database export', a
   try {
     await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
   } finally {
-    exportSpy.restore();
+    transactionSpy.restore();
     if (originalAll) CursorStore.prototype.all = originalAll;
     else delete CursorStore.prototype.all;
     if (originalUpsertMany) CursorStore.prototype.upsertMany = originalUpsertMany;
@@ -501,7 +996,7 @@ test('fresh scan batches many changed cursors into one total database export', a
 
   assert.equal(allCalls, 1);
   assert.equal(upsertManyCalls, 1);
-  assert.equal(exportSpy.calls, 1);
+  assert.equal(transactionSpy.calls, 1);
 });
 
 test('partial trailing line is not backed up until completed', async (t) => {
@@ -567,13 +1062,13 @@ test('moving a session from sessions to archived does not duplicate backup', asy
 
   await fs.mkdir(path.dirname(archivedPath), { recursive: true });
   await fs.rename(activePath, archivedPath);
-  const migrationExportSpy = spyOnAllCursorStoreExports();
+  const migrationTransactionSpy = spyOnAllCursorStoreWriteTransactions();
   try {
     await agent.performOneShotScan();
   } finally {
-    migrationExportSpy.restore();
+    migrationTransactionSpy.restore();
   }
-  assert.equal(migrationExportSpy.calls, 1);
+  assert.equal(migrationTransactionSpy.calls, 1);
   await fs.appendFile(archivedPath, jsonLine({ role: 'assistant', content: 'After archive' }), 'utf8');
   await agent.performOneShotScan();
 
@@ -703,7 +1198,12 @@ test('oversized line beyond limit sets error status and continues other sessions
   await writeSessionFile(blockedPath, ['x'.repeat(32 * 1024 * 1024 + 1)]);
   await writeSessionFile(healthyPath, [jsonLine({ role: 'user', content: 'healthy' })]);
 
-  const agent = new BackupAgent({ paths, now: makeClock() });
+  let validations = 0;
+  const agent = new BackupAgent({
+    paths,
+    now: makeClock(),
+    validateTarget: async () => { validations += 1; },
+  });
   await agent.performOneShotScan();
 
   const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
@@ -726,6 +1226,10 @@ test('oversized line beyond limit sets error status and continues other sessions
   ]);
   assert.equal(status.status, 'error');
   assert.match(status.lastError, /exceeds maximum JSONL line size/);
+
+  validations = 0;
+  await agent.requestImmediateScan('timer');
+  assert.equal(validations, 1, 'an unchanged source with a backup error must be retried');
 });
 
 test('invalid relative backup path throws a clear error', async (t) => {
@@ -844,7 +1348,7 @@ test('adopting an ahead user record recovers and preserves the first title', asy
   assert.equal(await fs.readFile(targetPath, 'utf8'), assistant + firstUser + laterUser);
 });
 
-test('retry syncs an adopted ahead target before advancing metadata', async (t) => {
+test('rollback sync failure stops retry without advancing metadata and later scan recovers', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'sync-ahead-retry.jsonl');
   const first = jsonLine({ role: 'user', content: 'first' });
@@ -869,18 +1373,9 @@ test('retry syncs an adopted ahead target before advancing metadata', async (t) 
     }),
   });
 
-  await assert.rejects(retryAgent.performOneShotScan(), /injected sync failure 1/);
-  assert.equal(syncCalls, 1);
-  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
-  assert.deepEqual(
-    JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions['sync-ahead-retry'],
-    baselineRecord,
-  );
-  assert.deepEqual(await loadCursor(paths, sourcePath), baselineCursor);
-
   await assert.rejects(retryAgent.performOneShotScan(), /injected sync failure 2/);
   assert.equal(syncCalls, 2);
-  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
+  assert.equal(await fs.readFile(targetPath, 'utf8'), first);
   assert.deepEqual(
     JSON.parse(await fs.readFile(paths.manifestPath, 'utf8')).sessions['sync-ahead-retry'],
     baselineRecord,
@@ -932,7 +1427,7 @@ test('fresh cursor reconciliation compares an existing target prefix without who
   assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
 });
 
-test('initial matching target reconciliation derives title, line count, and full hash in one bounded pass', async (t) => {
+test('initial matching unverified target is rebuilt and gains a verification sidecar', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'existing-seed-hash.jsonl');
   const assistant = jsonLine({ role: 'assistant', content: 'x'.repeat(3 * 1024 * 1024 + 17) });
@@ -957,11 +1452,11 @@ test('initial matching target reconciliation derives title, line count, and full
     ranges.get(sourcePath).reduce((total, range) => total + range.end - range.start, 0),
     Buffer.byteLength(contents),
   );
-  assert.equal(
-    ranges.get(targetPath).reduce((total, range) => total + range.end - range.start, 0),
-    Buffer.byteLength(contents),
-  );
+  assert.equal(ranges.get(targetPath).length, 0);
   assert.ok([...ranges.values()].flat().every(({ requested }) => requested <= 1024 * 1024));
+  const verification = await loadVerification(paths.verificationPath);
+  assert.equal(verification.sessions['existing-seed-hash'].byteCount, Buffer.byteLength(contents));
+  assert.ok(verification.sessions['existing-seed-hash'].chunkHashes.length > 0);
 });
 
 test('initial matching empty target reconciliation stores the canonical empty hash', async (t) => {
@@ -981,14 +1476,14 @@ test('initial matching empty target reconciliation stores the canonical empty ha
   assert.equal(record.contentHash, crypto.createHash('sha256').update('').digest('hex'));
 });
 
-test('unchanged scan stops before target, body, hash, manifest, cursor, and export work', async (t) => {
+test('unchanged scan stops before target, body, hash, manifest, and cursor transaction work', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'strict-no-change.jsonl');
   await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'stable' })]);
   await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
   const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
   const targetPath = path.join(paths.backupRoot, manifest.sessions['strict-no-change'].backupPath);
-  const exportSpy = spyOnAllCursorStoreExports();
+  const transactionSpy = spyOnAllCursorStoreWriteTransactions();
   const originalStat = fs.stat;
   const originalLstat = fs.lstat;
   const originalOpen = fs.open;
@@ -997,7 +1492,6 @@ test('unchanged scan stops before target, body, hash, manifest, cursor, and expo
   let targetStatCount = 0;
   let bodyReadCount = 0;
   let manifestWriteCount = 0;
-  let cursorWriteCount = 0;
   fs.stat = async (filePath, ...args) => {
     if (path.resolve(String(filePath)) === path.resolve(targetPath)) {
       targetStatCount += 1;
@@ -1028,7 +1522,6 @@ test('unchanged scan stops before target, body, hash, manifest, cursor, and expo
   };
   fs.rename = async (from, to, ...args) => {
     if (path.resolve(String(to)) === path.resolve(paths.manifestPath)) manifestWriteCount += 1;
-    if (path.resolve(String(to)) === path.resolve(paths.cursorDatabasePath)) cursorWriteCount += 1;
     return originalRename.call(fs, from, to, ...args);
   };
 
@@ -1040,17 +1533,16 @@ test('unchanged scan stops before target, body, hash, manifest, cursor, and expo
     fs.open = originalOpen;
     fs.readFile = originalReadFile;
     fs.rename = originalRename;
-    exportSpy.restore();
+    transactionSpy.restore();
   }
 
   assert.equal(targetStatCount, 0);
   assert.equal(bodyReadCount, 0);
   assert.equal(manifestWriteCount, 0);
-  assert.equal(cursorWriteCount, 0);
-  assert.equal(exportSpy.calls, 0);
+  assert.equal(transactionSpy.calls, 0);
 });
 
-test('append reads only the new committed range and clears the optional full hash', async (t) => {
+test('append revalidates from the final chunk boundary and clears the optional full hash', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'range-append.jsonl');
   const first = jsonLine({ role: 'user', content: 'first' });
@@ -1085,8 +1577,9 @@ test('append reads only the new committed range and clears the optional full has
 
   assert.ok(readRanges.length > 0);
   assert.ok(readRanges.every(({ start, end, requested }) => (
-    start >= oldOffset && end <= newOffset && requested <= 1024 * 1024
+    start >= 0 && end <= newOffset && requested <= 4 * 1024 * 1024
   )));
+  assert.ok(readRanges.some(({ start }) => start === oldOffset));
   const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
   const record = manifest.sessions['range-append'];
   assert.equal(record.bytesBackedUp, newOffset);
@@ -1114,8 +1607,9 @@ test('untitled append never reopens the large target prefix for a title', async 
   assert.ok(ranges.get(sourcePath).length > 0);
   assert.ok(ranges.get(targetPath).length > 0);
   assert.ok([...ranges.values()].flat().every(({ start, end, requested }) => (
-    start >= oldOffset && end <= newOffset && requested <= 1024 * 1024
+    start >= 0 && end <= newOffset && requested <= 4 * 1024 * 1024
   )));
+  assert.ok(ranges.get(sourcePath).some(({ start }) => start === oldOffset));
   const record = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'))
     .sessions['append-title-range'];
   assert.equal(record.title, null);
@@ -1130,6 +1624,9 @@ test('empty seed and empty rebuild store the canonical full hash', async (t) => 
   const emptyHash = crypto.createHash('sha256').update('').digest('hex');
   let manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
   assert.equal(manifest.sessions['empty-hash'].contentHash, emptyHash);
+  let verification = await loadVerification(paths.verificationPath);
+  assert.deepEqual(verification.sessions['empty-hash'].chunkHashes, []);
+  assert.equal(verification.sessions['empty-hash'].byteCount, 0);
 
   await fs.writeFile(sourcePath, jsonLine({ role: 'user', content: 'temporary' }));
   await fs.utimes(sourcePath, new Date(), new Date(Date.now() + 5_000));
@@ -1142,6 +1639,8 @@ test('empty seed and empty rebuild store the canonical full hash', async (t) => 
   const record = manifest.sessions['empty-hash'];
   assert.equal(record.contentHash, emptyHash);
   assert.equal((await fs.stat(path.join(paths.backupRoot, record.backupPath))).size, 0);
+  verification = await loadVerification(paths.verificationPath);
+  assert.deepEqual(verification.sessions['empty-hash'].chunkHashes, []);
 });
 
 test('same-size changed-mtime rewrite streams an exact rebuild without JSONL readFile', async (t) => {
@@ -1244,6 +1743,7 @@ test('cursor store preserves tricky values and pending partial line', async (t) 
   const cursor = {
     sessionId: 'quote-session',
     sourcePath,
+    sourceFileIdentity: null,
     backupPath: path.join('sessions', 'quote.jsonl'),
     lastByteOffset: 42,
     lastSourceSize: 99,
@@ -1259,7 +1759,7 @@ test('cursor store preserves tricky values and pending partial line', async (t) 
   assert.deepEqual(await store.get(sourcePath), cursor);
 });
 
-test('cursor store materializes all cursors and exports a changed batch once', async (t) => {
+test('cursor store materializes all cursors and writes a changed batch once', async (t) => {
   const { paths } = await makeTestPaths(t);
   const store = new CursorStore({ paths });
   await store.open();
@@ -1273,175 +1773,33 @@ test('cursor store materializes all cursors and exports a changed batch once', a
     lineCount: 2,
     pendingPartialLine: 'partial',
   });
-  const exportSpy = spyOnDatabaseExport(store);
+  const transactionSpy = spyOnCursorStoreWriteTransactions(store);
+  t.after(() => transactionSpy.restore());
 
   await store.upsertMany([one, two]);
 
   const cursors = store.all();
-  assert.equal(exportSpy.calls, 1);
+  assert.equal(transactionSpy.calls, 1);
   assert.ok(cursors instanceof Map);
   assert.equal(cursors.size, 2);
   assert.deepEqual(cursors.get(one.sourcePath), one);
   assert.deepEqual(cursors.get(two.sourcePath), two);
 });
 
-test('empty cursor batch does not export the database', async (t) => {
+test('empty cursor batch does not start a write transaction', async (t) => {
   const { paths } = await makeTestPaths(t);
   const store = new CursorStore({ paths });
   await store.open();
   t.after(async () => {
     await store.close();
   });
-  const exportSpy = spyOnDatabaseExport(store);
+  const transactionSpy = spyOnCursorStoreWriteTransactions(store);
+  t.after(() => transactionSpy.restore());
 
   await store.upsertMany([]);
 
-  assert.equal(exportSpy.calls, 0);
+  assert.equal(transactionSpy.calls, 0);
   assert.equal(store.all().size, 0);
-});
-
-test('SQL failure rolls back the cursor batch without a durable replacement', async (t) => {
-  const { paths } = await makeTestPaths(t);
-  const store = new CursorStore({ paths });
-  await store.open();
-  t.after(async () => {
-    await store.close();
-  });
-  assert.equal(await fileExists(paths.cursorDatabasePath), false);
-  store.db.run(`
-    CREATE TRIGGER reject_bad_cursor
-    BEFORE INSERT ON backup_cursors
-    WHEN NEW.source_path LIKE '%bad.jsonl'
-    BEGIN
-      SELECT RAISE(ABORT, 'injected SQL failure');
-    END;
-  `);
-  const exportSpy = spyOnDatabaseExport(store);
-
-  await assert.rejects(
-    store.upsertMany([
-      cursorFor(paths, 'good.jsonl'),
-      cursorFor(paths, 'bad.jsonl'),
-    ]),
-    /injected SQL failure/,
-  );
-
-  assert.equal(exportSpy.calls, 0);
-  assert.equal(store.all().size, 0);
-  assert.equal(await fileExists(paths.cursorDatabasePath), false);
-});
-
-test('durable cursor replacement failure leaves the previous database readable', async (t) => {
-  const { paths } = await makeTestPaths(t);
-  const store = new CursorStore({ paths });
-  await store.open();
-  t.after(async () => {
-    await store.close();
-  });
-  const original = cursorFor(paths, 'durable.jsonl');
-  await store.upsert(original);
-  const exportSpy = spyOnAllCursorStoreExports();
-  t.after(() => {
-    exportSpy.restore();
-  });
-  const originalRename = fs.rename;
-  const rejectedPath = cursorFor(paths, 'rejected.jsonl').sourcePath;
-  fs.rename = async () => {
-    throw new Error('injected durable replacement failure');
-  };
-
-  try {
-    await assert.rejects(
-      store.upsertMany([
-        cursorFor(paths, 'durable.jsonl', { lastByteOffset: 99 }),
-        cursorFor(paths, 'rejected.jsonl'),
-      ]),
-      /injected durable replacement failure/,
-    );
-  } finally {
-    fs.rename = originalRename;
-  }
-
-  assert.equal(exportSpy.calls, 1);
-  assert.equal(store.all().size, 1);
-  assert.deepEqual(await store.get(original.sourcePath), original);
-  assert.equal(await store.get(rejectedPath), null);
-
-  const accepted = cursorFor(paths, 'durable.jsonl', { lastByteOffset: 77 });
-  await store.upsertMany([accepted]);
-  assert.equal(exportSpy.calls, 2);
-  assert.deepEqual(await store.get(original.sourcePath), accepted);
-  assert.equal(await store.get(rejectedPath), null);
-  await store.close();
-
-  const reopened = new CursorStore({ paths });
-  await reopened.open();
-  t.after(async () => {
-    await reopened.close();
-  });
-  assert.equal(reopened.all().size, 1);
-  assert.deepEqual(await reopened.get(original.sourcePath), accepted);
-  assert.equal(await reopened.get(rejectedPath), null);
-});
-
-test('rollback failure restores the last durable database and permits reuse', async (t) => {
-  const { paths } = await makeTestPaths(t);
-  const store = new CursorStore({ paths });
-  await store.open();
-  t.after(async () => {
-    await store.close();
-  });
-  const original = cursorFor(paths, 'rollback.jsonl');
-  await store.upsert(original);
-  store.db.run(`
-    CREATE TRIGGER reject_bad_cursor
-    BEFORE INSERT ON backup_cursors
-    WHEN NEW.source_path LIKE '%bad.jsonl'
-    BEGIN
-      SELECT RAISE(ABORT, 'injected SQL failure');
-    END;
-  `);
-  const failedDatabase = store.db;
-  const originalRun = failedDatabase.run;
-  failedDatabase.run = function (sql, ...args) {
-    if (sql === 'ROLLBACK;') {
-      throw new Error('injected rollback failure');
-    }
-    return originalRun.call(failedDatabase, sql, ...args);
-  };
-  const exportSpy = spyOnAllCursorStoreExports();
-  t.after(() => {
-    exportSpy.restore();
-  });
-  const rejectedPath = cursorFor(paths, 'bad.jsonl').sourcePath;
-
-  await assert.rejects(
-    store.upsertMany([
-      cursorFor(paths, 'good.jsonl'),
-      cursorFor(paths, 'bad.jsonl'),
-    ]),
-    /injected SQL failure/,
-  );
-
-  assert.equal(exportSpy.calls, 0);
-  assert.equal(store.all().size, 1);
-  assert.deepEqual(await store.get(original.sourcePath), original);
-  assert.equal(await store.get(rejectedPath), null);
-
-  const accepted = cursorFor(paths, 'rollback.jsonl', { lastByteOffset: 55 });
-  await store.upsertMany([accepted]);
-  assert.equal(exportSpy.calls, 1);
-  assert.deepEqual(await store.get(original.sourcePath), accepted);
-  await store.close();
-
-  const reopened = new CursorStore({ paths });
-  await reopened.open();
-  t.after(async () => {
-    await reopened.close();
-  });
-  assert.equal(reopened.all().size, 1);
-  assert.deepEqual(await reopened.get(original.sourcePath), accepted);
-  assert.equal(await reopened.get(rejectedPath), null);
 });
 
 test('session tailer reads across chunks until complete lines are exhausted', async (t) => {
@@ -1722,7 +2080,7 @@ test('startup scan schedules an autonomous audit that catches up first and resch
   assert.deepEqual(cancelled, []);
 });
 
-test('periodic scan before the scheduled audit does not starve the original timer', async (t) => {
+test('no-change periodic tick does not starve the original audit timer', async (t) => {
   const { paths } = await makeTestPaths(t);
   const timers = [];
   let scanCount = 0;
@@ -1731,7 +2089,7 @@ test('periodic scan before the scheduled audit does not starve the original time
     async recoverPendingRepairIfNeeded() {},
     async recordInitialSeedCompleted() {},
     async runIfDue() {
-      assert.equal(scanCount, 3);
+      assert.equal(scanCount, 2);
       auditCount += 1;
       return { outcome: 'completed', checked: 0, repaired: 0 };
     },
@@ -1760,7 +2118,7 @@ test('periodic scan before the scheduled audit does not starve the original time
     { outcome: 'completed', checked: 0, repaired: 0 },
   );
   assert.equal(auditCount, 1);
-  assert.equal(scanCount, 3);
+  assert.equal(scanCount, 2);
   assert.equal(timers.length, 2);
 });
 
@@ -1920,6 +2278,77 @@ test('polling defaults to 30 seconds and stale timer callbacks are rejected afte
   assert.deepEqual(cancelled, [scheduled[0]]);
 });
 
+test('no-change timer ticks stay local until five-minute health and thirty-minute heartbeat deadlines', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const startedAt = new Date('2026-07-15T01:00:00.000Z');
+  let currentTime = startedAt;
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'idle-cadence.jsonl');
+  await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'steady' })]);
+  let validations = 0;
+  let remoteStatusWrites = 0;
+  const agent = new BackupAgent({
+    paths,
+    now: () => currentTime,
+    healthCheckIntervalMs: 5 * 60 * 1000,
+    remoteHeartbeatIntervalMs: 30 * 60 * 1000,
+    validateTarget: async () => { validations += 1; },
+    instrumentation: {
+      remoteStatusWrite: () => { remoteStatusWrites += 1; },
+    },
+  });
+  t.after(() => agent.stop());
+  await agent.performOneShotScan();
+  validations = 0;
+  remoteStatusWrites = 0;
+
+  currentTime = new Date(startedAt.getTime() + (5 * 60 * 1000) - 1);
+  await agent.requestImmediateScan('timer');
+  assert.equal(validations, 0);
+  assert.equal(remoteStatusWrites, 0);
+
+  currentTime = new Date(startedAt.getTime() + (5 * 60 * 1000));
+  await agent.requestImmediateScan('timer');
+  assert.equal(validations, 1);
+  assert.equal(remoteStatusWrites, 0);
+
+  currentTime = new Date(startedAt.getTime() + (30 * 60 * 1000) - 1);
+  await agent.requestImmediateScan('timer');
+  assert.equal(validations, 2);
+  assert.equal(remoteStatusWrites, 0);
+
+  currentTime = new Date(startedAt.getTime() + (30 * 60 * 1000));
+  await agent.requestImmediateScan('timer');
+  assert.equal(validations, 3);
+  assert.equal(remoteStatusWrites, 1);
+  const remoteStatus = JSON.parse(await fs.readFile(paths.remoteStatusPath, 'utf8'));
+  assert.equal(remoteStatus.lastHeartbeatAt, currentTime.toISOString());
+});
+
+test('local append triggers an immediate timer scan before the health deadline', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const now = new Date('2026-07-15T01:00:00.000Z');
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'local-change.jsonl');
+  const original = jsonLine({ role: 'user', content: 'original' });
+  const appended = jsonLine({ role: 'assistant', content: 'new' });
+  await writeSessionFile(sourcePath, [original]);
+  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
+  const initialStatus = JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8'));
+  await fs.appendFile(sourcePath, appended);
+  let validations = 0;
+  const agent = new BackupAgent({
+    paths,
+    now: () => new Date(now.getTime() + 30000),
+    initialStatus,
+    validateTarget: async () => { validations += 1; },
+  });
+  t.after(() => agent.stop());
+
+  await agent.requestImmediateScan('timer');
+
+  assert.equal(validations, 1);
+  assert.ok((await fs.readFile(paths.backupFilePath(sourcePath), 'utf8')).endsWith(appended));
+});
+
 test('concurrent triggers serialize one active scan and at most one queued follow-up', async (t) => {
   const { paths } = await makeTestPaths(t);
   const gates = [];
@@ -1945,23 +2374,24 @@ test('concurrent triggers serialize one active scan and at most one queued follo
     agent.stop();
   });
 
-  const drain = agent.requestImmediateScan('timer');
+  const requests = [];
+  const drain = agent.requestImmediateScan('startup');
+  requests.push(drain);
   await waitForCondition(() => scanCount === 1);
-  agent.requestImmediateScan('wake');
-  agent.requestImmediateScan('reconnect');
-  agent.requestImmediateScan('timer');
+  requests.push(agent.requestImmediateScan('wake'));
+  requests.push(agent.requestImmediateScan('reconnect'));
+  requests.push(agent.requestImmediateScan('timer'));
   gates[0].resolve();
   await waitForCondition(() => scanCount === 2);
-  agent.requestImmediateScan('wake');
-  agent.requestImmediateScan('reconnect');
-  agent.requestImmediateScan('timer');
+  requests.push(agent.requestImmediateScan('wake'));
+  requests.push(agent.requestImmediateScan('reconnect'));
+  requests.push(agent.requestImmediateScan('timer'));
   gates[1].resolve();
-  await drain;
-  await new Promise((resolve) => setImmediate(resolve));
+  await Promise.allSettled(requests);
 
   assert.equal(scanCount, 2);
   assert.equal(maximumConcurrentScans, 1);
-  assert.deepEqual(triggers, ['timer', 'wake', 'reconnect', 'timer', 'wake', 'reconnect', 'timer']);
+  assert.deepEqual(triggers, ['startup', 'wake', 'reconnect', 'timer', 'wake', 'reconnect', 'timer']);
 });
 
 test('replacement quiescence wait is bounded and succeeds after the active writer drains', async (t) => {
@@ -1978,6 +2408,8 @@ test('replacement quiescence wait is bounded and succeeds after the active write
 
   const scan = agent.requestImmediateScan('startup');
   await entered.promise;
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(keepAlive));
   const startedAt = Date.now();
   assert.equal(await agent.stopAndAwaitQuiescence(5), false);
   assert.ok(Date.now() - startedAt < 250);
@@ -2095,12 +2527,6 @@ test('two no-change timer ticks do not interrupt a running audit or queue backup
   const now = new Date('2026-07-14T04:05:06.000Z');
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'timer-audit.jsonl');
   await writeSessionFile(sourcePath, [jsonLine({ role: 'user', content: 'steady' }).repeat(50000)]);
-  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
-  await fs.writeFile(paths.auditStatePath, JSON.stringify({
-    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
-    lastResult: 'previous',
-    repairedCount: 0,
-  }));
   const readStarted = controlledPromise();
   const releaseRead = controlledPromise();
   let paused = false;
@@ -2119,10 +2545,10 @@ test('two no-change timer ticks do not interrupt a running audit or queue backup
   let targetStats = 0;
   let interruptionSignals = 0;
   const readSpy = spyOnAllCursorStoreReads();
-  const exportSpy = spyOnAllCursorStoreExports();
+  const transactionSpy = spyOnAllCursorStoreWriteTransactions();
   t.after(() => {
     readSpy.restore();
-    exportSpy.restore();
+    transactionSpy.restore();
   });
   const agent = new BackupAgent({
     paths,
@@ -2135,6 +2561,16 @@ test('two no-change timer ticks do not interrupt a running audit or queue backup
     integrityAuditorFactory: () => auditor,
   });
   t.after(() => agent.stop());
+  await agent.performOneShotScan();
+  await fs.writeFile(paths.auditStatePath, JSON.stringify({
+    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  }));
+  readSpy.reset();
+  transactionSpy.reset();
+  bodyReads = 0;
+  targetStats = 0;
 
   const audit = agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001');
   await readStarted.promise;
@@ -2142,26 +2578,22 @@ test('two no-change timer ticks do not interrupt a running audit or queue backup
   const baselineSignals = interruptionSignals;
   const firstTick = agent.requestImmediateScan('timer');
   assert.equal(interruptionSignals, baselineSignals);
-  await readSpy.waitForCalls(1);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(interruptionSignals, baselineSignals);
   await firstTick;
+  assert.equal(interruptionSignals, baselineSignals);
   const secondTick = agent.requestImmediateScan('timer');
   assert.equal(interruptionSignals, baselineSignals);
-  await readSpy.waitForCalls(2);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(interruptionSignals, baselineSignals);
   await secondTick;
+  assert.equal(interruptionSignals, baselineSignals);
   const preflightReads = readSpy.calls;
-  const preflightExports = exportSpy.calls;
+  const preflightTransactions = transactionSpy.calls;
   const preflightBodyReads = bodyReads;
   const preflightTargetStats = targetStats;
   releaseRead.resolve();
   const outcome = await audit;
   await Promise.allSettled([firstTick, secondTick]);
 
-  assert.equal(preflightReads, 2);
-  assert.equal(preflightExports, 0);
+  assert.equal(preflightReads, 0);
+  assert.equal(preflightTransactions, 0);
   assert.equal(preflightBodyReads, 0);
   assert.equal(preflightTargetStats, 0);
   assert.deepEqual(outcome, { outcome: 'completed', checked: 1, repaired: 0 });
@@ -2174,12 +2606,6 @@ test('timer tick with a complete append interrupts audit and backs up the append
   const initial = jsonLine({ role: 'user', content: 'steady' }).repeat(50000);
   const appended = jsonLine({ role: 'assistant', content: 'new during audit' });
   await writeSessionFile(sourcePath, [initial]);
-  await new BackupAgent({ paths, now: () => now }).performOneShotScan();
-  await fs.writeFile(paths.auditStatePath, JSON.stringify({
-    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
-    lastResult: 'previous',
-    repairedCount: 0,
-  }));
   const readStarted = controlledPromise();
   const releaseRead = controlledPromise();
   let paused = false;
@@ -2198,10 +2624,10 @@ test('timer tick with a complete append interrupts audit and backs up the append
   let targetStats = 0;
   let interruptionSignals = 0;
   const readSpy = spyOnAllCursorStoreReads();
-  const exportSpy = spyOnAllCursorStoreExports();
+  const transactionSpy = spyOnAllCursorStoreWriteTransactions();
   t.after(() => {
     readSpy.restore();
-    exportSpy.restore();
+    transactionSpy.restore();
   });
   const agent = new BackupAgent({
     paths,
@@ -2214,6 +2640,16 @@ test('timer tick with a complete append interrupts audit and backs up the append
     integrityAuditorFactory: () => auditor,
   });
   t.after(() => agent.stop());
+  await agent.performOneShotScan();
+  await fs.writeFile(paths.auditStatePath, JSON.stringify({
+    lastCompletedAt: new Date(now.getTime() - 86401000).toISOString(),
+    lastResult: 'previous',
+    repairedCount: 0,
+  }));
+  readSpy.reset();
+  transactionSpy.reset();
+  bodyReads = 0;
+  targetStats = 0;
 
   const audit = agent.performIntegrityAuditIfDue('00000000-0000-0000-0000-000000000001');
   await readStarted.promise;
@@ -2223,15 +2659,15 @@ test('timer tick with a complete append interrupts audit and backs up the append
   const tick = agent.requestImmediateScan('timer');
   await waitForCondition(() => interruptionSignals === baselineSignals + 1);
 
-  assert.equal(readSpy.calls, 1);
-  assert.equal(exportSpy.calls, 0);
+  assert.equal(readSpy.calls, 0);
+  assert.equal(transactionSpy.calls, 0);
   assert.equal(bodyReads, 0);
   assert.equal(targetStats, 0);
   releaseRead.resolve();
 
   assert.deepEqual(await audit, { outcome: 'interrupted', checked: 0, repaired: 0 });
   await tick;
-  assert.equal(exportSpy.calls, 1);
+  assert.equal(transactionSpy.calls, 1);
   assert.ok((await fs.readFile(paths.backupFilePath(sourcePath), 'utf8')).endsWith(appended));
 });
 

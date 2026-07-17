@@ -9,6 +9,7 @@ const { titleFromJsonLine } = require('./session-identity');
 const NEWLINE_BYTE = 0x0A;
 const DEFAULT_CHUNK_SIZE = 1024 * 1024;
 const MAXIMUM_CHUNK_SIZE = 1024 * 1024;
+const DEFAULT_WRITE_BUFFER_SIZE = 1024 * 1024;
 const DEFAULT_MAX_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_PENDING_PARTIAL_BYTES = 64 * 1024;
 const NEWLINE = Buffer.from([NEWLINE_BYTE]);
@@ -38,6 +39,42 @@ async function writeAll(handle, buffer, position = null) {
     }
     written += bytesWritten;
   }
+}
+
+function createBufferedBackupWriter({
+  bufferSize = DEFAULT_WRITE_BUFFER_SIZE,
+  writeChunk,
+}) {
+  if (!Number.isSafeInteger(bufferSize) || bufferSize <= 0) {
+    throw new Error(`Invalid backup write buffer size: ${bufferSize}`);
+  }
+  const buffer = Buffer.allocUnsafe(bufferSize);
+  let bufferedLength = 0;
+
+  async function flush() {
+    if (bufferedLength === 0) return;
+    await writeChunk(buffer.subarray(0, bufferedLength));
+    bufferedLength = 0;
+  }
+
+  async function append(data) {
+    let sourceOffset = 0;
+    while (sourceOffset < data.length) {
+      const count = Math.min(buffer.length - bufferedLength, data.length - sourceOffset);
+      data.copy(buffer, bufferedLength, sourceOffset, sourceOffset + count);
+      bufferedLength += count;
+      sourceOffset += count;
+      if (bufferedLength === buffer.length) await flush();
+    }
+  }
+
+  async function appendByte(byte) {
+    buffer[bufferedLength] = byte;
+    bufferedLength += 1;
+    if (bufferedLength === buffer.length) await flush();
+  }
+
+  return { append, appendByte, flush };
 }
 
 async function scanCompleteRecords({
@@ -146,6 +183,7 @@ async function rebuildSessionCompleteLines({
   interruptionRequested = () => false,
   onChunk = null,
   sync = (handle) => handle.sync(),
+  verifyTemporary = null,
 }) {
   if (maximumOffset !== null && (!Number.isSafeInteger(maximumOffset) || maximumOffset < 0)) {
     throw new Error(`Invalid maximum source offset: ${maximumOffset}`);
@@ -156,6 +194,9 @@ async function rebuildSessionCompleteLines({
   let scanResult;
   try {
     await durableReplaceWithWriter(targetPath, async (targetHandle) => {
+      const bufferedWriter = createBufferedBackupWriter({
+        writeChunk: (chunk) => writeAll(targetHandle, chunk),
+      });
       scanResult = await scanCompleteRecords({
         sourceHandle,
         sourcePath,
@@ -166,14 +207,23 @@ async function rebuildSessionCompleteLines({
         onChunk,
         onRecord: async (line) => {
           if (line.length > 0) {
-            await writeAll(targetHandle, line);
+            await bufferedWriter.append(line);
             digest.update(line);
           }
-          await writeAll(targetHandle, NEWLINE);
+          await bufferedWriter.appendByte(NEWLINE_BYTE);
           digest.update(NEWLINE);
         },
       });
-    }, { sync });
+      await bufferedWriter.flush();
+    }, {
+      sync,
+      verifyTemporary: verifyTemporary
+        ? (temporaryPath) => verifyTemporary(temporaryPath, {
+          ...scanResult,
+          contentHash: digest.copy().digest('hex'),
+        })
+        : null,
+    });
   } finally {
     await sourceHandle.close();
   }
@@ -220,6 +270,12 @@ async function appendCompleteLines({
       throw new Error(`Backup target size changed during append: ${targetPath}`);
     }
     let writePosition = sourceOffset;
+    const bufferedWriter = createBufferedBackupWriter({
+      writeChunk: async (chunk) => {
+        await writeAll(targetHandle, chunk, writePosition);
+        writePosition += chunk.length;
+      },
+    });
     const scanResult = await scanCompleteRecords({
       sourceHandle,
       sourcePath,
@@ -228,13 +284,12 @@ async function appendCompleteLines({
       maxLineBytes,
       onRecord: async (line) => {
         if (line.length > 0) {
-          await writeAll(targetHandle, line, writePosition);
-          writePosition += line.length;
+          await bufferedWriter.append(line);
         }
-        await writeAll(targetHandle, NEWLINE, writePosition);
-        writePosition += 1;
+        await bufferedWriter.appendByte(NEWLINE_BYTE);
       },
     });
+    await bufferedWriter.flush();
     if (scanResult.committedByteCount > 0) {
       await sync(targetHandle);
     }

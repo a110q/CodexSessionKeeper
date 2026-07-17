@@ -32,8 +32,7 @@ function firstUserMessage(object) {
 }
 
 async function extractRecoveredThreadMetadata(record, recoveredPath, codexRoot) {
-  const text = await fs.promises.readFile(recoveredPath, 'utf8');
-  const lines = text.split(/\n/).filter((line) => line.trim()).slice(0, 400);
+  const lines = await firstRecoveredJsonlLines(recoveredPath);
   let firstTimestamp = null;
   let lastTimestamp = null;
   let userMessage = '';
@@ -110,6 +109,53 @@ async function extractRecoveredThreadMetadata(record, recoveredPath, codexRoot) 
     agentPath: null,
     codexRoot,
   };
+}
+
+async function firstRecoveredJsonlLines(filePath, limit = 400) {
+  const handle = await fs.promises.open(filePath, 'r');
+  const lines = [];
+  let pending = [];
+  let pendingLength = 0;
+  let position = 0;
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (lines.length < limit) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      const chunk = buffer.subarray(0, bytesRead);
+      position += bytesRead;
+      let start = 0;
+      for (let index = 0; index < chunk.length; index += 1) {
+        if (chunk[index] !== 0x0A) continue;
+        if (start < index) {
+          const segment = Buffer.from(chunk.subarray(start, index));
+          pending.push(segment);
+          pendingLength += segment.length;
+        }
+        if (pendingLength > 0) {
+          lines.push(Buffer.concat(pending, pendingLength).toString('utf8'));
+        }
+        pending = [];
+        pendingLength = 0;
+        if (lines.length === limit) return lines;
+        start = index + 1;
+      }
+      if (start < chunk.length) {
+        const segment = Buffer.from(chunk.subarray(start));
+        pending.push(segment);
+        pendingLength += segment.length;
+        if (pendingLength > 32 * 1024 * 1024) {
+          throw new Error('Recovered JSONL line exceeds 32 MiB.');
+        }
+      }
+    }
+    if (pendingLength > 0 && lines.length < limit) {
+      lines.push(Buffer.concat(pending, pendingLength).toString('utf8'));
+    }
+    return lines;
+  } finally {
+    await handle.close();
+  }
 }
 
 module.exports = {

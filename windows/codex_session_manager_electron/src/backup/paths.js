@@ -87,6 +87,7 @@ function backupPaths(input) {
     logPath: path.join(logsRoot, 'backup-agent.log'),
     logsRoot,
     manifestPath: path.join(backupRoot, 'manifest.json'),
+    verificationPath: path.join(backupRoot, 'verification.json'),
     pendingSourcesPath: path.join(stateRoot, 'pending-sources.json'),
     relativeBackupPath,
     repairQuarantineRoot: path.join(backupRoot, 'repair-quarantine'),

@@ -46,7 +46,7 @@ function createNasRuntime({
     }
     state = snapshotValue('validating', configuration);
     try {
-      const resolved = await nasService.resolve(configuration);
+      const resolved = await resolveWritable(configuration);
       if (!ownsLifecycle(generation)) return snapshot();
       await startAgent(resolved, 'startup', generation);
     } catch (error) {
@@ -83,7 +83,7 @@ function createNasRuntime({
       if (!ownsLifecycle(generation)) return snapshot();
       if (previous) {
         try {
-          const resolved = await nasService.resolve(previous);
+          const resolved = await resolveWritable(previous);
           if (!ownsLifecycle(generation)) return snapshot();
           await startAgent(resolved, 'activation', generation);
         } catch (restartError) {
@@ -122,7 +122,7 @@ function createNasRuntime({
     }
     state = snapshotValue('validating', configuration);
     try {
-      const resolved = await nasService.resolve(configuration);
+      const resolved = await resolveWritable(configuration);
       if (!ownsLifecycle(generation)) return snapshot();
       await startAgent(resolved, trigger, generation);
       return snapshot();
@@ -146,7 +146,7 @@ function createNasRuntime({
     lastAppliedCallbackSequence = 0;
     target = selectedTarget;
     state = snapshotValue(
-      initialStatus?.status === 'error' ? 'error' : 'running',
+      initialStatus?.status === 'error' ? 'error' : 'validating',
       selectedTarget.configuration,
       initialStatus?.lastError || null,
     );
@@ -183,6 +183,12 @@ function createNasRuntime({
       void Promise.resolve(created.performOneShotScan()).catch(() => {});
     }
     return true;
+  }
+
+  async function resolveWritable(configuration) {
+    const resolved = await nasService.resolve(configuration);
+    await nasService.verifyWritable(resolved);
+    return resolved;
   }
 
   function runLifecycleOperation(operation) {
@@ -270,9 +276,11 @@ function createNasRuntime({
 
   function recordProgress(progress, selectedTarget, generation, sequence) {
     if (!shouldApplyCallback(selectedTarget, generation, sequence)) return;
-    const progressState = progress?.pendingFiles > 0
-      ? (progress.phase === 'seeding' ? 'seeding' : 'pending')
-      : 'running';
+    const progressState = progress?.phase === 'verifying'
+      ? 'verifying'
+      : progress?.pendingFiles > 0
+        ? (progress.phase === 'seeding' ? 'seeding' : 'pending')
+        : state.state;
     state = snapshotValue(
       progressState,
       selectedTarget.configuration,
@@ -322,7 +330,7 @@ function createNasRuntime({
       status: state.state === 'unconfigured' ? 'waiting' : state.state,
       mode: 'polling',
     };
-    const runtimeOwnsStatus = ['validating', 'disconnected', 'seeding', 'pending'].includes(state.state);
+    const runtimeOwnsStatus = ['validating', 'disconnected', 'seeding', 'verifying', 'pending'].includes(state.state);
     return {
       ...base,
       status: runtimeOwnsStatus ? state.state : base.status,

@@ -9,9 +9,12 @@ const test = require('node:test');
 
 const { durableReplaceWithWriter } = require('../../src/backup/durable-write');
 const {
+  appendCompleteLines,
   rebuildCompleteLines,
   rangesMatch,
 } = require('../../src/backup/session-backup-streamer');
+
+const ONE_MIB = 1024 * 1024;
 
 async function makeFixture(t, contents = Buffer.alloc(0)) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'session-backup-streamer-'));
@@ -47,6 +50,38 @@ async function withTrackedReadSizes(filePath, operation) {
   }
 }
 
+async function withTrackedWriteSizes(targetPath, operation) {
+  const originalOpen = fs.open;
+  const writes = [];
+  const targetDirectory = path.resolve(path.dirname(targetPath));
+  const targetBasename = path.basename(targetPath);
+  fs.open = async function (openedPath, ...args) {
+    const handle = await originalOpen.call(fs, openedPath, ...args);
+    const resolved = path.resolve(String(openedPath));
+    const isTarget = resolved === path.resolve(targetPath)
+      || (path.dirname(resolved) === targetDirectory
+        && path.basename(resolved).startsWith(`.${targetBasename}.tmp-`));
+    if (isTarget) {
+      const originalWrite = handle.write.bind(handle);
+      handle.write = async (buffer, offset, length, position) => {
+        writes.push({ length, position });
+        return originalWrite(buffer, offset, length, position);
+      };
+    }
+    return handle;
+  };
+  try {
+    return { result: await operation(), writes };
+  } finally {
+    fs.open = originalOpen;
+  }
+}
+
+function manySmallRecords(minimumBytes) {
+  const record = '{"type":"event_msg","payload":{"type":"user_message","message":"buffer me"}}\n';
+  return Buffer.from(record.repeat(Math.ceil(minimumBytes / Buffer.byteLength(record))));
+}
+
 test('rebuild streams several chunks, excludes a partial record, and hashes committed bytes', async (t) => {
   const chunkSize = 7;
   const source = Buffer.from('a'.repeat(chunkSize * 4 + 3) + '\nsecond\npartial');
@@ -67,6 +102,38 @@ test('rebuild streams several chunks, excludes a partial record, and hashes comm
   });
   assert.ok(readSizes.length > 3);
   assert.ok(readSizes.every((size) => size <= chunkSize));
+});
+
+test('rebuild batches many small records into one MiB writes', async (t) => {
+  const source = manySmallRecords(ONE_MIB * 3 + 17);
+  const { sourcePath, targetPath } = await makeFixture(t, source);
+
+  const { writes } = await withTrackedWriteSizes(targetPath, () => rebuildCompleteLines({
+    sourcePath,
+    targetPath,
+  }));
+
+  assert.deepEqual(await fs.readFile(targetPath), source);
+  assert.ok(writes.length <= Math.ceil(source.length / ONE_MIB));
+  assert.ok(writes.every(({ length }) => length > 0 && length <= ONE_MIB));
+});
+
+test('append batches many small records into positioned one MiB writes', async (t) => {
+  const prefix = Buffer.from('{"type":"event_msg","payload":{"message":"existing"}}\n');
+  const appended = manySmallRecords(ONE_MIB * 2 + 17);
+  const { sourcePath, targetPath } = await makeFixture(t, Buffer.concat([prefix, appended]));
+  await fs.writeFile(targetPath, prefix);
+
+  const { writes } = await withTrackedWriteSizes(targetPath, () => appendCompleteLines({
+    sourcePath,
+    sourceOffset: prefix.length,
+    targetPath,
+  }));
+
+  assert.deepEqual(await fs.readFile(targetPath), Buffer.concat([prefix, appended]));
+  assert.ok(writes.length <= Math.ceil(appended.length / ONE_MIB));
+  assert.ok(writes.every(({ length }) => length > 0 && length <= ONE_MIB));
+  assert.equal(writes[0].position, prefix.length);
 });
 
 test('rebuild accepts a legal 32 MiB line spanning bounded chunks', async (t) => {

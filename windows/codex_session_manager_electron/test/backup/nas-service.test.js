@@ -78,6 +78,26 @@ test('recovery devices are resolved by marker ID and unknown IDs are rejected', 
   );
 });
 
+test('saved target resolution is read-only and writable probing is explicit', async (t) => {
+  const fixture = await makeFixture(t);
+  await fixture.employee('运营部', '陈超');
+  let probeIds = 0;
+  const service = fixture.service({
+    randomUUID: () => {
+      probeIds += 1;
+      return '11111111-1111-1111-1111-111111111111';
+    },
+  });
+  const activated = await service.activate({ department: '运营部', employee: '陈超' });
+  probeIds = 0;
+
+  const resolved = await service.resolve(activated.configuration);
+
+  assert.equal(probeIds, 0);
+  await service.verifyWritable(resolved);
+  assert.equal(probeIds, 1);
+});
+
 async function makeFixture(t) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'nas-service-test-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
@@ -103,7 +123,7 @@ async function makeFixture(t) {
           server: identity.server || COMPANY_NAS.server,
           share: identity.share || COMPANY_NAS.share
         }),
-        randomUUID: () => '11111111-1111-1111-1111-111111111111',
+        randomUUID: identity.randomUUID || (() => '11111111-1111-1111-1111-111111111111'),
         deviceName: () => 'Runtime Mac',
         now: () => new Date('2026-07-13T00:00:00Z')
       });

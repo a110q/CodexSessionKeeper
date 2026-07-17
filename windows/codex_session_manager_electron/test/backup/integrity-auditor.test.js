@@ -16,6 +16,7 @@ const {
   validateWindowsSourceNamespace,
 } = require('../../src/backup/integrity-auditor');
 const { backupPaths } = require('../../src/backup/paths');
+const { loadVerification } = require('../../src/backup/verification-store');
 
 const DEVICE_ID = '00000000-0000-0000-0000-000000000001';
 const DUE_DATE = new Date('2026-07-14T04:05:06.000Z');
@@ -142,6 +143,7 @@ class IntegrityFixture {
     return {
       sessionId: this.sessionId,
       sourcePath: this.sourcePath,
+      sourceFileIdentity: null,
       backupPath: path.join('sessions', `${this.sessionId}.jsonl`),
       lastByteOffset: this.committed.length,
       lastSourceSize: this.committed.length + this.localTail.length,
@@ -364,6 +366,11 @@ test('equal multi-chunk audit stops at the committed offset and ignores a partia
   assert.deepEqual(await fs.readFile(fixture.targetPath), committed);
   assert.equal((await fixture.loadManifest()).sessions[fixture.sessionId].contentHash, sha256(committed));
   assert.equal((await fixture.loadAuditState()).lastCompletedAt, fixture.now.toISOString());
+  const verification = await loadVerification(fixture.paths.verificationPath);
+  assert.equal(verification.sessions[fixture.sessionId].byteCount, committed.length);
+  assert.equal(verification.sessions[fixture.sessionId].lineCount, fixture.cursor.lineCount);
+  assert.ok(verification.sessions[fixture.sessionId].chunkHashes.length > 0);
+  assert.equal(verification.sessions[fixture.sessionId].verifiedAt, fixture.now.toISOString());
 });
 
 test('legacy moved-session cursor is removed while the current cursor is audited', async (t) => {
@@ -482,6 +489,80 @@ test('corruption in every bounded chunk is detected and repaired', async (t) => 
     assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 1 });
     assert.deepEqual(await fs.readFile(fixture.targetPath), committed);
   }
+});
+
+test('repair readback failure retries once before replacing the formal target', async (t) => {
+  const committed = multiChunkJSONL();
+  let repairWriteAttempts = 0;
+  let injected = false;
+  const fixture = await IntegrityFixture.create(t, {
+    committed,
+    corrupted: true,
+    instrumentation: {
+      didStreamChunk: async (phase, filePath, offset, length) => {
+        if (phase === 'repairTemporary' && offset === 0 && length > 0) {
+          repairWriteAttempts += 1;
+        }
+        if (phase !== 'repairTemporaryVerification' || offset !== 0 || injected) return;
+        injected = true;
+        const handle = await fs.open(filePath, 'r+');
+        try {
+          await handle.write(Buffer.from([0]), 0, 1, 1024 * 1024 + 17);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      },
+    },
+  });
+
+  assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 1 });
+  assert.equal(repairWriteAttempts, 2);
+  assert.deepEqual(await fs.readFile(fixture.targetPath), committed);
+});
+
+test('two repair readback failures preserve the formal backup and metadata', async (t) => {
+  const committed = multiChunkJSONL();
+  let remainingFailures = 2;
+  let repairWriteAttempts = 0;
+  const fixture = await IntegrityFixture.create(t, {
+    committed,
+    corrupted: true,
+    instrumentation: {
+      didStreamChunk: async (phase, filePath, offset, length) => {
+        if (phase === 'repairTemporary' && offset === 0 && length > 0) {
+          repairWriteAttempts += 1;
+        }
+        if (phase !== 'repairTemporaryVerification' || offset !== 0 || remainingFailures === 0) return;
+        remainingFailures -= 1;
+        const handle = await fs.open(filePath, 'r+');
+        try {
+          await handle.write(Buffer.from([0]), 0, 1, 1024 * 1024 + 17);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      },
+    },
+  });
+  const before = await Promise.all([
+    fs.readFile(fixture.targetPath),
+    fs.readFile(fixture.paths.manifestPath),
+    fs.readFile(fixture.paths.cursorDatabasePath),
+    fs.readFile(fixture.paths.auditStatePath),
+  ]);
+
+  await assert.rejects(fixture.run());
+
+  assert.equal(repairWriteAttempts, 2);
+  const after = await Promise.all([
+    fs.readFile(fixture.targetPath),
+    fs.readFile(fixture.paths.manifestPath),
+    fs.readFile(fixture.paths.cursorDatabasePath),
+    fs.readFile(fixture.paths.auditStatePath),
+  ]);
+  assert.deepEqual(after, before);
+  assert.equal(await exists(fixture.paths.verificationPath), false);
 });
 
 test('interruption discards buffered state and restarts the file at byte zero', async (t) => {

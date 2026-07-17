@@ -73,6 +73,10 @@ const els = {
   backupStatusDetail: $('#backupStatusDetail'),
   nasStatusRetryBtn: $('#nasStatusRetryBtn'),
   nasReconfigureBtn: $('#nasReconfigureBtn'),
+  launchAtLoginWarning: $('#launchAtLoginWarning'),
+  launchAtLoginMessage: $('#launchAtLoginMessage'),
+  retryLaunchAtLoginBtn: $('#retryLaunchAtLoginBtn'),
+  openLoginItemSettingsBtn: $('#openLoginItemSettingsBtn'),
   nasSetupModal: $('#nasSetupModal'),
   nasDetectionBadge: $('#nasDetectionBadge'),
   nasSetupError: $('#nasSetupError'),
@@ -533,6 +537,36 @@ async function retryNasBackup() {
   }
 }
 
+function applyLaunchAtLoginState(launchAtLogin) {
+  state.nasSetup = { ...state.nasSetup, launchAtLogin };
+  state.backupStatus = {
+    ...state.backupStatus,
+    autoStartEnabled: Boolean(launchAtLogin?.enabled),
+    launchAtLogin,
+  };
+}
+
+async function retryLaunchAtLogin() {
+  try {
+    const launchAtLogin = await window.codexManager.retryLaunchAtLogin();
+    applyLaunchAtLoginState(launchAtLogin);
+    renderBackupStatus();
+    showToast(launchAtLogin.enabled ? '开机自启已启用' : (launchAtLogin.message || '无法启用开机自启'), !launchAtLogin.enabled);
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
+}
+
+async function openLoginItemSettings() {
+  try {
+    const launchAtLogin = await window.codexManager.openLoginItemSettings();
+    applyLaunchAtLoginState(launchAtLogin);
+    renderBackupStatus();
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
+}
+
 async function loadNasRecoveryDevices() {
   state.nasRecoveryDevices = (await window.codexManager.listNasBackupDevices() || [])
     .sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent) || String(a.deviceName).localeCompare(String(b.deviceName), 'zh-CN'));
@@ -549,11 +583,13 @@ async function loadNasRecoveryDevices() {
 
 function renderBackupStatus() {
   const backup = state.backupStatus || {};
+  const launchAtLogin = backup.launchAtLogin || state.nasSetup?.launchAtLogin || {};
   const status = backup.status || 'waiting';
   const mode = backup.mode || 'unknown';
   const labels = {
-    running: '运行中',
+    running: '备份已验证',
     seeding: '首次备份中',
+    verifying: '正在校验',
     pending: '正在补传',
     validating: '正在验证',
     disconnected: 'NAS 未连接',
@@ -565,7 +601,7 @@ function renderBackupStatus() {
     ? 'running'
     : status === 'error' || status === 'disconnected'
       ? 'error'
-      : ['seeding', 'pending', 'validating'].includes(status)
+      : ['seeding', 'pending', 'validating', 'verifying'].includes(status)
         ? 'working'
         : 'waiting';
   els.backupStatusText.textContent = labels[status] || '等待中';
@@ -575,11 +611,16 @@ function renderBackupStatus() {
   const progress = backup.progress;
   els.backupStatusDetail.textContent = backup.lastError
     ? backup.lastError
+    : status === 'verifying'
+      ? `正在回读校验已上传备份 · ${progress?.completedFiles || 0} / ${progress?.totalFiles || 0}`
     : progress?.pendingFiles > 0
       ? `已处理 ${progress.completedFiles || 0} / ${progress.totalFiles || 0}，剩余 ${progress.pendingFiles}`
     : `模式：${mode} · 最近备份：${lastBackup} · 会话：${backup.sessionCount || 0}`;
   els.nasStatusRetryBtn.classList.toggle('hidden', !['disconnected', 'error', 'waiting'].includes(status));
   els.nasReconfigureBtn.classList.toggle('hidden', !state.nasSetup?.configured);
+  const launchWarningVisible = Boolean(state.nasSetup?.configured && !launchAtLogin.enabled);
+  els.launchAtLoginWarning.classList.toggle('hidden', !launchWarningVisible);
+  els.launchAtLoginMessage.textContent = launchAtLogin.message || '开机自启尚未启用；关闭窗口后备份将无法长期常驻。';
   renderNasSetup();
 }
 
@@ -1684,6 +1725,8 @@ els.nasRetryBtn.addEventListener('click', detectAndLoadNasCatalogs);
 els.nasConfirmBtn.addEventListener('click', activateNasBackup);
 els.nasStatusRetryBtn.addEventListener('click', retryNasBackup);
 els.nasReconfigureBtn.addEventListener('click', () => beginNasSetup(true));
+els.retryLaunchAtLoginBtn.addEventListener('click', retryLaunchAtLogin);
+els.openLoginItemSettingsBtn.addEventListener('click', openLoginItemSettings);
 els.nasCancelReconfigureBtn.addEventListener('click', () => {
   state.nasReconfiguring = false;
   state.nasUiError = '';

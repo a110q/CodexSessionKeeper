@@ -60,7 +60,7 @@ test('disconnected startup schedules 30 second retry and reconnect starts one ag
   harness.connected.value = true;
   await harness.fireRetry();
   assert.equal(harness.created.length, 1);
-  assert.equal(harness.runtime.snapshot().state, 'running');
+  assert.equal(harness.runtime.snapshot().state, 'validating');
   assert.deepEqual(harness.created[0].pollingIntervals, [30000]);
   assert.deepEqual(harness.created[0].triggers, ['reconnect']);
 });
@@ -75,6 +75,19 @@ test('manual retry revalidates and restarts current agent', async () => {
   assert.equal(harness.created[0].stopped, true);
   assert.equal(harness.created[1].started, true);
   assert.deepEqual(harness.created[1].triggers, ['activation']);
+});
+
+test('startup performs one explicit write probe while periodic target validation stays read-only', async () => {
+  const harness = runtimeHarness({ saved: configuration('运营部', '陈超') });
+
+  await harness.runtime.initialize();
+  assert.equal(harness.writableChecks, 1);
+  const settled = harness.sideEffectCounts();
+
+  await harness.created[0].validateTarget();
+
+  assert.equal(harness.writableChecks, 1);
+  assert.equal(harness.sideEffectCounts().resolveCalls, settled.resolveCalls + 1);
 });
 
 test('failed reconfiguration preserves settings and restarts previous validated target', async () => {
@@ -93,15 +106,21 @@ test('failed reconfiguration preserves settings and restarts previous validated 
   assert.equal(harness.created[1].target.configuration.employee, '陈超');
 });
 
-test('agent progress exposes seeding and pending states for exit protection', async () => {
+test('verified state requires final status after readback progress', async () => {
   const harness = runtimeHarness({ saved: configuration('运营部', '陈超') });
   await harness.runtime.initialize();
 
+  assert.equal(harness.runtime.snapshot().state, 'validating');
   harness.created[0].report({ phase: 'seeding', totalFiles: 3, completedFiles: 1, pendingFiles: 2 });
   assert.equal(harness.runtime.snapshot().state, 'seeding');
   harness.created[0].report({ phase: 'scanning', totalFiles: 3, completedFiles: 2, pendingFiles: 1 });
   assert.equal(harness.runtime.snapshot().state, 'pending');
+  harness.created[0].report({ phase: 'verifying', totalFiles: 3, completedFiles: 2, pendingFiles: 1 });
+  assert.equal(harness.runtime.snapshot().state, 'verifying');
+  assert.equal(harness.runtime.backupStatus().status, 'verifying');
   harness.created[0].report({ phase: 'scanning', totalFiles: 3, completedFiles: 3, pendingFiles: 0 });
+  assert.equal(harness.runtime.snapshot().state, 'verifying');
+  harness.created[0].reportStatus({ status: 'running', mode: 'polling', lastError: null });
   assert.equal(harness.runtime.snapshot().state, 'running');
 });
 
@@ -123,7 +142,7 @@ test('persisted status is loaded once and repeated renderer status reads are mem
   for (let index = 0; index < 100; index += 1) {
     assert.deepEqual(harness.runtime.backupStatus(), {
       ...savedStatus,
-      status: 'running',
+      status: 'validating',
       lastError: null,
       progress: null,
     });
@@ -262,6 +281,7 @@ function runtimeHarness(options = {}) {
   const delays = [];
   const scheduled = [];
   let resolveCalls = 0;
+  let writableChecks = 0;
   let pathCalls = 0;
   let statusReads = 0;
   const nasService = {
@@ -275,7 +295,8 @@ function runtimeHarness(options = {}) {
       await options.beforeResolve?.({ call: resolveCalls, configuration: configurationValue });
       if (!connected.value) throw new Error('NAS disconnected');
       return target(configurationValue, configurationValue.department, configurationValue.employee);
-    }
+    },
+    async verifyWritable() { writableChecks += 1; },
   };
   const runtime = createNasRuntime({
     nasService,
@@ -293,7 +314,7 @@ function runtimeHarness(options = {}) {
       return options.persistedStatus ? structuredClone(options.persistedStatus) : null;
     },
     callbackDelivery: options.callbackDelivery,
-    agentFactory: ({ target: selectedTarget, paths, onProgress, onStatus }) => {
+    agentFactory: ({ target: selectedTarget, paths, validateTarget, onProgress, onStatus }) => {
       const agent = {
         target: selectedTarget,
         paths,
@@ -304,6 +325,7 @@ function runtimeHarness(options = {}) {
         triggers: [],
         report: onProgress,
         reportStatus: onStatus,
+        validateTarget,
         async start() { this.started = true; },
         startPolling(interval) { this.started = true; this.pollingIntervals.push(interval); },
         requestImmediateScan(trigger) { this.triggers.push(trigger); },
@@ -324,6 +346,7 @@ function runtimeHarness(options = {}) {
     connected,
     created,
     delays,
+    get writableChecks() { return writableChecks; },
     get statusReads() { return statusReads; },
     sideEffectCounts() {
       return { settingsLoads, resolveCalls, pathCalls, statusReads, created: created.length };

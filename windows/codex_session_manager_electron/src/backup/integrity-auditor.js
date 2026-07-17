@@ -5,6 +5,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 
 const { CursorStore } = require('./cursor-store');
+const { verifyFullBackupFile } = require('./backup-file-verifier');
 const {
   durableReplaceWithWriter,
   publishSyncedTemporaryFileIfAbsent,
@@ -15,6 +16,7 @@ const { INTEGRITY_REPAIR_JOURNAL_VERSION } = require('./models');
 const { assertSafeDestinationPath, assertSafeSourcePath } = require('./restore-filesystem');
 const { rebuildSessionCompleteLines } = require('./session-backup-streamer');
 const { sessionIdFromPath } = require('./session-identity');
+const { loadVerification, saveVerification } = require('./verification-store');
 
 const MAXIMUM_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_CHUNK_SIZE = MAXIMUM_CHUNK_SIZE;
@@ -153,6 +155,11 @@ class BackupIntegrityAuditor {
       manifest.updatedAt = auditDate.toISOString();
       await saveManifest(this.paths, manifest);
     }
+    await this.refreshVerification({
+      manifest,
+      cursorsBySession: currentCursorsBySession,
+      verifiedAt: auditDate,
+    });
     if (staleCursorSourcePaths.size > 0) {
       const store = this.cursorStoreFactory(this.paths);
       await store.open();
@@ -178,6 +185,40 @@ class BackupIntegrityAuditor {
     });
     await this.saveAuditState(state);
     return outcome('completed', checked, repaired);
+  }
+
+  async refreshVerification({ manifest, cursorsBySession, verifiedAt }) {
+    if (cursorsBySession.size === 0) return;
+    const verificationPath = this.paths.verificationPath
+      || path.join(this.paths.backupRoot, 'verification.json');
+    const document = await loadVerification(verificationPath);
+    const original = JSON.stringify(document);
+    for (const sessionId of [...cursorsBySession.keys()].sort()) {
+      const cursor = cursorsBySession.get(sessionId);
+      const record = manifest.sessions?.[sessionId];
+      if (!record
+        || cursor.backupPath !== record.backupPath
+        || cursor.lastByteOffset !== record.bytesBackedUp) continue;
+      const relativeBackupPath = validateRelativeBackupPath(record.backupPath);
+      const targetPath = path.resolve(this.paths.backupRoot, ...relativeBackupPath.split('/'));
+      const result = await verifyFullBackupFile({
+        filePath: targetPath,
+        chunkSize: document.chunkSize,
+        expectedByteCount: record.bytesBackedUp,
+        expectedLineCount: record.lineCount,
+        expectedContentHash: record.contentHash || null,
+      });
+      document.sessions[sessionId] = {
+        backupPath: relativeBackupPath,
+        byteCount: result.byteCount,
+        lineCount: result.lineCount,
+        chunkHashes: result.chunkHashes,
+        verifiedAt: verifiedAt.toISOString(),
+      };
+    }
+    if (JSON.stringify(document) !== original) {
+      await saveVerification(verificationPath, document);
+    }
   }
 
   async recordInitialSeedCompleted(at) {
@@ -344,32 +385,40 @@ class BackupIntegrityAuditor {
     let quarantine;
     let repairHash;
     try {
-      const rebuilt = await rebuildSessionCompleteLines({
-        sourcePath: revalidated.sourcePath,
-        targetPath: repairTemporary,
-        maximumOffset: revalidated.cursor.lastByteOffset,
-        chunkSize: this.chunkSize,
-        interruptionRequested,
-        onChunk: async (offset, length) => {
-          await this.didStreamChunk('repairTemporary', revalidated.sourcePath, offset, length);
-        },
-        sync: async (handle) => {
-          await this.checkpoint('beforeTemporaryFlush');
-          await this.sync(handle);
-        },
-      });
-      if (rebuilt.committedByteCount !== revalidated.cursor.lastByteOffset
-        || rebuilt.pendingPartialLine || rebuilt.blockedError) {
-        throw new Error(`Integrity repair rejected structurally invalid committed JSONL: ${revalidated.sourcePath}`);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const rebuilt = await rebuildSessionCompleteLines({
+          sourcePath: revalidated.sourcePath,
+          targetPath: repairTemporary,
+          maximumOffset: revalidated.cursor.lastByteOffset,
+          chunkSize: this.chunkSize,
+          interruptionRequested,
+          onChunk: async (offset, length) => {
+            await this.didStreamChunk('repairTemporary', revalidated.sourcePath, offset, length);
+          },
+          sync: async (handle) => {
+            await this.checkpoint('beforeTemporaryFlush');
+            await this.sync(handle);
+          },
+        });
+        if (rebuilt.committedByteCount !== revalidated.cursor.lastByteOffset
+          || rebuilt.pendingPartialLine || rebuilt.blockedError) {
+          throw new Error(`Integrity repair rejected structurally invalid committed JSONL: ${revalidated.sourcePath}`);
+        }
+        repairHash = rebuilt.contentHash;
+        try {
+          await this.verifyFile(repairTemporary, {
+            expectedByteCount: revalidated.cursor.lastByteOffset,
+            expectedHash: repairHash,
+            phase: 'repairTemporaryVerification',
+            interruptionRequested,
+            validateJSON: true,
+          });
+          break;
+        } catch (error) {
+          await fsp.rm(repairTemporary, { force: true }).catch(() => {});
+          if (isInterrupted(error) || attempt === 1) throw error;
+        }
       }
-      repairHash = rebuilt.contentHash;
-      await this.verifyFile(repairTemporary, {
-        expectedByteCount: revalidated.cursor.lastByteOffset,
-        expectedHash: repairHash,
-        phase: 'repairTemporaryVerification',
-        interruptionRequested,
-        validateJSON: true,
-      });
 
       if (!revalidated.targetExists) {
         return await this.installMissingTarget({

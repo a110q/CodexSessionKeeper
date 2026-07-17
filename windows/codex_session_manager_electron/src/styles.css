@@ -258,6 +258,17 @@ p {
   align-items: center;
 }
 
+.startup-warning {
+  display: grid;
+  gap: 7px;
+  padding-top: 8px;
+  border-top: 1px solid var(--separator-soft);
+}
+
+.startup-warning small {
+  color: var(--danger);
+}
+
 .text-button {
   padding: 0;
   color: var(--blue);

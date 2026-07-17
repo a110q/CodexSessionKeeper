@@ -56,7 +56,7 @@ function createNasService({
     const mount = await detect();
     const departmentRoot = await directDirectory(mount.trustedRoot, department);
     const employeeRoot = await directDirectory(departmentRoot, employee);
-    await verifyWritable(employeeRoot);
+    await verifyDirectoryWritable(employeeRoot);
     const selectedDeviceId = String(previous?.deviceId || randomUUID()).toLowerCase();
     const selectedDeviceName = previous?.deviceName || deviceName();
     const devicesRoot = await managedDirectory(employeeRoot, 'devices');
@@ -86,7 +86,7 @@ function createNasService({
       });
     }
     const backupRoot = await managedDirectory(deviceRoot, 'incremental-backups');
-    await verifyWritable(deviceRoot);
+    await verifyDirectoryWritable(deviceRoot);
     return Object.freeze({ configuration, employeeRoot, deviceRoot, backupRoot });
   }
 
@@ -106,8 +106,19 @@ function createNasService({
       throw new Error(`NAS device marker mismatch: ${deviceRoot}`);
     }
     const backupRoot = await directDirectory(deviceRoot, 'incremental-backups');
-    await verifyWritable(deviceRoot);
     return Object.freeze({ configuration: Object.freeze({ ...configuration }), employeeRoot, deviceRoot, backupRoot });
+  }
+
+  async function verifyWritable(target) {
+    if (!target?.deviceRoot || !target?.backupRoot) {
+      throw new Error('NAS target is missing trusted device paths.');
+    }
+    const deviceRoot = await validateDirectory(target.deviceRoot);
+    const backupRoot = await directDirectory(deviceRoot, 'incremental-backups');
+    if (!samePath(backupRoot, target.backupRoot)) {
+      throw new Error(`NAS backup root changed during write validation: ${target.backupRoot}`);
+    }
+    await verifyDirectoryWritable(deviceRoot);
   }
 
   async function recoveryDevices(configuration) {
@@ -241,7 +252,7 @@ function createNasService({
     }
   }
 
-  async function verifyWritable(directory) {
+  async function verifyDirectoryWritable(directory) {
     const probeRoot = pathImpl.join(directory, `.codex-session-keeper-probe-${randomUUID()}`);
     const source = pathImpl.join(probeRoot, 'write-test');
     const renamed = pathImpl.join(probeRoot, 'rename-test');
@@ -312,6 +323,7 @@ function createNasService({
     employees,
     activate,
     resolve,
+    verifyWritable,
     recoveryDevices,
     resolveDevice,
   });

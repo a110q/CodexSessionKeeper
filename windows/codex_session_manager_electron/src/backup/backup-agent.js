@@ -12,6 +12,13 @@ const {
 } = require('./integrity-auditor');
 const { AGENT_VERSION, MANIFEST_VERSION } = require('./models');
 const { loadOrCreateManifest, saveManifest } = require('./manifest-store');
+const {
+  BackupFileVerificationError,
+  verifyAppendSourceAnchors,
+  verifyChangedBackupChunks,
+  verifyFullBackupFile,
+} = require('./backup-file-verifier');
+const { loadVerification, saveVerification } = require('./verification-store');
 const { sessionIdFromPath } = require('./session-identity');
 const {
   appendCompleteLines,
@@ -22,6 +29,8 @@ const {
 
 const ACTIVE_STATUS = 'active';
 const AUDIT_INTERVAL_MS = 86400 * 1000;
+const DEFAULT_HEALTH_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_REMOTE_HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000;
 
 class BackupAgent {
   constructor({
@@ -40,6 +49,9 @@ class BackupAgent {
     cancelAuditTimer = clearTimeout,
     scheduleInterval = setInterval,
     cancelInterval = clearInterval,
+    healthCheckIntervalMs = DEFAULT_HEALTH_CHECK_INTERVAL_MS,
+    remoteHeartbeatIntervalMs = DEFAULT_REMOTE_HEARTBEAT_INTERVAL_MS,
+    autoStartEnabled = () => false,
   } = {}) {
     if (!paths) {
       throw new Error('BackupAgent requires paths.');
@@ -50,6 +62,12 @@ class BackupAgent {
     this.validateTarget = validateTarget;
     this.fileCommitter = fileCommitter;
     this.cachedStatus = initialStatus ? { ...initialStatus } : null;
+    this.healthCheckIntervalMs = positiveInterval(healthCheckIntervalMs, 'healthCheckIntervalMs');
+    this.remoteHeartbeatIntervalMs = positiveInterval(remoteHeartbeatIntervalMs, 'remoteHeartbeatIntervalMs');
+    this.autoStartEnabled = autoStartEnabled;
+    this.lastHealthCheckAt = parseOptionalDate(initialStatus?.lastHeartbeatAt);
+    this.lastRemoteHeartbeatAt = parseOptionalDate(initialStatus?.lastHeartbeatAt);
+    this.settledSourceSnapshot = null;
     this.auditLastCompletedAt = initialStatus?.lastAuditAt ?? null;
     this.onProgress = onProgress;
     this.onStatus = onStatus;
@@ -69,6 +87,7 @@ class BackupAgent {
     this.auditPromise = null;
     this.auditScanDeferred = null;
     this.timerPreflightPromise = null;
+    this.idleMaintenancePromise = null;
     this.auditInterruptionEpoch = 0;
     this.auditTimer = null;
     this.auditTimerGeneration = 0;
@@ -111,7 +130,12 @@ class BackupAgent {
 
   async stopAndAwaitQuiescence(timeoutMs = 100) {
     this.stop();
-    const active = [this.scanPromise, this.auditPromise, this.timerPreflightPromise].filter(Boolean);
+    const active = [
+      this.scanPromise,
+      this.auditPromise,
+      this.timerPreflightPromise,
+      this.idleMaintenancePromise,
+    ].filter(Boolean);
     if (active.length === 0) return true;
     let timeout;
     try {
@@ -130,8 +154,8 @@ class BackupAgent {
   requestImmediateScan(trigger) {
     if (this.stopped) return Promise.resolve(null);
     this.instrumentation.scanRequested?.(trigger);
-    const scan = trigger === 'timer' && this.auditPromise
-      ? this.requestTimerScanDuringAudit()
+    const scan = trigger === 'timer'
+      ? this.requestTimerTick()
       : this.performOneShotScan();
     return scan.finally(() => {
       if (this.stopped) return;
@@ -140,7 +164,7 @@ class BackupAgent {
     });
   }
 
-  requestTimerScanDuringAudit() {
+  requestTimerTick() {
     if (this.timerPreflightPromise) return this.timerPreflightPromise;
     const preflight = (async () => {
       let hasPendingWork;
@@ -149,9 +173,13 @@ class BackupAgent {
       } catch {
         hasPendingWork = true;
       }
-      if (!hasPendingWork || this.stopped) return null;
-      if (this.auditScanDeferred) return this.auditScanDeferred.promise;
-      return this.performOneShotScan();
+      if (this.stopped) return null;
+      if (hasPendingWork) {
+        if (this.auditScanDeferred) return this.auditScanDeferred.promise;
+        return this.performOneShotScan();
+      }
+      if (this.auditPromise || this.scanPromise) return null;
+      return this.performIdleMaintenanceIfDue();
     })();
     this.timerPreflightPromise = preflight;
     preflight.then(
@@ -166,31 +194,30 @@ class BackupAgent {
   }
 
   async timerPreflightHasPendingWork() {
-    const store = new CursorStore({ paths: this.paths });
-    await store.open();
-    try {
-      const cursors = store.all();
-      const processedSessionIds = new Set();
-      for (const sourcePath of await this.discoverSessionFiles()) {
-        const sessionId = sessionIdFromPath(sourcePath);
-        if (!sessionId || processedSessionIds.has(sessionId)) continue;
-        processedSessionIds.add(sessionId);
-        const sourceStats = await trustedSourceMetadata(sourcePath);
-        if (!timerPreflightIsUnchanged({
-          sourcePath,
-          sourceStats,
-          cursor: cursors.get(sourcePath) || null,
-        })) {
-          return true;
-        }
+    const settled = this.settledSourceSnapshot;
+    if (!settled) return true;
+    const current = new Map();
+    const processedSessionIds = new Set();
+    for (const sourcePath of await this.discoverSessionFiles()) {
+      const sessionId = sessionIdFromPath(sourcePath);
+      if (!sessionId || processedSessionIds.has(sessionId)) continue;
+      processedSessionIds.add(sessionId);
+      const sourceStats = await trustedSourceMetadata(sourcePath);
+      const previous = settled.get(sourcePath);
+      if (!previous
+        || previous.size !== sourceStats.size
+        || previous.modifiedAt !== sourceStats.modifiedAt
+        || previous.fileIdentity !== sourceStats.fileIdentity) {
+        return true;
       }
-      return false;
-    } finally {
-      await store.close();
+      current.set(sourcePath, sourceStats);
     }
+    return current.size !== settled.size;
   }
 
   async performOneShotScan() {
+    if (this.stopped) return null;
+    if (this.idleMaintenancePromise) await this.idleMaintenancePromise;
     if (this.stopped) return null;
     this.requestAuditInterruption();
     if (this.auditPromise) {
@@ -198,6 +225,46 @@ class BackupAgent {
       return this.auditScanDeferred.promise;
     }
     return this.startOneShotScan();
+  }
+
+  async performIdleMaintenanceIfDue() {
+    if (this.stopped) return null;
+    if (this.idleMaintenancePromise) return this.idleMaintenancePromise;
+    const maintenance = this.performIdleMaintenanceLocked();
+    this.idleMaintenancePromise = maintenance;
+    try {
+      return await maintenance;
+    } catch (error) {
+      await this.writeLocalErrorStatus(error).catch(() => {});
+      throw error;
+    } finally {
+      if (this.idleMaintenancePromise === maintenance) this.idleMaintenancePromise = null;
+    }
+  }
+
+  async performIdleMaintenanceLocked() {
+    const date = this.now();
+    const healthDue = intervalIsDue(this.lastHealthCheckAt, date, this.healthCheckIntervalMs);
+    const heartbeatDue = intervalIsDue(this.lastRemoteHeartbeatAt, date, this.remoteHeartbeatIntervalMs);
+    if (!healthDue && !heartbeatDue) return null;
+
+    await this.validateTarget(this.paths);
+    this.lastHealthCheckAt = date;
+    if (!heartbeatDue) return null;
+
+    const existing = this.cachedStatus || await loadStatus(this.paths.localStatusPath);
+    if (!existing) return null;
+    const snapshot = {
+      ...existing,
+      autoStartEnabled: Boolean(this.autoStartEnabled()),
+      lastHeartbeatAt: date.toISOString(),
+    };
+    await replaceFileDurably(this.paths.remoteStatusPath, jsonPayload(snapshot));
+    this.instrumentation.remoteStatusWrite?.(this.paths.remoteStatusPath);
+    await replaceFileDurably(this.paths.localStatusPath, jsonPayload(snapshot));
+    this.lastRemoteHeartbeatAt = date;
+    this.publishStatus(snapshot);
+    return snapshot;
   }
 
   async startOneShotScan() {
@@ -357,6 +424,8 @@ class BackupAgent {
     try {
       const cursorMap = cursorStore.all();
       const manifest = loadOrCreateManifest(this.paths, scanDate);
+      const verification = await loadVerification(this.paths.verificationPath);
+      const originalVerification = JSON.stringify(verification);
       let manifestChanged = !manifestExisted;
       for (const [key, value] of [
         ['version', MANIFEST_VERSION],
@@ -378,6 +447,7 @@ class BackupAgent {
         phase,
       });
       const processedSessionIds = new Set();
+      const nextSettledSourceSnapshot = new Map();
       const updatedCursors = [];
       const staleCursorSourcePaths = [];
       const scanErrors = [];
@@ -401,10 +471,18 @@ class BackupAgent {
           currentCursor: cursorMap.get(sourcePath) || null,
           cursorMap,
           manifest,
+          verification,
+          onVerifying: () => this.onProgress?.({
+            totalFiles: sources.length,
+            completedFiles,
+            pendingFiles: Math.max(0, sources.length - completedFiles),
+            phase: 'verifying',
+          }),
           scanDate,
           sessionId,
           sourcePath,
         });
+        nextSettledSourceSnapshot.set(sourcePath, result.sourceStats);
         manifestChanged ||= result.manifestChanged;
         if (result.cursor) {
           updatedCursors.push(result.cursor);
@@ -431,6 +509,9 @@ class BackupAgent {
         }
       }
 
+      if (JSON.stringify(verification) !== originalVerification) {
+        await saveVerification(this.paths.verificationPath, verification);
+      }
       if (manifestChanged) {
         manifest.updatedAt = scanDate.toISOString();
         await saveManifest(this.paths, manifest);
@@ -464,6 +545,7 @@ class BackupAgent {
       if (scanErrors.length === 0) {
         await integrityAuditor.recordInitialSeedCompleted(scanDate);
         this.auditLastCompletedAt ??= scanDate.toISOString();
+        this.settledSourceSnapshot = nextSettledSourceSnapshot;
       }
       return manifest;
     } finally {
@@ -510,7 +592,16 @@ class BackupAgent {
     return pending;
   }
 
-  async processSessionFile({ sourcePath, sessionId, scanDate, manifest, currentCursor, cursorMap }) {
+  async processSessionFile({
+    sourcePath,
+    sessionId,
+    scanDate,
+    manifest,
+    verification,
+    onVerifying,
+    currentCursor,
+    cursorMap,
+  }) {
     const sourceStats = await trustedSourceMetadata(sourcePath);
     const existingRecord = manifest.sessions[sessionId] || null;
     const migratedCursor = this.migratedCursor(existingRecord, sourcePath, cursorMap);
@@ -521,7 +612,14 @@ class BackupAgent {
       && migratedCursor?.backupPath === relativeBackupPath
       ? migratedCursor.sourcePath
       : null;
-    if (scanIsStrictlyUnchanged({
+    const existingVerification = verification.sessions[sessionId] || null;
+    const recordHasTrustedVerification = verificationMatches({
+      entry: existingVerification,
+      record: existingRecord,
+      relativeBackupPath,
+      chunkSize: verification.chunkSize,
+    });
+    if (recordHasTrustedVerification && scanIsStrictlyUnchanged({
       sourcePath,
       relativeBackupPath,
       sourceStats,
@@ -533,6 +631,7 @@ class BackupAgent {
         cursor: null,
         staleCursorSourcePath: null,
         lastError: currentCursor?.lastError || null,
+        sourceStats,
       };
     }
 
@@ -546,42 +645,35 @@ class BackupAgent {
       && existingRecord?.bytesBackedUp === baselineCursor.lastByteOffset
       && existingRecord?.lineCount === baselineCursor.lineCount
     );
+    const identityAgrees = Boolean(
+      baselineCursor
+      && (baselineCursor.sourceFileIdentity == null
+        || baselineCursor.sourceFileIdentity === sourceStats.fileIdentity)
+    );
     const pathAgrees = Boolean(
       baselineCursor
       && baselineCursor.backupPath === relativeBackupPath
       && existingRecord?.backupPath === relativeBackupPath
       && existingRecord?.sourcePath === sourcePath
     );
-    let rebuild = !targetState.exists;
+    let rebuild = !targetState.exists || !recordHasTrustedVerification;
     let readOffset = recordedOffset;
     let baseLineCount = recordedLines;
     let adoptedPrefix = null;
     const freshPrefixSeed = !baselineCursor && !existingRecord;
 
-    if (targetState.exists) {
-      if (metadataAgrees && pathAgrees && targetState.byteCount === recordedOffset) {
-        rebuild = false;
+    if (targetState.exists && recordHasTrustedVerification) {
+      if (metadataAgrees
+        && identityAgrees
+        && pathAgrees
+        && targetState.byteCount === recordedOffset) {
+        rebuild = !await verifyAppendSourceAnchors({
+          sourcePath,
+          previous: existingVerification,
+          chunkSize: verification.chunkSize,
+        });
       } else {
-        const canAdoptPrefix = targetState.byteCount <= sourceStats.size
-          && ((!baselineCursor && !existingRecord) || targetState.byteCount > recordedOffset);
-        const prefix = canAdoptPrefix
-          ? await this.fileCommitter.verifyCompletePrefix(
-            backupPath,
-            sourcePath,
-            targetState.byteCount,
-          )
-          : null;
-        if (prefix?.matches) {
-          if (targetState.byteCount > recordedOffset) {
-            await this.fileCommitter.synchronizeTarget(backupPath, this.paths.backupRoot);
-          }
-          rebuild = false;
-          adoptedPrefix = prefix;
-          readOffset = targetState.byteCount;
-          baseLineCount = prefix.lineCount;
-        } else {
-          rebuild = true;
-        }
+        rebuild = true;
       }
     }
 
@@ -590,43 +682,128 @@ class BackupAgent {
     let finalOffset;
     let wroteData;
     let contentHash;
+    const rebuildAndVerify = async (attempts) => {
+      let lastError = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          let attemptVerification = null;
+          const attemptStream = await this.fileCommitter.rebuildCompleteLines(
+            sourcePath,
+            backupPath,
+            this.paths.backupRoot,
+            async (temporaryPath, expected) => {
+              onVerifying?.();
+              attemptVerification = await verifyFullBackupFile({
+                filePath: temporaryPath,
+                chunkSize: verification.chunkSize,
+                expectedByteCount: expected.committedByteCount,
+                expectedLineCount: expected.lineCount,
+                expectedContentHash: expected.contentHash,
+              });
+            },
+          );
+          if (!attemptVerification) throw new Error(`Backup readback verification did not run: ${backupPath}`);
+          return { streamed: attemptStream, verified: attemptVerification };
+        } catch (error) {
+          lastError = error;
+          if (attempt + 1 === attempts) {
+            if (!(error instanceof BackupFileVerificationError)) throw error;
+            throw new Error(
+              `NAS backup upload/readback verification failed for ${backupPath}: ${error.message || String(error)}`,
+              { cause: error },
+            );
+          }
+        }
+      }
+      throw lastError || new Error(`Backup readback verification failed: ${backupPath}`);
+    };
     if (rebuild) {
-      streamed = await this.fileCommitter.rebuildCompleteLines(
-        sourcePath,
-        backupPath,
-        this.paths.backupRoot,
-      );
+      const rebuilt = await rebuildAndVerify(2);
+      streamed = rebuilt.streamed;
       finalOffset = streamed.committedByteCount;
       finalStats = { byteCount: finalOffset, lineCount: streamed.lineCount };
       wroteData = targetState.exists || finalOffset > 0;
       contentHash = streamed.contentHash;
+      verification.sessions[sessionId] = {
+        backupPath: relativeBackupPath,
+        byteCount: rebuilt.verified.byteCount,
+        lineCount: rebuilt.verified.lineCount,
+        chunkHashes: rebuilt.verified.chunkHashes,
+        verifiedAt: scanDate.toISOString(),
+      };
     } else {
-      streamed = await this.fileCommitter.appendCompleteLines(
-        sourcePath,
-        backupPath,
-        readOffset,
-        this.paths.backupRoot,
-      );
-      finalOffset = streamed.committedByteCount;
-      if (finalOffset > readOffset && !await this.fileCommitter.rangesMatch(
-        sourcePath,
-        readOffset,
-        backupPath,
-        readOffset,
-        finalOffset - readOffset,
-      )) {
-        throw new Error(`Backup range verification failed: ${backupPath}`);
+      let rebuiltAfterAppendFailure = null;
+      const restorePreviousVerification = () => {
+        if (existingVerification) verification.sessions[sessionId] = existingVerification;
+        else delete verification.sessions[sessionId];
+      };
+      try {
+        streamed = await this.fileCommitter.appendCompleteLines(
+          sourcePath,
+          backupPath,
+          readOffset,
+          this.paths.backupRoot,
+        );
+        const attemptFinalOffset = streamed.committedByteCount;
+        const attemptFinalLineCount = baseLineCount + streamed.lineCount;
+        verification.sessions[sessionId] = attemptFinalOffset > existingVerification.byteCount
+          ? await (async () => {
+            onVerifying?.();
+            return verifyChangedBackupChunks({
+              sourcePath,
+              targetPath: backupPath,
+              previous: existingVerification,
+              backupPath: relativeBackupPath,
+              committedByteCount: attemptFinalOffset,
+              lineCount: attemptFinalLineCount,
+              verifiedAt: scanDate,
+              chunkSize: verification.chunkSize,
+            });
+          })()
+          : existingVerification;
+        const finalSourceStats = await trustedSourceMetadata(sourcePath);
+        if (!sameSourceMetadata(sourceStats, finalSourceStats)) {
+          throw sourceChangedDuringBackupError(sourcePath);
+        }
+      } catch (error) {
+        restorePreviousVerification();
+        await this.fileCommitter.truncateTarget(
+          backupPath,
+          recordedOffset,
+          this.paths.backupRoot,
+        );
+        const finalSourceStats = await trustedSourceMetadata(sourcePath);
+        if (error?.code === 'SOURCE_CHANGED_DURING_BACKUP'
+          || !sameSourceMetadata(sourceStats, finalSourceStats)) {
+          throw error?.code === 'SOURCE_CHANGED_DURING_BACKUP'
+            ? error
+            : sourceChangedDuringBackupError(sourcePath, error);
+        }
+        rebuiltAfterAppendFailure = await rebuildAndVerify(1);
+        streamed = rebuiltAfterAppendFailure.streamed;
+        verification.sessions[sessionId] = {
+          backupPath: relativeBackupPath,
+          byteCount: rebuiltAfterAppendFailure.verified.byteCount,
+          lineCount: rebuiltAfterAppendFailure.verified.lineCount,
+          chunkHashes: rebuiltAfterAppendFailure.verified.chunkHashes,
+          verifiedAt: scanDate.toISOString(),
+        };
       }
+      finalOffset = streamed.committedByteCount;
       finalStats = {
         byteCount: finalOffset,
-        lineCount: baseLineCount + streamed.lineCount,
+        lineCount: rebuiltAfterAppendFailure ? streamed.lineCount : baseLineCount + streamed.lineCount,
       };
-      wroteData = streamed.appendedByteCount > 0 || readOffset !== recordedOffset;
+      wroteData = rebuiltAfterAppendFailure
+        ? true
+        : streamed.appendedByteCount > 0 || readOffset !== recordedOffset;
       const adoptedCompleteSeed = freshPrefixSeed
         && adoptedPrefix
         && streamed.appendedByteCount === 0
         && finalOffset === adoptedPrefix.byteCount;
-      if (adoptedCompleteSeed) {
+      if (rebuiltAfterAppendFailure) {
+        contentHash = streamed.contentHash;
+      } else if (adoptedCompleteSeed) {
         contentHash = adoptedPrefix.contentHash;
       } else {
         contentHash = finalOffset > recordedOffset ? null : existingRecord?.contentHash ?? null;
@@ -664,6 +841,7 @@ class BackupAgent {
       lastByteOffset: finalOffset,
       lastSourceSize: sourceStats.size,
       lastSourceModifiedAt: sourceStats.modifiedAt,
+      sourceFileIdentity: sourceStats.fileIdentity,
       lineCount: updatedRecord.lineCount,
       pendingPartialLine: streamed.pendingPartialLine,
       status: ACTIVE_STATUS,
@@ -678,6 +856,7 @@ class BackupAgent {
         : updatedCursor,
       staleCursorSourcePath,
       lastError: streamed.blockedError || null,
+      sourceStats,
     };
   }
 
@@ -728,7 +907,7 @@ class BackupAgent {
       sessionCount: records.length,
       lineCount: records.reduce((total, record) => total + Number(record.lineCount ?? 0), 0),
       bytesBackedUp: records.reduce((total, record) => total + Number(record.bytesBackedUp ?? 0), 0),
-      autoStartEnabled: false,
+      autoStartEnabled: Boolean(this.autoStartEnabled()),
       lastError,
       lastAuditAt: auditState?.lastCompletedAt ?? existingStatus?.lastAuditAt,
       lastAuditResult: auditState?.lastResult ?? existingStatus?.lastAuditResult,
@@ -737,7 +916,10 @@ class BackupAgent {
     };
 
     await replaceFileDurably(this.paths.remoteStatusPath, jsonPayload(snapshot));
+    this.instrumentation.remoteStatusWrite?.(this.paths.remoteStatusPath);
     await replaceFileDurably(this.paths.localStatusPath, jsonPayload(snapshot));
+    this.lastHealthCheckAt = date;
+    this.lastRemoteHeartbeatAt = date;
     this.publishStatus(snapshot);
   }
 
@@ -755,6 +937,7 @@ class BackupAgent {
       backupRoot: this.paths.backupRoot,
       firstRunAt: existing?.firstRunAt ?? date.toISOString(),
       lastHeartbeatAt: date.toISOString(),
+      autoStartEnabled: Boolean(this.autoStartEnabled()),
       lastError: error?.message || String(error),
     };
     await replaceFileDurably(this.paths.localStatusPath, jsonPayload(snapshot));
@@ -782,7 +965,11 @@ class BackupAgent {
       for (const sourcePath of await this.discoverSessionFiles()) {
         const cursor = await store.get(sourcePath);
         const metadata = await trustedSourceMetadata(sourcePath);
-        if (!cursor || cursor.lastSourceSize !== metadata.size || cursor.lastSourceModifiedAt !== metadata.modifiedAt) {
+        if (!cursor
+          || cursor.lastSourceSize !== metadata.size
+          || cursor.lastSourceModifiedAt !== metadata.modifiedAt
+          || (cursor.sourceFileIdentity != null
+            && cursor.sourceFileIdentity !== metadata.fileIdentity)) {
           pending.push({ sourcePath, size: metadata.size, modifiedAt: metadata.modifiedAt });
         }
       }
@@ -797,6 +984,26 @@ class BackupAgent {
     this.auditInterruptionEpoch += 1;
     this.instrumentation.auditInterruptionSet?.();
   }
+}
+
+function verificationMatches({ entry, record, relativeBackupPath, chunkSize }) {
+  if (!entry
+    || !record
+    || !Number.isSafeInteger(chunkSize)
+    || chunkSize <= 0
+    || entry.backupPath !== relativeBackupPath
+    || entry.backupPath !== record.backupPath
+    || entry.byteCount !== record.bytesBackedUp
+    || entry.lineCount !== record.lineCount
+    || !Number.isSafeInteger(entry.byteCount)
+    || entry.byteCount < 0
+    || !Number.isSafeInteger(entry.lineCount)
+    || entry.lineCount < 0
+    || !Array.isArray(entry.chunkHashes)
+    || entry.chunkHashes.length !== Math.ceil(entry.byteCount / chunkSize)) {
+    return false;
+  }
+  return entry.chunkHashes.every((hash) => /^[a-f\d]{64}$/i.test(hash));
 }
 
 function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
@@ -837,9 +1044,32 @@ function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
       return appendCompleteLines({ sourcePath, sourceOffset, targetPath, sync });
     },
 
-    async rebuildCompleteLines(sourcePath, targetPath, backupRoot) {
+    async rebuildCompleteLines(sourcePath, targetPath, backupRoot, verifyTemporary = null) {
       await ensureContainedParent(backupRoot, targetPath);
-      return rebuildSessionCompleteLines({ sourcePath, targetPath, sync });
+      return rebuildSessionCompleteLines({
+        sourcePath,
+        targetPath,
+        sync,
+        verifyTemporary,
+      });
+    },
+
+    async truncateTarget(targetPath, byteCount, backupRoot) {
+      await assertContainedTarget(backupRoot, targetPath);
+      if (!Number.isSafeInteger(byteCount) || byteCount < 0) {
+        throw new Error(`Invalid backup rollback length: ${byteCount}`);
+      }
+      const stats = await fsp.lstat(targetPath);
+      if (!stats.isFile() || stats.isSymbolicLink()) {
+        throw new Error(`Backup target is not a trusted regular file: ${targetPath}`);
+      }
+      const handle = await fsp.open(targetPath, 'r+');
+      try {
+        await handle.truncate(byteCount);
+        await sync(handle);
+      } finally {
+        await handle.close();
+      }
     },
   };
 }
@@ -928,11 +1158,37 @@ async function walkJsonlFiles(root, priority, discovered) {
 }
 
 async function trustedSourceMetadata(sourcePath) {
-  const stats = await fsp.lstat(sourcePath);
+  const stats = await fsp.lstat(sourcePath, { bigint: true });
   if (!stats.isFile() || stats.isSymbolicLink()) {
     throw new Error(`Session source is not a trusted regular file: ${sourcePath}`);
   }
-  return { modifiedAt: stats.mtimeMs / 1000, size: stats.size };
+  if (stats.size < 0n || stats.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`Session source size cannot be represented safely: ${sourcePath}`);
+  }
+  const wholeSeconds = stats.mtimeNs / 1_000_000_000n;
+  const fractionalNanoseconds = stats.mtimeNs % 1_000_000_000n;
+  if (wholeSeconds < BigInt(Number.MIN_SAFE_INTEGER)
+    || wholeSeconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`Session source modification time cannot be represented safely: ${sourcePath}`);
+  }
+  return {
+    fileIdentity: `${stats.dev}:${stats.ino}`,
+    modifiedAt: Number(wholeSeconds) + (Number(fractionalNanoseconds) / 1_000_000_000),
+    size: Number(stats.size),
+  };
+}
+
+function sameSourceMetadata(lhs, rhs) {
+  return lhs.fileIdentity === rhs.fileIdentity
+    && lhs.size === rhs.size
+    && lhs.modifiedAt === rhs.modifiedAt;
+}
+
+function sourceChangedDuringBackupError(sourcePath, cause = null) {
+  const error = new Error(`Session source changed during backup: ${sourcePath}`);
+  error.code = 'SOURCE_CHANGED_DURING_BACKUP';
+  if (cause) error.cause = cause;
+  return error;
 }
 
 function scanIsStrictlyUnchanged({
@@ -952,26 +1208,12 @@ function scanIsStrictlyUnchanged({
     || cursor.lastByteOffset < 0
     || cursor.lastByteOffset > sourceStats.size
     || cursor.lastSourceSize !== sourceStats.size
-    || cursor.lastSourceModifiedAt !== sourceStats.modifiedAt) {
+    || cursor.lastSourceModifiedAt !== sourceStats.modifiedAt
+    || (cursor.sourceFileIdentity != null
+      && cursor.sourceFileIdentity !== sourceStats.fileIdentity)) {
     return false;
   }
 
-  const hasUncommittedBytes = sourceStats.size > cursor.lastByteOffset;
-  if (hasUncommittedBytes) {
-    return Boolean(cursor.pendingPartialLine) || cursor.lastError != null;
-  }
-  return !cursor.pendingPartialLine && cursor.lastError == null;
-}
-
-function timerPreflightIsUnchanged({ sourcePath, sourceStats, cursor }) {
-  if (!cursor
-    || cursor.sourcePath !== sourcePath
-    || cursor.lastByteOffset < 0
-    || cursor.lastByteOffset > sourceStats.size
-    || cursor.lastSourceSize !== sourceStats.size
-    || cursor.lastSourceModifiedAt !== sourceStats.modifiedAt) {
-    return false;
-  }
   const hasUncommittedBytes = sourceStats.size > cursor.lastByteOffset;
   if (hasUncommittedBytes) {
     return Boolean(cursor.pendingPartialLine) || cursor.lastError != null;
@@ -988,7 +1230,7 @@ function sameRecord(lhs, rhs) {
 function sameCursor(lhs, rhs) {
   if (!lhs) return false;
   return ['sessionId', 'sourcePath', 'backupPath', 'lastByteOffset', 'lastSourceSize',
-    'lastSourceModifiedAt', 'lineCount', 'pendingPartialLine', 'status', 'lastError']
+    'lastSourceModifiedAt', 'sourceFileIdentity', 'lineCount', 'pendingPartialLine', 'status', 'lastError']
     .every((key) => lhs[key] === rhs[key]);
 }
 
@@ -1061,6 +1303,24 @@ function validDate(value) {
   const date = value instanceof Date ? new Date(value) : new Date(value);
   if (Number.isNaN(date.getTime())) throw new Error(`Invalid audit date: ${String(value)}`);
   return date;
+}
+
+function parseOptionalDate(value) {
+  if (value == null) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function positiveInterval(value, name) {
+  const interval = Number(value);
+  if (!Number.isFinite(interval) || interval <= 0) {
+    throw new Error(`${name} must be a positive number.`);
+  }
+  return interval;
+}
+
+function intervalIsDue(previous, current, intervalMs) {
+  return !previous || current.getTime() - previous.getTime() >= intervalMs;
 }
 
 function normalizedTimerDelay(value) {

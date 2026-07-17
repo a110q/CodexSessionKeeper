@@ -1,8 +1,18 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
-const { replaceFileDurably, writeFileDurably } = require('./durable-write');
+const {
+  durableReplaceWithWriter,
+  publishSyncedTemporaryFileIfAbsent,
+  replaceFileDurably,
+  writeFileDurably,
+} = require('./durable-write');
+const { verifyFullBackupFile } = require('./backup-file-verifier');
 const { assertSafeDestinationPath, assertSafeSourcePath } = require('./restore-filesystem');
+const { createSecureRecoveryDirectory } = require('./secure-recovery-directory');
+const { loadVerification } = require('./verification-store');
+
+const SHA256_PATTERN = /^[a-f\d]{64}$/i;
 
 function safePathComponent(value) {
   const safe = String(value || '')
@@ -124,6 +134,9 @@ async function loadIncrementalBackupCatalog({ paths, currentSessionIds }) {
 
 async function preflightIncrementalRecovery({ paths, sessionIds }) {
   const manifest = await readManifest(paths);
+  const verification = await loadVerification(
+    paths.verificationPath || path.join(paths.backupRoot, 'verification.json'),
+  );
   const selected = new Set((sessionIds || []).map(String));
   const records = Object.values(manifest.sessions || {})
     .filter((record) => selected.has(record.sessionId))
@@ -135,8 +148,14 @@ async function preflightIncrementalRecovery({ paths, sessionIds }) {
 
   const destinationRoot = paths.codexRoot;
   const seenDestinations = new Set();
-  const restorePaths = records.map((record) => {
+  const restorePaths = [];
+  for (const record of records) {
     const sourcePath = resolveBackupFile(paths, record, { requireExisting: true });
+    const expectedVerification = await validatedRecoveryExpectation({
+      sourcePath,
+      record,
+      verification,
+    });
     const filename = `${safePathComponent(record.sessionId)}.jsonl`;
     const destinationPath = path.join(destinationRoot, 'sessions', 'recovered', filename);
     assertSafeDestinationPath(destinationPath, destinationRoot);
@@ -145,13 +164,14 @@ async function preflightIncrementalRecovery({ paths, sessionIds }) {
       throw new Error(`Multiple sessions map to the same recovery destination: ${filename}`);
     }
     seenDestinations.add(normalizedDestination);
-    return Object.freeze({
+    restorePaths.push(Object.freeze({
       sessionId: record.sessionId,
       sourcePath,
       destinationPath,
       record: Object.freeze({ ...record }),
-    });
-  });
+      expectedVerification,
+    }));
+  }
 
   assertSafeDestinationPath(path.join(destinationRoot, 'session_index.jsonl'), destinationRoot);
   return Object.freeze(restorePaths);
@@ -173,55 +193,63 @@ async function restoreIncrementalSessions({ paths, preflight }) {
     }
   }
 
-  const recoveredRoot = path.join(paths.codexRoot, 'sessions', 'recovered');
-  await createSafeDestinationDirectory(recoveredRoot, paths.codexRoot);
-  const recoveredFiles = {};
-  for (const item of restorePaths) {
-    const content = await readValidatedSource(paths, item);
-    await writeFileDurably(item.destinationPath, content);
-    recoveredFiles[item.sessionId] = item.destinationPath;
-  }
-
-  const indexPath = path.join(paths.codexRoot, 'session_index.jsonl');
-  assertSafeDestinationPath(indexPath, paths.codexRoot);
-  const existingLines = await readExistingLines(indexPath);
-  const restoredIds = new Set(restorePaths.map((item) => item.sessionId));
-  const retained = existingLines.filter((line) => {
-    try {
-      return !restoredIds.has(String(JSON.parse(line).id || ''));
-    } catch {
-      return true;
+  const recoveredRoot = await createSecureRecoveryDirectory(paths.codexRoot);
+  const stagingRoot = path.join(recoveredRoot, `.recovery-staging-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  assertSafeDestinationPath(stagingRoot, paths.codexRoot);
+  await fsp.mkdir(stagingRoot);
+  const staged = [];
+  const published = [];
+  try {
+    for (const item of restorePaths) {
+      const stagingPath = path.join(stagingRoot, path.basename(item.destinationPath));
+      await stageAndVerifySource({ paths, item, stagingPath });
+      staged.push({ item, stagingPath });
     }
-  });
-  const recoveredLines = restorePaths.map(({ record, destinationPath }) => JSON.stringify({
-    id: record.sessionId,
-    title: record.title || record.sessionId,
-    thread_name: record.title || record.sessionId,
-    rollout_path: destinationPath,
-    source_path: record.sourcePath || '',
-    backup_path: record.backupPath || '',
-    updated_at: record.lastBackedUpAt || record.firstSeenAt,
-    line_count: record.lineCount || 0,
-    bytes_backed_up: record.bytesBackedUp || 0,
-  }));
-  const payload = `${[...retained, ...recoveredLines].join('\n')}\n`;
-  if (existsSync(indexPath)) await replaceFileDurably(indexPath, payload);
-  else await writeFileDurably(indexPath, payload);
 
-  return Object.freeze({ recoveredFiles: Object.freeze(recoveredFiles), records: restorePaths.map((item) => item.record) });
-}
-
-async function createSafeDestinationDirectory(directory, root) {
-  const relative = path.relative(path.resolve(root), path.resolve(directory));
-  let current = path.resolve(root);
-  for (const component of relative.split(path.sep).filter(Boolean)) {
-    current = path.join(current, component);
+    const recoveredFiles = {};
     try {
-      await fsp.mkdir(current);
+      for (const { item, stagingPath } of staged) {
+        await publishSyncedTemporaryFileIfAbsent(stagingPath, item.destinationPath);
+        published.push(item.destinationPath);
+        recoveredFiles[item.sessionId] = item.destinationPath;
+      }
+
+      const indexPath = path.join(paths.codexRoot, 'session_index.jsonl');
+      assertSafeDestinationPath(indexPath, paths.codexRoot);
+      const existingLines = await readExistingLines(indexPath);
+      const restoredIds = new Set(restorePaths.map((item) => item.sessionId));
+      const retained = existingLines.filter((line) => {
+        try {
+          return !restoredIds.has(String(JSON.parse(line).id || ''));
+        } catch {
+          return true;
+        }
+      });
+      const recoveredLines = restorePaths.map(({ record, destinationPath }) => JSON.stringify({
+        id: record.sessionId,
+        title: record.title || record.sessionId,
+        thread_name: record.title || record.sessionId,
+        rollout_path: destinationPath,
+        source_path: record.sourcePath || '',
+        backup_path: record.backupPath || '',
+        updated_at: record.lastBackedUpAt || record.firstSeenAt,
+        line_count: record.lineCount || 0,
+        bytes_backed_up: record.bytesBackedUp || 0,
+      }));
+      const payload = `${[...retained, ...recoveredLines].join('\n')}\n`;
+      if (existsSync(indexPath)) await replaceFileDurably(indexPath, payload);
+      else await writeFileDurably(indexPath, payload);
+
+      return Object.freeze({
+        recoveredFiles: Object.freeze(recoveredFiles),
+        records: restorePaths.map((item) => item.record),
+      });
     } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+      await Promise.allSettled(published.map((destinationPath) => fsp.rm(destinationPath, { force: true })));
+      throw error;
     }
-    assertSafeDestinationPath(current, root);
+  } finally {
+    await fsp.rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -234,28 +262,95 @@ async function readExistingLines(filePath) {
   }
 }
 
-async function readValidatedSource(paths, item) {
+async function stageAndVerifySource({ paths, item, stagingPath }) {
   const resolved = resolveBackupFile(paths, item.record, { requireExisting: true });
   if (resolved !== item.sourcePath) {
     throw new Error(`Backup path for session ${item.sessionId} changed during restore.`);
   }
-  const before = await fsp.lstat(item.sourcePath);
-  if (!before.isFile() || before.isSymbolicLink()) {
-    throw new Error(`Backup source is not a regular file: ${item.sourcePath}`);
-  }
-  const handle = await fsp.open(item.sourcePath, 'r');
+  const source = await fsp.open(item.sourcePath, 'r');
   try {
-    const opened = await handle.stat();
-    const stillResolved = resolveBackupFile(paths, item.record, { requireExisting: true });
-    if (stillResolved !== item.sourcePath
-      || !opened.isFile()
-      || (before.ino && opened.ino && (before.ino !== opened.ino || before.dev !== opened.dev))) {
-      throw new Error(`Backup source changed during restore: ${item.sourcePath}`);
-    }
-    return await handle.readFile();
+    await durableReplaceWithWriter(stagingPath, async (destination) => {
+      const buffer = Buffer.allocUnsafe(item.expectedVerification.chunkSize);
+      let position = 0;
+      while (true) {
+        const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) break;
+        await writeAll(destination, buffer.subarray(0, bytesRead));
+        position += bytesRead;
+      }
+    }, {
+      verifyTemporary: (temporaryPath) => verifyFullBackupFile({
+        filePath: temporaryPath,
+        chunkSize: item.expectedVerification.chunkSize,
+        expectedByteCount: item.expectedVerification.byteCount,
+        expectedLineCount: item.expectedVerification.lineCount,
+        expectedContentHash: item.expectedVerification.contentHash,
+        expectedChunkHashes: item.expectedVerification.chunkHashes,
+      }),
+    });
   } finally {
-    await handle.close();
+    await source.close();
   }
+}
+
+async function writeAll(handle, data) {
+  let offset = 0;
+  while (offset < data.length) {
+    const { bytesWritten } = await handle.write(data, offset, data.length - offset, null);
+    if (bytesWritten <= 0) throw new Error('Unable to write staged recovery file.');
+    offset += bytesWritten;
+  }
+}
+
+async function validatedRecoveryExpectation({ sourcePath, record, verification }) {
+  const byteCount = Number(record.bytesBackedUp);
+  const lineCount = Number(record.lineCount);
+  if (!Number.isSafeInteger(byteCount) || byteCount < 0 || !Number.isSafeInteger(lineCount) || lineCount < 0) {
+    throw new Error(`Backup metadata is invalid for session ${record.sessionId}.`);
+  }
+  const entry = verification.sessions[record.sessionId];
+  if (entry) {
+    if (entry.backupPath !== record.backupPath
+      || entry.byteCount !== byteCount
+      || entry.lineCount !== lineCount
+      || !Array.isArray(entry.chunkHashes)
+      || entry.chunkHashes.length !== Math.ceil(byteCount / verification.chunkSize)
+      || !entry.chunkHashes.every((hash) => SHA256_PATTERN.test(String(hash)))) {
+      throw new Error(`Backup verification metadata does not match session ${record.sessionId}.`);
+    }
+    const result = await verifyFullBackupFile({
+      filePath: sourcePath,
+      chunkSize: verification.chunkSize,
+      expectedByteCount: byteCount,
+      expectedLineCount: lineCount,
+      expectedChunkHashes: entry.chunkHashes,
+    });
+    return Object.freeze({
+      byteCount,
+      lineCount,
+      contentHash: result.contentHash,
+      chunkSize: verification.chunkSize,
+      chunkHashes: Object.freeze([...entry.chunkHashes]),
+    });
+  }
+
+  if (!SHA256_PATTERN.test(String(record.contentHash || ''))) {
+    throw new Error(`Backup has no trusted verification for session ${record.sessionId}.`);
+  }
+  const result = await verifyFullBackupFile({
+    filePath: sourcePath,
+    chunkSize: verification.chunkSize,
+    expectedByteCount: byteCount,
+    expectedLineCount: lineCount,
+    expectedContentHash: record.contentHash,
+  });
+  return Object.freeze({
+    byteCount,
+    lineCount,
+    contentHash: result.contentHash,
+    chunkSize: verification.chunkSize,
+    chunkHashes: null,
+  });
 }
 
 module.exports = {

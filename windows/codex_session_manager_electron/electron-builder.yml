@@ -1,0 +1,31 @@
+appId: com.codexsessionkeeper.desktop
+productName: codex_会话管理
+artifactName: codex_session_keeper_windows_${version}_internal-test-unsigned.${ext}
+asar: false
+directories:
+  output: ../../dist/win10-installer
+  buildResources: build
+files:
+  - src/**/*
+  - src/lifecycle.js
+  - src/backup/**/*
+  - vendor/sqlite3.exe
+  - package.json
+win:
+  executableName: codex_session_manager
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  packElevateHelper: false
+  allowToChangeInstallationDirectory: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: codex_会话管理
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false
+  include: build/installer.nsh

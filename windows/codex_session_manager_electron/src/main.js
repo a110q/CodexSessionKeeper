@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require('electron');
+const { app, BrowserWindow, Menu, Tray, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -22,9 +22,13 @@ const {
   deleteSingleSessionStateDb: deleteLiveSessionStateDb,
   mergeSingleSessionStateDb: mergeLiveSingleSessionStateDb,
   mergeStateDatabase: mergeLiveStateDatabase,
-  repairStateDatabaseRolloutPaths: repairLiveStateDatabaseRolloutPaths,
+  preflightMergeStateDatabase: preflightLiveStateDatabaseMerge,
   replaceStateDatabase: replaceLiveStateDatabase,
 } = require('./backup/live-state-database');
+const {
+  createConsistentStateDatabaseSnapshot,
+  protectionSnapshotWarning,
+} = require('./backup/snapshot-state-database');
 const { validateRestorePaths } = require('./backup/restore-paths');
 const {
   assertSafeDestinationPath,
@@ -38,9 +42,29 @@ const {
   installNavigationGuards,
   resolveTrustedSessionFile,
 } = require('./security');
+const {
+  applySessionDeletionPlan,
+  applySessionJsonlPlan,
+  assertFileContentMatchesFingerprint,
+  assertSessionRestorePlanFresh,
+  buildSessionDeletionPlan,
+  buildSessionJsonlPlan,
+  buildSessionProtectionPlan,
+  buildSessionRestorePlan,
+  indexTrustedSessionFiles,
+  materializeSessionProtectionPlan,
+  normalizeSessionId,
+} = require('./session-data-security');
+const {
+  BACKGROUND_ARGUMENT,
+  createBackgroundLifecycle,
+  createLoginItemController,
+} = require('./lifecycle');
 
 let mainWindow;
 let sqlPromise;
+let tray;
+let trayStatusTimer;
 
 const appVersion = '1.0.14';
 const codexRoot = path.join(os.homedir(), '.codex');
@@ -61,6 +85,7 @@ const nasRuntime = createNasRuntime({
     initialStatus,
     onProgress,
     onStatus,
+    autoStartEnabled: () => launchAtLoginState.enabled,
   }),
 });
 const applicationPagePath = path.join(__dirname, 'index.html');
@@ -73,7 +98,15 @@ const handleTrustedIpc = createTrustedIpcRegistrar({
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
 let removePowerMonitorResume = null;
-let backupExitConfirmed = false;
+const loginItemController = createLoginItemController({
+  app,
+  openSettings: () => shell.openExternal('ms-settings:startupapps'),
+});
+let launchAtLoginState = {
+  enabled: false,
+  requiresApproval: false,
+  message: '开机自启状态尚未检查。',
+};
 
 const backupCandidates = [
   'config.toml',
@@ -152,40 +185,46 @@ function createWindow() {
   });
 
   installNavigationGuards(mainWindow.webContents, applicationPageURL);
-  installBackupExitGuard(mainWindow);
+  backgroundLifecycle.attachWindow(mainWindow);
   mainWindow.loadFile(applicationPagePath);
+  return mainWindow;
+}
+
+function getOrCreateMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return createWindow();
+  return mainWindow;
 }
 
 if (hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     Menu.setApplicationMenu(null);
+    launchAtLoginState = loginItemController.currentState();
     await nasRuntime.initialize();
+    if (nasRuntime.snapshot().configuration) ensureLaunchAtLoginEnabled();
     installBackupLifecycleListeners();
-    createWindow();
+    installTray();
+    if (!process.argv.includes(BACKGROUND_ARGUMENT)) createWindow();
   });
 }
 
-app.on('second-instance', () => {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
+app.on('second-instance', (_event, commandLine) => {
+  backgroundLifecycle.handleSecondInstance(commandLine);
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+app.on('window-all-closed', () => {});
 
 app.on('activate', () => {
   nasRuntime.requestImmediateScan('activation');
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  backgroundLifecycle.showWindow();
 });
 
-app.on('before-quit', () => {
-  const backupBusy = ['seeding', 'pending'].includes(nasRuntime.snapshot().state);
-  if (backupBusy && !backupExitConfirmed) return;
-  teardownBackupLifecycleListeners();
-  nasRuntime.stop();
+app.on('before-quit', (event) => {
+  if (!backgroundLifecycle.isQuitRequested()) {
+    event.preventDefault();
+    void backgroundLifecycle.requestQuit();
+    return;
+  }
+  backgroundLifecycle.beforeQuit();
 });
 
 function installBackupLifecycleListeners() {
@@ -200,6 +239,101 @@ function teardownBackupLifecycleListeners() {
   removePowerMonitorResume?.();
   removePowerMonitorResume = null;
 }
+
+function ensureLaunchAtLoginEnabled() {
+  launchAtLoginState = loginItemController.ensureEnabled();
+  return launchAtLoginState;
+}
+
+function currentLaunchAtLoginState() {
+  launchAtLoginState = loginItemController.currentState();
+  return launchAtLoginState;
+}
+
+function notifyHiddenToTray() {
+  const settings = settingsStore.load();
+  if (settings.backgroundNoticeShown || !tray) return;
+  try {
+    tray.displayBalloon?.({
+      title: 'Codex 会话管理仍在运行',
+      content: '窗口已隐藏到系统托盘，NAS 会话备份会继续运行。',
+      iconType: 'info',
+    });
+    settingsStore.savePatch({ backgroundNoticeShown: true });
+  } catch {
+    // A tray notification is informational; backup must keep running if Windows suppresses it.
+  }
+}
+
+function trayStatusLabel() {
+  const runtime = nasRuntime.snapshot();
+  const labels = {
+    running: '备份已验证',
+    seeding: '首次备份中',
+    pending: '正在补传',
+    verifying: '正在校验',
+    disconnected: 'NAS 未连接',
+    error: '备份异常',
+    unconfigured: '尚未配置',
+  };
+  return `NAS：${labels[runtime.state] || '等待中'}`;
+}
+
+function updateTrayMenu() {
+  if (!tray || tray.isDestroyed()) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: trayStatusLabel(), enabled: false },
+    { label: '打开 Codex 会话管理', click: () => backgroundLifecycle.showWindow() },
+    { type: 'separator' },
+    { label: '退出', click: () => void backgroundLifecycle.requestQuit() },
+  ]));
+}
+
+function installTray() {
+  if (tray && !tray.isDestroyed()) return;
+  tray = new Tray(path.join(__dirname, 'assets', 'CodexSessionVaultIcon.png'));
+  tray.setToolTip('Codex 会话管理');
+  tray.on('click', () => backgroundLifecycle.showWindow());
+  tray.on('double-click', () => backgroundLifecycle.showWindow());
+  updateTrayMenu();
+  trayStatusTimer = setInterval(updateTrayMenu, 10000);
+}
+
+function teardownTray() {
+  if (trayStatusTimer) clearInterval(trayStatusTimer);
+  trayStatusTimer = undefined;
+  tray?.destroy();
+  tray = undefined;
+}
+
+const backgroundLifecycle = createBackgroundLifecycle({
+  getWindow: getOrCreateMainWindow,
+  getBackupState: () => nasRuntime.snapshot().state,
+  confirmBusyQuit: async () => {
+    const options = {
+      type: 'warning',
+      title: 'NAS 备份尚未完成',
+      message: 'NAS 备份尚未完成，仍要退出吗？',
+      detail: '现在退出可能会让最新会话留到下次启动后继续补传。',
+      buttons: ['继续备份', '仍要退出'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    };
+    const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    const result = owner
+      ? await dialog.showMessageBox(owner, options)
+      : await dialog.showMessageBox(options);
+    return result.response === 1;
+  },
+  quitApplication: () => app.quit(),
+  stopRuntime: () => nasRuntime.stop(),
+  teardown: () => {
+    teardownBackupLifecycleListeners();
+    teardownTray();
+  },
+  notifyHidden: notifyHiddenToTray,
+});
 
 function pathsForNasTarget(target) {
   return backupPaths({
@@ -223,35 +357,8 @@ function nasSetupState() {
     deviceName: configuration?.deviceName || null,
     lastError: runtime.lastError,
     progress: runtime.progress,
+    launchAtLogin: launchAtLoginState,
   };
-}
-
-function installBackupExitGuard(window) {
-  let allowClose = false;
-  let promptOpen = false;
-  window.on('close', (event) => {
-    if (allowClose || !['seeding', 'pending'].includes(nasRuntime.snapshot().state)) return;
-    event.preventDefault();
-    if (promptOpen) return;
-    promptOpen = true;
-    void dialog.showMessageBox(window, {
-      type: 'warning',
-      title: 'NAS 备份尚未完成',
-      message: 'NAS 备份尚未完成，仍要退出吗？',
-      detail: '现在退出可能会让最新会话留到下次启动后继续补传。',
-      buttons: ['继续备份', '仍要退出'],
-      defaultId: 0,
-      cancelId: 0,
-      noLink: true,
-    }).then((result) => {
-      promptOpen = false;
-      if (result.response === 1) {
-        backupExitConfirmed = true;
-        allowClose = true;
-        window.close();
-      }
-    });
-  });
 }
 
 function ensureDir(dirPath) {
@@ -287,7 +394,12 @@ function readText(targetPath) {
 }
 
 function readBackupStatus() {
-  return nasRuntime.backupStatus();
+  const launchAtLogin = currentLaunchAtLoginState();
+  return {
+    ...nasRuntime.backupStatus(),
+    autoStartEnabled: launchAtLogin.enabled,
+    launchAtLogin,
+  };
 }
 
 function readLines(targetPath) {
@@ -415,7 +527,9 @@ function tableExists(db, table) {
 }
 
 function makeSession(row, existsOnDiskOverride = null, sizeBytesOverride = null, rolloutPathOverride = null) {
-  const rolloutPath = rolloutPathOverride || row.rolloutPath || row.rollout_path || '';
+  // Raw rollout_path values come from a mutable SQLite database. Only a path
+  // resolved from an authenticated session_meta record may leave this layer.
+  const rolloutPath = rolloutPathOverride || '';
   const fileExists = existsOnDiskOverride ?? exists(rolloutPath);
   return {
     id: String(row.id || ''),
@@ -456,10 +570,9 @@ async function loadSessionsFromSqlite(root = codexRoot) {
       ORDER BY updated_at DESC, created_at DESC;
     `);
     return rows.map((row) => {
-      const rolloutPath = row.rolloutPath || row.rollout_path || '';
-      const resolvedPath = resolveRolloutFilePath(String(row.id || ''), rolloutPath, root, codexRoot);
+      const resolvedPath = resolveRolloutFilePath(String(row.id || ''), '', root, codexRoot);
       const fileExists = exists(resolvedPath);
-      return makeSession(row, fileExists, fileExists ? fileSize(resolvedPath) : 0, resolvedPath || rolloutPath);
+      return makeSession(row, fileExists, fileExists ? fileSize(resolvedPath) : 0, resolvedPath);
     });
   } catch {
     return [];
@@ -493,36 +606,21 @@ function snapshotRelativePath(absolutePath, snapshotCodexRoot) {
 
 function findRolloutFile(root, sessionId) {
   if (!root || !sessionId) return '';
-  for (const dir of ['sessions', 'archived_sessions']) {
-    const match = walkFiles(
-      path.join(root, dir),
-      (filePath) => filePath.endsWith('.jsonl') && path.basename(filePath).includes(sessionId)
-    )[0];
-    if (match) return match;
+  try {
+    return indexTrustedSessionFiles({ codexRoot: root }).get(normalizeSessionId(sessionId))?.[0] || '';
+  } catch {
+    return '';
   }
-  return '';
 }
 
 function resolveRolloutFilePath(sessionId, rolloutPath, dataRoot, snapshotCodexRoot) {
-  const relative = snapshotRelativePath(rolloutPath, snapshotCodexRoot);
-  if (relative) {
-    const candidate = path.join(dataRoot, relative);
-    if (exists(candidate)) return candidate;
-  }
-
-  if (rolloutPath) {
-    const relativeToData = safeRelativePath(dataRoot, rolloutPath);
-    if (relativeToData && exists(rolloutPath)) return rolloutPath;
-  }
-
+  void rolloutPath;
+  void snapshotCodexRoot;
   return findRolloutFile(dataRoot, sessionId);
 }
 
 function snapshotFilePathForSession(snapshot, session) {
-  const resolved = resolveRolloutFilePath(session.id, session.rolloutPath, snapshot.dataPath, snapshot.codexRoot);
-  if (resolved) return resolved;
-  const relative = snapshotRelativePath(session.rolloutPath, snapshot.codexRoot);
-  return relative ? path.join(snapshot.dataPath, relative) : '';
+  return resolveRolloutFilePath(session.id, '', snapshot.dataPath, snapshot.codexRoot);
 }
 
 async function loadSessionsInSnapshot(snapshot) {
@@ -553,7 +651,7 @@ async function loadSessionsInSnapshot(snapshot) {
       const session = makeSession(row, false, 0);
       const probe = snapshotFilePathForSession(snapshot, session);
       const fileExists = exists(probe);
-      return makeSession(row, fileExists, fileExists ? fileSize(probe) : 0, probe || session.rolloutPath);
+      return makeSession(row, fileExists, fileExists ? fileSize(probe) : 0, probe);
     });
   } catch {
     databaseSessions = [];
@@ -565,11 +663,6 @@ async function loadSessionsInSnapshot(snapshot) {
   }
   const fileSessions = loadSessionsFromFiles(snapshot.dataPath);
   return mergeSessionLists(databaseSessions, fileSessions);
-}
-
-function extractSessionIdFromPath(filePath) {
-  const match = filePath.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
-  return match ? match[0].toLowerCase() : '';
 }
 
 function firstUserMessageFromRollout(filePath) {
@@ -661,13 +754,15 @@ function mergeSessionLists(primarySessions, fallbackSessions) {
 
 function loadSessionsFromFiles(root = codexRoot) {
   const { titles, archived } = loadTitleMaps(root);
-  const files = [
-    ...walkFiles(path.join(root, 'sessions'), (filePath) => filePath.endsWith('.jsonl')),
-    ...walkFiles(path.join(root, 'archived_sessions'), (filePath) => filePath.endsWith('.jsonl'))
-  ];
+  let trustedIndex;
+  try {
+    trustedIndex = indexTrustedSessionFiles({ codexRoot: root });
+  } catch {
+    return [];
+  }
+  const files = [...trustedIndex.entries()].flatMap(([id, matches]) => matches.map((filePath) => ({ id, filePath })));
 
-  return files.map((filePath) => {
-    const id = extractSessionIdFromPath(filePath);
+  return files.map(({ id, filePath }) => {
     const stat = fs.statSync(filePath);
     const meta = firstUserMessageFromRollout(filePath);
     const row = {
@@ -861,26 +956,20 @@ function copyPathIntoSnapshot(relativePath, dataPath, warnings = null) {
 }
 
 async function copyStateDatabaseIntoSnapshot(dataPath, warnings = null) {
-  if (!copyPathIntoSnapshot('state_5.sqlite', dataPath, warnings)) {
-    return { ok: false, warning: '' };
-  }
-
+  const sourcePath = path.join(codexRoot, 'state_5.sqlite');
+  if (!exists(sourcePath)) return { ok: false, warning: '' };
   const databasePath = path.join(dataPath, 'state_5.sqlite');
-  let db;
   try {
-    db = await openDatabase(databasePath);
-    const rows = execRows(db, 'PRAGMA integrity_check;');
-    const result = String(rows[0]?.integrity_check || '').toLowerCase();
-    if (result && result !== 'ok') throw new Error(`integrity_check: ${result}`);
+    await createConsistentStateDatabaseSnapshot({
+      sourcePath,
+      destinationPath: databasePath,
+    });
     return { ok: true, warning: '' };
   } catch (error) {
-    if (exists(databasePath)) fs.rmSync(databasePath, { force: true });
     return {
       ok: false,
-      warning: `SQLite 索引库当前不可读，已降级创建文件型快照。原因：${error.message || error}`
+      warning: `SQLite 索引库无法生成一致副本，已降级创建文件型快照。原因：${error.message || error}`
     };
-  } finally {
-    if (db) db.close();
   }
 }
 
@@ -1033,41 +1122,10 @@ async function createSystemSnapshot(name, reason, candidates = backupCandidates)
   return meta;
 }
 
-function copyRolloutFilesForSessions(sessionIds, dataPath) {
-  const included = new Set();
-  for (const dir of ['sessions', 'archived_sessions']) {
-    const files = walkFiles(
-      path.join(codexRoot, dir),
-      (filePath) => filePath.endsWith('.jsonl') && [...sessionIds].some((sessionId) => path.basename(filePath).includes(sessionId))
-    );
-    for (const filePath of files) {
-      const relative = safeRelativePath(codexRoot, filePath);
-      if (!relative) continue;
-      copyReplacing(filePath, path.join(dataPath, relative));
-      included.add(dir);
-    }
-  }
-  return included;
-}
-
-function copyShellSnapshotsForSessions(sessionIds, dataPath) {
-  const shellDir = path.join(codexRoot, 'shell_snapshots');
-  const files = walkFiles(
-    shellDir,
-    (filePath) => [...sessionIds].some((sessionId) => path.basename(filePath).includes(sessionId))
-  );
-  for (const filePath of files) {
-    copyReplacing(filePath, path.join(dataPath, 'shell_snapshots', path.basename(filePath)));
-  }
-  return files.length > 0;
-}
-
 async function createSessionProtectionSnapshot(name, reason, sessions) {
   if (!exists(codexRoot)) throw new Error(`Codex 数据目录不存在：${codexRoot}`);
   const sessionIds = new Set((sessions || []).map((session) => String(session.id)).filter(Boolean));
   if (!sessionIds.size) throw new Error('没有可备份的会话。');
-
-  ensureDir(snapshotRoot);
   const baseId = `${timestampId()}-${reason}`;
   let id = baseId;
   let collisionIndex = 2;
@@ -1078,60 +1136,66 @@ async function createSessionProtectionSnapshot(name, reason, sessions) {
 
   const snapshotPath = path.join(snapshotRoot, id);
   const dataPath = path.join(snapshotPath, 'data');
-  ensureDir(dataPath);
+  const protectionPlan = buildSessionProtectionPlan({
+    sessionIds,
+    codexRoot,
+    destinationRoot: dataPath,
+  });
   const includedPaths = new Set();
   const warnings = [];
+  let snapshotCreated = false;
+  try {
+    ensureDir(snapshotRoot);
+    fs.mkdirSync(snapshotPath);
+    snapshotCreated = true;
+    fs.mkdirSync(dataPath);
+    materializeSessionProtectionPlan(protectionPlan);
+    for (const output of protectionPlan.jsonlPlan.outputs) {
+      includedPaths.add(path.basename(output.destinationPath));
+    }
+    for (const entry of protectionPlan.trustedFiles) {
+      includedPaths.add(entry.relativePath.split(path.sep)[0]);
+    }
 
-  for (const relativePath of conversationLineMergePaths) {
-    const source = path.join(codexRoot, relativePath);
-    if (!exists(source)) continue;
-    const destination = path.join(dataPath, relativePath);
-    if (!copyEntryIntoSnapshot(source, destination, warnings)) continue;
-    filterLineFile(destination, relativePath === 'session_index.jsonl' ? 'id' : null, sessionIds);
-    includedPaths.add(relativePath);
-  }
+    const stateCopy = await copyStateDatabaseIntoSnapshot(dataPath, warnings);
+    if (stateCopy.ok) {
+      includedPaths.add('state_5.sqlite');
+    } else if (stateCopy.warning) {
+      warnings.push(stateCopy.warning);
+    }
 
-  for (const relativePath of copyRolloutFilesForSessions(sessionIds, dataPath)) {
-    includedPaths.add(relativePath);
+    const sanitized = await sanitizeSnapshotData(dataPath, codexRoot);
+    if (sanitized.warning) warnings.push(sanitized.warning);
+    if (!exists(path.join(dataPath, 'state_5.sqlite'))) includedPaths.delete('state_5.sqlite');
+    const restorableSessionIds = sanitized.restorableSessionIds.size
+      ? sanitized.restorableSessionIds
+      : new Set(loadSessionsFromFiles(dataPath).map((session) => session.id));
+    const counts = snapshotSessionCounts(dataPath, restorableSessionIds);
+    const currentState = inspectCurrentState();
+    const meta = {
+      id,
+      name,
+      createdAt: new Date().toISOString(),
+      codexRoot,
+      reason,
+      kind: snapshotKind({ reason }),
+      modelProvider: currentState.modelProvider,
+      model: currentState.model,
+      accountFingerprint: currentState.accountFingerprint,
+      sessionCount: counts.active,
+      archivedSessionCount: counts.archived,
+      sizeBytes: directorySize(dataPath),
+      includedPaths: [...includedPaths].sort(),
+      appVersion: `win-exe-${appVersion}`,
+      warnings
+    };
+    fs.writeFileSync(path.join(snapshotPath, 'snapshot.json'), JSON.stringify(meta, null, 2), 'utf8');
+    enforceAutomaticSnapshotRetention();
+    return meta;
+  } catch (error) {
+    if (snapshotCreated) fs.rmSync(snapshotPath, { recursive: true, force: true });
+    throw error;
   }
-  if (copyShellSnapshotsForSessions(sessionIds, dataPath)) {
-    includedPaths.add('shell_snapshots');
-  }
-  const stateCopy = await copyStateDatabaseIntoSnapshot(dataPath, warnings);
-  if (stateCopy.ok) {
-    includedPaths.add('state_5.sqlite');
-  } else if (stateCopy.warning) {
-    warnings.push(stateCopy.warning);
-  }
-
-  const sanitized = await sanitizeSnapshotData(dataPath, codexRoot);
-  if (sanitized.warning) warnings.push(sanitized.warning);
-  if (!exists(path.join(dataPath, 'state_5.sqlite'))) includedPaths.delete('state_5.sqlite');
-  const restorableSessionIds = sanitized.restorableSessionIds.size
-    ? sanitized.restorableSessionIds
-    : new Set(loadSessionsFromFiles(dataPath).map((session) => session.id));
-  const counts = snapshotSessionCounts(dataPath, restorableSessionIds);
-  const currentState = inspectCurrentState();
-  const meta = {
-    id,
-    name,
-    createdAt: new Date().toISOString(),
-    codexRoot,
-    reason,
-    kind: snapshotKind({ reason }),
-    modelProvider: currentState.modelProvider,
-    model: currentState.model,
-    accountFingerprint: currentState.accountFingerprint,
-    sessionCount: counts.active,
-    archivedSessionCount: counts.archived,
-    sizeBytes: directorySize(dataPath),
-    includedPaths: [...includedPaths].sort(),
-    appVersion: `win-exe-${appVersion}`,
-    warnings
-  };
-  fs.writeFileSync(path.join(snapshotPath, 'snapshot.json'), JSON.stringify(meta, null, 2), 'utf8');
-  enforceAutomaticSnapshotRetention();
-  return meta;
 }
 
 function normalizeRestoreProtectionMode(value, fallback = 'lightweight') {
@@ -1169,59 +1233,109 @@ async function createRestoreProtectionSnapshot(name, reason, protectionMode, ses
 
 function findLatestSnapshotRollout(sessionId) {
   for (const snapshot of loadSnapshots()) {
-    const files = [
-      ...walkFiles(path.join(snapshot.dataPath, 'sessions'), (filePath) => filePath.endsWith('.jsonl') && filePath.includes(sessionId)),
-      ...walkFiles(path.join(snapshot.dataPath, 'archived_sessions'), (filePath) => filePath.endsWith('.jsonl') && filePath.includes(sessionId))
-    ];
+    const files = indexTrustedSessionFiles({ codexRoot: snapshot.dataPath }).get(normalizeSessionId(sessionId)) || [];
     if (files.length) return { snapshot, rolloutPath: files[0] };
   }
   return null;
 }
 
-function relativeFromDataRoot(dataPath, filePath) {
-  const relative = path.relative(dataPath, filePath);
-  return relative && !relative.startsWith('..') ? relative : path.basename(filePath);
+function preflightSnapshotSessionRestore(snapshot, sessionIds, { replace = false } = {}) {
+  validateSnapshotRestorePaths(snapshot);
+  return buildSessionRestorePlan({
+    sessionIds,
+    sourceRoot: snapshot.dataPath,
+    destinationRoot: codexRoot,
+    replace,
+  });
 }
 
-function mergeLinesContaining(sourcePath, destinationPath, needle) {
-  if (!exists(sourcePath)) return;
-  ensureDir(path.dirname(destinationPath));
+function rolloutPathUpdatesFromRestorePlan(plan) {
+  const updates = [];
   const seen = new Set();
-  const output = [];
-  for (const line of readLines(destinationPath)) {
-    if (!seen.has(line)) {
-      seen.add(line);
-      output.push(line);
-    }
-  }
-  for (const line of readLines(sourcePath)) {
-    if (line.includes(needle) && !seen.has(line)) {
-      seen.add(line);
-      output.push(line);
-    }
-  }
-  fs.writeFileSync(destinationPath, `${output.join('\n')}${output.length ? '\n' : ''}`, 'utf8');
-}
-
-function removeLinesContaining(targetPath, needle) {
-  if (!exists(targetPath)) return;
-  const output = readLines(targetPath).filter((line) => !line.includes(needle));
-  fs.writeFileSync(targetPath, `${output.join('\n')}${output.length ? '\n' : ''}`, 'utf8');
-}
-
-function restoreShellSnapshots(sessionId, dataPath) {
-  const sourceDir = path.join(dataPath, 'shell_snapshots');
-  if (!exists(sourceDir)) return;
-  assertSafeSourcePath(sourceDir, dataPath, { recursive: true });
-  const files = walkFiles(sourceDir, (filePath) => path.basename(filePath).includes(sessionId));
-  for (const filePath of files) {
-    const destination = path.join(codexRoot, 'shell_snapshots', path.basename(filePath));
-    copyRestoreEntry({
-      sourcePath: filePath,
-      destinationPath: destination,
-      sourceRoot: dataPath,
-      destinationRoot: codexRoot,
+  for (const entry of plan.trustedFiles) {
+    if (seen.has(entry.sessionId)) continue;
+    seen.add(entry.sessionId);
+    const relative = path.relative(plan.destinationRoot, entry.destinationPath);
+    updates.push({
+      sessionId: entry.sessionId,
+      rolloutPath: entry.destinationPath,
+      archived: relative.split(path.sep)[0] === 'archived_sessions',
     });
+  }
+  return updates;
+}
+
+async function preflightSnapshotStateDatabaseMerge(snapshot, sessionIds) {
+  if (!(snapshot.includedPaths || []).includes('state_5.sqlite')) return;
+  const sourceDatabasePath = assertSafeSourcePath(
+    path.join(snapshot.dataPath, 'state_5.sqlite'),
+    snapshot.dataPath,
+    { allowMissing: true },
+  );
+  const destinationDatabasePath = assertSafeDestinationPath(
+    path.join(codexRoot, 'state_5.sqlite'),
+    codexRoot,
+  );
+  await preflightLiveStateDatabaseMerge(
+    sourceDatabasePath,
+    destinationDatabasePath,
+    sessionIds,
+  );
+}
+
+function publishSnapshotSessionRestorePlan(plan) {
+  assertSessionRestorePlanFresh(plan, '预检后');
+  const staged = [];
+  const published = [];
+  try {
+    for (const entry of plan.trustedFiles) {
+      assertSafeSourcePath(entry.filePath, plan.sourceRoot);
+      assertSafeDestinationPath(entry.destinationPath, plan.destinationRoot);
+      fs.mkdirSync(path.dirname(entry.destinationPath), { recursive: true });
+      assertSafeDestinationPath(entry.destinationPath, plan.destinationRoot);
+      const temporaryPath = path.join(
+        path.dirname(entry.destinationPath),
+        `.${path.basename(entry.destinationPath)}.restore-${process.pid}-${crypto.randomUUID()}`,
+      );
+      fs.copyFileSync(entry.filePath, temporaryPath, fs.constants.COPYFILE_EXCL);
+      const handle = fs.openSync(temporaryPath, 'r+');
+      try {
+        fs.fsyncSync(handle);
+      } finally {
+        fs.closeSync(handle);
+      }
+      assertFileContentMatchesFingerprint(temporaryPath, entry.fingerprint);
+      staged.push({ entry, temporaryPath });
+    }
+
+    assertSessionRestorePlanFresh(plan, '发布前');
+    for (const item of staged) {
+      if (item.entry.destinationFingerprint) {
+        const backupPath = `${item.temporaryPath}.previous`;
+        fs.linkSync(item.entry.destinationPath, backupPath);
+        fs.renameSync(item.temporaryPath, item.entry.destinationPath);
+        published.push({ destinationPath: item.entry.destinationPath, backupPath });
+      } else {
+        // Hard-link publication is atomic and cannot replace a concurrently-created session.
+        fs.linkSync(item.temporaryPath, item.entry.destinationPath);
+        published.push({ destinationPath: item.entry.destinationPath, backupPath: null });
+      }
+    }
+    applySessionJsonlPlan(plan.jsonlPlan);
+  } catch (error) {
+    for (const item of [...published].reverse()) {
+      if (item.backupPath && exists(item.backupPath)) {
+        fs.renameSync(item.backupPath, item.destinationPath);
+      } else {
+        fs.rmSync(item.destinationPath, { force: true });
+      }
+    }
+    throw error;
+  } finally {
+    for (const item of staged) fs.rmSync(item.temporaryPath, { force: true });
+    for (const item of published) {
+      if (item.backupPath) fs.rmSync(item.backupPath, { force: true });
+    }
   }
 }
 
@@ -1263,60 +1377,14 @@ function mergeDirectory(sourceDir, destinationDir) {
   }
 }
 
-function jsonLineIdentity(line, key) {
-  const obj = parseJsonLine(line);
-  if (!obj || obj[key] === undefined || obj[key] === null) return null;
-  return `${key}:${String(obj[key])}`;
-}
-
-function lineContainsAnySessionId(line, allowedSessionIds) {
-  if (!allowedSessionIds || allowedSessionIds.size === 0) return false;
-  const obj = parseJsonLine(line);
-  if (obj) {
-    for (const key of ['session_id', 'id', 'thread_id']) {
-      if (obj[key] && allowedSessionIds.has(String(obj[key]))) return true;
-    }
-  }
-  return [...allowedSessionIds].some((sessionId) => String(line).includes(sessionId));
-}
-
-function mergeLineFile(sourcePath, destinationPath, uniqueKey = null, allowedSessionIds = null) {
-  if (!exists(sourcePath)) return;
-  ensureDir(path.dirname(destinationPath));
-  if (!exists(destinationPath) && !allowedSessionIds) {
-    copyReplacing(sourcePath, destinationPath);
-    return;
-  }
-
-  const seen = new Set();
-  const output = [];
-  const addLine = (line, requiresAllowedSession = false) => {
-    if (!String(line).trim()) return;
-    if (requiresAllowedSession && allowedSessionIds && !lineContainsAnySessionId(line, allowedSessionIds)) return;
-    const identity = uniqueKey ? (jsonLineIdentity(line, uniqueKey) || line) : line;
-    if (seen.has(identity)) return;
-    seen.add(identity);
-    output.push(line);
-  };
-
-  if (exists(destinationPath)) readLines(destinationPath).forEach((line) => addLine(line, false));
-  readLines(sourcePath).forEach((line) => addLine(line, true));
-  fs.writeFileSync(destinationPath, `${output.join('\n')}${output.length ? '\n' : ''}`, 'utf8');
-}
-
 function filterLineFile(targetPath, uniqueKey, allowedSessionIds) {
   if (!exists(targetPath)) return;
-  const seen = new Set();
-  const output = [];
-  for (const line of readLines(targetPath)) {
-    if (!String(line).trim()) continue;
-    if (!lineContainsAnySessionId(line, allowedSessionIds)) continue;
-    const identity = uniqueKey ? (jsonLineIdentity(line, uniqueKey) || line) : line;
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    output.push(line);
-  }
-  fs.writeFileSync(targetPath, `${output.join('\n')}${output.length ? '\n' : ''}`, 'utf8');
+  void uniqueKey;
+  const kind = path.basename(targetPath) === 'session_index.jsonl' ? 'sessionIndex'
+    : path.basename(targetPath) === 'history.jsonl.bak' ? 'historyBackup' : 'history';
+  applySessionJsonlPlan(buildSessionJsonlPlan({ operations: [{
+    mode: 'filter', kind, sourcePath: targetPath, destinationPath: targetPath, sessionIds: allowedSessionIds,
+  }] }));
 }
 
 function writeSnapshotDatabase(databasePath, db) {
@@ -1359,25 +1427,35 @@ function updateThreadRolloutPath(db, sessionId, rolloutPath, archived = null) {
   statement.free();
 }
 
-async function mergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds = null) {
+async function mergeStateDatabase(
+  sourceDbPath,
+  destinationDbPath,
+  allowedSessionIds = null,
+  rolloutPathUpdates = [],
+) {
   try {
-    return await mergeLiveStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds);
+    return await mergeLiveStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds, {
+      rolloutPathUpdates,
+    });
   } catch (error) {
-    throw new Error(`SQLite 索引合并失败：${error.message}`);
+    const wrapped = new Error(`SQLite 索引合并失败：${error.message}`, { cause: error });
+    wrapped.code = error.code;
+    throw wrapped;
   }
 }
 
-async function restoreConversationsOnly(snapshot) {
+async function restoreConversationsOnly(snapshot, sessionRestorePlan) {
   if (!snapshot || !exists(snapshot.dataPath)) throw new Error('快照结构不完整，无法恢复。');
   validateSnapshotRestorePaths(snapshot);
   ensureDir(codexRoot);
 
   const included = new Set(snapshot.includedPaths || []);
   const restorableSessionIds = included.has('state_5.sqlite')
-    ? new Set((await loadSessionsInSnapshot(snapshot)).filter((session) => session.existsOnDisk).map((session) => session.id))
+    ? new Set(sessionRestorePlan.sessionIds)
     : null;
 
   for (const relativePath of conversationDirectoryPaths) {
+    if (relativePath === 'sessions' || relativePath === 'archived_sessions') continue;
     if (!included.has(relativePath)) continue;
     const sourcePath = path.join(snapshot.dataPath, relativePath);
     if (!exists(sourcePath)) continue;
@@ -1388,18 +1466,7 @@ async function restoreConversationsOnly(snapshot) {
       destinationRoot: codexRoot,
     });
   }
-
-  for (const relativePath of conversationLineMergePaths) {
-    if (!included.has(relativePath)) continue;
-    assertSafeSourcePath(path.join(snapshot.dataPath, relativePath), snapshot.dataPath, { allowMissing: true });
-    assertSafeDestinationPath(path.join(codexRoot, relativePath), codexRoot);
-    mergeLineFile(
-      path.join(snapshot.dataPath, relativePath),
-      path.join(codexRoot, relativePath),
-      relativePath === 'session_index.jsonl' ? 'id' : null,
-      restorableSessionIds
-    );
-  }
+  publishSnapshotSessionRestorePlan(sessionRestorePlan);
 
   if (included.has('state_5.sqlite')) {
     const sourceDatabasePath = assertSafeSourcePath(
@@ -1414,9 +1481,9 @@ async function restoreConversationsOnly(snapshot) {
     const message = await mergeStateDatabase(
       sourceDatabasePath,
       destinationDatabasePath,
-      restorableSessionIds
+      restorableSessionIds,
+      rolloutPathUpdatesFromRestorePlan(sessionRestorePlan),
     );
-    if (restorableSessionIds) await repairStateDatabaseFileRolloutPaths(destinationDatabasePath, codexRoot, restorableSessionIds);
     return message;
   }
   return 'SQLite 索引未合并：快照不包含 state_5.sqlite。';
@@ -1446,23 +1513,6 @@ async function repairRecoveredThreadIndexFromIncrementalRecovery(catalog, recove
   }
 }
 
-async function repairStateDatabaseFileRolloutPaths(databasePath, root, sessionIds) {
-  if (!exists(databasePath)) return;
-  const safeDatabasePath = assertSafeDestinationPath(databasePath, root);
-  const updates = [];
-  for (const sessionId of sessionIds) {
-    const rolloutPath = findRolloutFile(root, sessionId);
-    if (!rolloutPath) continue;
-    const relative = safeRelativePath(root, rolloutPath);
-    updates.push({
-      sessionId,
-      rolloutPath,
-      archived: relative ? relative.split(path.sep)[0] === 'archived_sessions' : null,
-    });
-  }
-  await repairLiveStateDatabaseRolloutPaths(safeDatabasePath, updates);
-}
-
 function validateSnapshotRestorePaths(snapshot) {
   if (!snapshot || !exists(snapshot.dataPath)) throw new Error('快照结构不完整，无法恢复。');
   const restorePaths = validateRestorePaths({
@@ -1477,16 +1527,18 @@ function validateSnapshotRestorePaths(snapshot) {
   });
 }
 
-async function restoreFull(snapshot) {
+async function restoreFull(snapshot, sessionRestorePlan) {
   const validatedPaths = validateSnapshotRestorePaths(snapshot);
   ensureDir(codexRoot);
   const included = new Set(validatedPaths.map((restorePath) => restorePath.relativePath));
   const restorableSessionIds = included.has('state_5.sqlite')
-    ? new Set((await loadSessionsInSnapshot(snapshot)).filter((session) => session.existsOnDisk).map((session) => session.id))
+    ? new Set(sessionRestorePlan.sessionIds)
     : null;
 
   for (const restorePath of validatedPaths) {
     if (stateDatabaseSnapshotPaths.has(restorePath.relativePath)) continue;
+    if (conversationLineMergePaths.includes(restorePath.relativePath)) continue;
+    if (restorePath.relativePath === 'sessions' || restorePath.relativePath === 'archived_sessions') continue;
     if (!exists(restorePath.sourcePath)) continue;
     copyRestoreEntry({
       sourcePath: restorePath.sourcePath,
@@ -1496,6 +1548,8 @@ async function restoreFull(snapshot) {
     });
   }
 
+  publishSnapshotSessionRestorePlan(sessionRestorePlan);
+
   if (!restorableSessionIds) return;
 
   const sourceDatabasePath = path.join(snapshot.dataPath, 'state_5.sqlite');
@@ -1503,25 +1557,25 @@ async function restoreFull(snapshot) {
   if (!exists(sourceDatabasePath)) throw new Error('快照结构不完整：state_5.sqlite 缺失。');
   const safeSourceDatabasePath = assertSafeSourcePath(sourceDatabasePath, snapshot.dataPath);
   const safeDatabasePath = assertSafeDestinationPath(databasePath, codexRoot);
-  await replaceLiveStateDatabase(safeSourceDatabasePath, safeDatabasePath, restorableSessionIds);
-  await repairStateDatabaseFileRolloutPaths(safeDatabasePath, codexRoot, restorableSessionIds);
+  await replaceLiveStateDatabase(safeSourceDatabasePath, safeDatabasePath, restorableSessionIds, {
+    rolloutPathUpdates: rolloutPathUpdatesFromRestorePlan(sessionRestorePlan),
+  });
 
-  for (const relativePath of conversationLineMergePaths) {
-    if (!included.has(relativePath)) continue;
-    assertSafeDestinationPath(path.join(codexRoot, relativePath), codexRoot);
-    filterLineFile(
-      path.join(codexRoot, relativePath),
-      relativePath === 'session_index.jsonl' ? 'id' : null,
-      restorableSessionIds
-    );
-  }
 }
 
-async function mergeSingleSessionStateDb(snapshotDbPath, destinationDbPath, sessionId) {
+async function mergeSingleSessionStateDb(
+  snapshotDbPath,
+  destinationDbPath,
+  sessionId,
+  rolloutPathUpdates = [],
+) {
   try {
-    return await mergeLiveSingleSessionStateDb(snapshotDbPath, destinationDbPath, sessionId);
+    return await mergeLiveSingleSessionStateDb(snapshotDbPath, destinationDbPath, sessionId, {
+      rolloutPathUpdates,
+    });
   } catch (error) {
-    return `SQLite 索引合并失败：${error.message}`;
+    if (error.code === 'SQLITE_RESTORE_CONFLICT') throw error;
+    throw new Error(`SQLite 索引合并失败：${error.message}`, { cause: error });
   }
 }
 
@@ -1547,8 +1601,10 @@ function extractConversationText(value) {
 }
 
 function loadConversationMessages(session) {
-  if (!session || !exists(session.rolloutPath)) throw new Error('会话文件不存在。');
-  const lines = readLines(session.rolloutPath);
+  if (!session) throw new Error('会话文件不存在。');
+  const rolloutPath = findRolloutFile(codexRoot, session.id);
+  if (!rolloutPath) throw new Error('会话文件不存在或身份校验失败。');
+  const lines = readLines(rolloutPath);
   const eventMessages = [];
   const responseMessages = [];
   lines.forEach((line, index) => {
@@ -1655,22 +1711,17 @@ function lastBackupAtForDevice(device) {
   }
 }
 
-async function deleteSessionArtifacts(session) {
-  if (session.rolloutPath && exists(session.rolloutPath)) fs.rmSync(session.rolloutPath, { force: true });
-  for (const dir of ['sessions', 'archived_sessions']) {
-    for (const filePath of walkFiles(path.join(codexRoot, dir), (itemPath) => path.basename(itemPath).includes(session.id) && itemPath.endsWith('.jsonl'))) {
-      fs.rmSync(filePath, { force: true });
-      removeEmptyParents(path.dirname(filePath), path.join(codexRoot, dir));
-    }
+async function deleteSessionArtifacts(plan) {
+  const warning = applySessionDeletionPlan(plan);
+  for (const entry of plan.trustedFiles) {
+    const relative = safeRelativePath(codexRoot, entry.filePath);
+    if (relative) removeEmptyParents(path.dirname(entry.filePath), path.join(codexRoot, relative.split(path.sep)[0]));
   }
-  for (const lineFile of ['history.jsonl', 'history.jsonl.bak', 'session_index.jsonl']) {
-    removeLinesContaining(path.join(codexRoot, lineFile), session.id);
+  const messages = [];
+  for (const sessionId of plan.sessionIds) {
+    messages.push(await deleteSingleSessionStateDb(path.join(codexRoot, 'state_5.sqlite'), sessionId));
   }
-  const shellDir = path.join(codexRoot, 'shell_snapshots');
-  for (const filePath of walkFiles(shellDir, (itemPath) => path.basename(itemPath).includes(session.id))) {
-    fs.rmSync(filePath, { force: true });
-  }
-  return deleteSingleSessionStateDb(path.join(codexRoot, 'state_5.sqlite'), session.id);
+  return [warning, ...messages].filter(Boolean).join(' ');
 }
 
 handleTrustedIpc('load-state', async () => loadState());
@@ -1695,12 +1746,23 @@ handleTrustedIpc('list-nas-employees', async (_event, department) => nasService.
 
 handleTrustedIpc('activate-nas-backup', async (_event, department, employee) => {
   await nasRuntime.activate({ department: String(department || ''), employee: String(employee || '') });
+  ensureLaunchAtLoginEnabled();
+  updateTrayMenu();
   return nasSetupState();
 });
 
 handleTrustedIpc('retry-nas-backup', async () => {
   await nasRuntime.retry();
+  ensureLaunchAtLoginEnabled();
+  updateTrayMenu();
   return nasSetupState();
+});
+
+handleTrustedIpc('retry-launch-at-login', async () => ensureLaunchAtLoginEnabled());
+
+handleTrustedIpc('open-login-item-settings', async () => {
+  await loginItemController.openSettings();
+  return currentLaunchAtLoginState();
 });
 
 handleTrustedIpc('list-nas-backup-devices', async () => {
@@ -1778,17 +1840,23 @@ handleTrustedIpc('restore-snapshot-conversations', async (_event, snapshotId, pr
   if (!snapshot) throw new Error('没有找到快照。');
   validateSnapshotRestorePaths(snapshot);
   const protectionSessions = (await loadSessionsInSnapshot(snapshot)).filter((session) => session.existsOnDisk);
-  await createRestoreProtectionSnapshot(
+  const sessionRestorePlan = preflightSnapshotSessionRestore(
+    snapshot,
+    new Set(protectionSessions.map((session) => session.id)),
+  );
+  await preflightSnapshotStateDatabaseMerge(snapshot, new Set(sessionRestorePlan.sessionIds));
+  const protectionSnapshot = await createRestoreProtectionSnapshot(
     normalizeRestoreProtectionMode(protectionMode) === 'lightweight' ? 'Pre-Restore Lightweight Backup' : 'Pre-Restore Backup',
     normalizeRestoreProtectionMode(protectionMode) === 'lightweight' ? 'pre-restore-lightweight' : 'pre-restore',
     protectionMode,
     protectionSessions,
     backupCandidates
   );
-  const sqliteMessage = await restoreConversationsOnly(snapshot);
+  const protectionWarning = protectionSnapshotWarning(protectionSnapshot);
+  const sqliteMessage = await restoreConversationsOnly(snapshot, sessionRestorePlan);
   return {
     ok: true,
-    message: `已从 ${snapshot.name} 恢复对话，当前账号、登录态和模型供应商配置已保留。${sqliteMessage}`
+    message: `已从 ${snapshot.name} 恢复对话，当前账号、登录态和模型供应商配置已保留。${sqliteMessage}${protectionWarning}`
   };
 });
 
@@ -1800,7 +1868,13 @@ handleTrustedIpc('restore-snapshot-full', async (_event, snapshotId, protectionM
   const protectionSessions = mode === 'lightweight'
     ? (await loadSessions()).filter((session) => session.existsOnDisk)
     : (await loadSessionsInSnapshot(snapshot)).filter((session) => session.existsOnDisk);
-  await createRestoreProtectionSnapshot(
+  const snapshotSessions = (await loadSessionsInSnapshot(snapshot)).filter((session) => session.existsOnDisk);
+  const sessionRestorePlan = preflightSnapshotSessionRestore(
+    snapshot,
+    new Set(snapshotSessions.map((session) => session.id)),
+    { replace: true },
+  );
+  const protectionSnapshot = await createRestoreProtectionSnapshot(
     mode === 'lightweight' ? 'Pre-Restore Lightweight Backup' : 'Pre-Restore Backup',
     mode === 'lightweight' ? 'pre-restore-lightweight' : 'pre-restore',
     mode,
@@ -1808,8 +1882,9 @@ handleTrustedIpc('restore-snapshot-full', async (_event, snapshotId, protectionM
     backupCandidates,
     ['config.toml', 'auth.json', '.codex-global-state.json', '.codex-global-state.json.bak']
   );
-  await restoreFull(snapshot);
-  return { ok: true, message: `已完整恢复快照：${snapshot.name}。请重启 Codex。` };
+  const protectionWarning = protectionSnapshotWarning(protectionSnapshot);
+  await restoreFull(snapshot, sessionRestorePlan);
+  return { ok: true, message: `已完整恢复快照：${snapshot.name}。请重启 Codex。${protectionWarning}` };
 });
 
 handleTrustedIpc('restore-snapshot-session', async (_event, snapshotId, sessionId, protectionMode = 'lightweight') => {
@@ -1822,32 +1897,18 @@ handleTrustedIpc('restore-snapshot-session', async (_event, snapshotId, sessionI
     throw new Error('这个快照只有会话索引，没有真实会话文件，无法恢复到 Codex 客户端。请选择包含会话文件的快照。');
   }
   validateSnapshotRestorePaths(snapshot);
-  await createRestoreProtectionSnapshot(
+  const sessionRestorePlan = preflightSnapshotSessionRestore(snapshot, new Set([session.id]));
+  await preflightSnapshotStateDatabaseMerge(snapshot, new Set([session.id]));
+  const protectionSnapshot = await createRestoreProtectionSnapshot(
     'Pre-Single-Session Restore Backup',
     'pre-single-session-restore',
     protectionMode,
     [session],
     conversationBackupCandidates
   );
+  const protectionWarning = protectionSnapshotWarning(protectionSnapshot);
 
-  const snapshotFilePath = snapshotFilePathForSession(snapshot, session);
-  if (!snapshotFilePath || !exists(snapshotFilePath)) {
-    throw new Error('这个快照里的会话文件路径无法映射到当前 Codex 数据目录。');
-  }
-  const relativePath = relativeFromDataRoot(snapshot.dataPath, snapshotFilePath);
-  copyRestoreEntry({
-    sourcePath: snapshotFilePath,
-    destinationPath: path.join(codexRoot, relativePath),
-    sourceRoot: snapshot.dataPath,
-    destinationRoot: codexRoot,
-  });
-
-  for (const lineFile of conversationLineMergePaths) {
-    assertSafeSourcePath(path.join(snapshot.dataPath, lineFile), snapshot.dataPath, { allowMissing: true });
-    assertSafeDestinationPath(path.join(codexRoot, lineFile), codexRoot);
-    mergeLinesContaining(path.join(snapshot.dataPath, lineFile), path.join(codexRoot, lineFile), sessionId);
-  }
-  restoreShellSnapshots(sessionId, snapshot.dataPath);
+  publishSnapshotSessionRestorePlan(sessionRestorePlan);
   const snapshotDatabasePath = assertSafeSourcePath(
     path.join(snapshot.dataPath, 'state_5.sqlite'),
     snapshot.dataPath,
@@ -1857,10 +1918,10 @@ handleTrustedIpc('restore-snapshot-session', async (_event, snapshotId, sessionI
   const sqliteMessage = await mergeSingleSessionStateDb(
     snapshotDatabasePath,
     destinationDatabasePath,
-    sessionId
+    sessionId,
+    rolloutPathUpdatesFromRestorePlan(sessionRestorePlan),
   );
-  await repairStateDatabaseFileRolloutPaths(destinationDatabasePath, codexRoot, new Set([sessionId]));
-  return { ok: true, message: `已恢复单个会话：${session.title || session.id}。${sqliteMessage}` };
+  return { ok: true, message: `已恢复单个会话：${session.title || session.id}。${sqliteMessage}${protectionWarning}` };
 });
 
 handleTrustedIpc('restore-snapshot-sessions', async (_event, snapshotId, sessionIds, protectionMode = 'lightweight') => {
@@ -1871,46 +1932,32 @@ handleTrustedIpc('restore-snapshot-sessions', async (_event, snapshotId, session
   const sessions = (await loadSessionsInSnapshot(snapshot)).filter((item) => idSet.has(item.id) && item.existsOnDisk);
   if (!sessions.length) throw new Error('没有可恢复的会话文件。');
   validateSnapshotRestorePaths(snapshot);
+  const restoredIds = new Set(sessions.map((session) => session.id));
+  const sessionRestorePlan = preflightSnapshotSessionRestore(snapshot, restoredIds);
+  await preflightSnapshotStateDatabaseMerge(snapshot, restoredIds);
 
-  await createRestoreProtectionSnapshot(
+  const protectionSnapshot = await createRestoreProtectionSnapshot(
     'Pre-Batch-Session Restore Backup',
     'pre-batch-session-restore',
     protectionMode,
     sessions,
     conversationBackupCandidates
   );
-  const restoredIds = new Set();
+  const protectionWarning = protectionSnapshotWarning(protectionSnapshot);
   const snapshotDatabasePath = assertSafeSourcePath(
     path.join(snapshot.dataPath, 'state_5.sqlite'),
     snapshot.dataPath,
     { allowMissing: true }
   );
   const destinationDatabasePath = assertSafeDestinationPath(path.join(codexRoot, 'state_5.sqlite'), codexRoot);
-  for (const session of sessions) {
-    const snapshotFilePath = snapshotFilePathForSession(snapshot, session);
-    if (!snapshotFilePath || !exists(snapshotFilePath)) continue;
-    const relativePath = relativeFromDataRoot(snapshot.dataPath, snapshotFilePath);
-    copyRestoreEntry({
-      sourcePath: snapshotFilePath,
-      destinationPath: path.join(codexRoot, relativePath),
-      sourceRoot: snapshot.dataPath,
-      destinationRoot: codexRoot,
-    });
-    for (const lineFile of conversationLineMergePaths) {
-      assertSafeSourcePath(path.join(snapshot.dataPath, lineFile), snapshot.dataPath, { allowMissing: true });
-      assertSafeDestinationPath(path.join(codexRoot, lineFile), codexRoot);
-      mergeLinesContaining(path.join(snapshot.dataPath, lineFile), path.join(codexRoot, lineFile), session.id);
-    }
-    restoreShellSnapshots(session.id, snapshot.dataPath);
-    await mergeSingleSessionStateDb(
-      snapshotDatabasePath,
-      destinationDatabasePath,
-      session.id
-    );
-    restoredIds.add(session.id);
-  }
-  await repairStateDatabaseFileRolloutPaths(destinationDatabasePath, codexRoot, restoredIds);
-  return { ok: true, message: `已从 ${snapshot.name} 批量恢复 ${restoredIds.size} 个会话。` };
+  publishSnapshotSessionRestorePlan(sessionRestorePlan);
+  await mergeStateDatabase(
+    snapshotDatabasePath,
+    destinationDatabasePath,
+    restoredIds,
+    rolloutPathUpdatesFromRestorePlan(sessionRestorePlan),
+  );
+  return { ok: true, message: `已从 ${snapshot.name} 批量恢复 ${restoredIds.size} 个会话。${protectionWarning}` };
 });
 
 handleTrustedIpc('restore-incremental-backup-sessions', async (_event, deviceId, sessionIds, protectionMode = 'lightweight') => {
@@ -1933,7 +1980,7 @@ handleTrustedIpc('restore-incremental-backup-sessions', async (_event, deviceId,
   assertSafeDestinationPath(path.join(codexRoot, 'state_5.sqlite'), codexRoot);
 
   const mode = normalizeRestoreProtectionMode(protectionMode);
-  await createRestoreProtectionSnapshot(
+  const protectionSnapshot = await createRestoreProtectionSnapshot(
     mode === 'lightweight'
       ? 'Pre-Incremental-Backup-Restore Lightweight Backup'
       : 'Pre-Incremental-Backup-Restore Backup',
@@ -1944,13 +1991,14 @@ handleTrustedIpc('restore-incremental-backup-sessions', async (_event, deviceId,
     await loadSessions(),
     mode === 'lightweight' ? conversationBackupCandidates : backupCandidates
   );
+  const protectionWarning = protectionSnapshotWarning(protectionSnapshot);
 
   const recovery = await restoreIncrementalSessions({ paths: selectedPaths, preflight });
   const threadIndexResult = await repairRecoveredThreadIndexFromIncrementalRecovery(catalog, recovery, restorableIds);
   return {
     ok: true,
     restoredCount: restorableIds.length,
-    message: `已从公司 NAS 会话备份恢复 ${restorableIds.length} 个缺失会话。${threadIndexResult.message} 请重启 Codex 后查看。`,
+    message: `已从公司 NAS 会话备份恢复 ${restorableIds.length} 个缺失会话。${threadIndexResult.message} 请重启 Codex 后查看。${protectionWarning}`,
   };
 });
 
@@ -1979,28 +2027,18 @@ handleTrustedIpc('restore-session', async (_event, sessionId, protectionMode = '
   const match = findLatestSnapshotRollout(sessionId);
   if (!match) throw new Error('快照库里没有包含这条会话的记录。');
   validateSnapshotRestorePaths(match.snapshot);
-  await createRestoreProtectionSnapshot(
+  const sessionRestorePlan = preflightSnapshotSessionRestore(match.snapshot, new Set([session.id]));
+  await preflightSnapshotStateDatabaseMerge(match.snapshot, new Set([session.id]));
+  const protectionSnapshot = await createRestoreProtectionSnapshot(
     'Pre-Single-Session Restore Backup',
     'pre-single-session-restore',
     protectionMode,
     [session],
     conversationBackupCandidates
   );
+  const protectionWarning = protectionSnapshotWarning(protectionSnapshot);
 
-  const relative = relativeFromDataRoot(match.snapshot.dataPath, match.rolloutPath);
-  const destination = path.join(codexRoot, relative);
-  copyRestoreEntry({
-    sourcePath: match.rolloutPath,
-    destinationPath: destination,
-    sourceRoot: match.snapshot.dataPath,
-    destinationRoot: codexRoot,
-  });
-  for (const lineFile of ['history.jsonl', 'history.jsonl.bak', 'session_index.jsonl']) {
-    assertSafeSourcePath(path.join(match.snapshot.dataPath, lineFile), match.snapshot.dataPath, { allowMissing: true });
-    assertSafeDestinationPath(path.join(codexRoot, lineFile), codexRoot);
-    mergeLinesContaining(path.join(match.snapshot.dataPath, lineFile), path.join(codexRoot, lineFile), sessionId);
-  }
-  restoreShellSnapshots(sessionId, match.snapshot.dataPath);
+  publishSnapshotSessionRestorePlan(sessionRestorePlan);
   const snapshotDatabasePath = assertSafeSourcePath(
     path.join(match.snapshot.dataPath, 'state_5.sqlite'),
     match.snapshot.dataPath,
@@ -2010,18 +2048,20 @@ handleTrustedIpc('restore-session', async (_event, sessionId, protectionMode = '
   const sqliteMessage = await mergeSingleSessionStateDb(
     snapshotDatabasePath,
     destinationDatabasePath,
-    sessionId
+    sessionId,
+    rolloutPathUpdatesFromRestorePlan(sessionRestorePlan),
   );
-  await repairStateDatabaseFileRolloutPaths(destinationDatabasePath, codexRoot, new Set([sessionId]));
-  return { ok: true, message: `已从 ${match.snapshot.name} 恢复：${session.title}。${sqliteMessage}` };
+  return { ok: true, message: `已从 ${match.snapshot.name} 恢复：${session.title}。${sqliteMessage}${protectionWarning}` };
 });
 
 handleTrustedIpc('delete-session', async (_event, sessionId) => {
   const session = await getSessionById(sessionId);
   if (!session) throw new Error('没有找到当前会话。');
-  await createSessionProtectionSnapshot('Pre-Delete Session Backup', 'pre-delete-session', [session]);
-  const sqliteMessage = await deleteSessionArtifacts(session);
-  return { ok: true, message: `会话已删除：${session.title}。${sqliteMessage}` };
+  const deletionPlan = buildSessionDeletionPlan({ sessionIds: new Set([session.id]), codexRoot });
+  const protectionSnapshot = await createSessionProtectionSnapshot('Pre-Delete Session Backup', 'pre-delete-session', [session]);
+  const protectionWarning = protectionSnapshotWarning(protectionSnapshot);
+  const sqliteMessage = await deleteSessionArtifacts(deletionPlan);
+  return { ok: true, message: `会话已删除：${session.title}。${sqliteMessage}${protectionWarning}` };
 });
 
 handleTrustedIpc('delete-sessions', async (_event, sessionIds) => {
@@ -2030,13 +2070,14 @@ handleTrustedIpc('delete-sessions', async (_event, sessionIds) => {
   const idSet = new Set(ids);
   const sessions = (await loadSessions()).filter((session) => idSet.has(session.id));
   if (!sessions.length) throw new Error('没有找到要删除的会话。');
-  await createSessionProtectionSnapshot('Pre-Delete Sessions Backup', 'pre-delete-session', sessions);
-  const sqliteMessages = [];
-  for (const session of sessions) {
-    sqliteMessages.push(await deleteSessionArtifacts(session));
-  }
-  const sqliteSummary = [...new Set(sqliteMessages)].join(' ');
-  return { ok: true, message: `已删除 ${sessions.length} 个会话。${sqliteSummary}` };
+  const deletionPlan = buildSessionDeletionPlan({
+    sessionIds: new Set(sessions.map((session) => session.id)),
+    codexRoot,
+  });
+  const protectionSnapshot = await createSessionProtectionSnapshot('Pre-Delete Sessions Backup', 'pre-delete-session', sessions);
+  const protectionWarning = protectionSnapshotWarning(protectionSnapshot);
+  const sqliteSummary = await deleteSessionArtifacts(deletionPlan);
+  return { ok: true, message: `已删除 ${sessions.length} 个会话。${sqliteSummary}${protectionWarning}` };
 });
 
 handleTrustedIpc('load-conversation', async (_event, sessionId) => {
@@ -2047,7 +2088,9 @@ handleTrustedIpc('load-conversation', async (_event, sessionId) => {
 handleTrustedIpc('open-session-file', async (_event, sessionId) => {
   const session = await getSessionById(sessionId);
   if (!session) throw new Error('没有找到当前会话。');
-  const sessionFile = resolveTrustedSessionFile(session.rolloutPath, codexRoot);
+  const trustedPath = findRolloutFile(codexRoot, session.id);
+  if (!trustedPath) throw new Error('会话文件不存在或身份校验失败。');
+  const sessionFile = resolveTrustedSessionFile(trustedPath, codexRoot);
   const error = await shell.openPath(sessionFile);
   if (error) throw new Error(`打开会话文件失败：${error}`);
   return { ok: true };
@@ -2056,7 +2099,9 @@ handleTrustedIpc('open-session-file', async (_event, sessionId) => {
 handleTrustedIpc('reveal-session-file', async (_event, sessionId) => {
   const session = await getSessionById(sessionId);
   if (!session) throw new Error('没有找到当前会话。');
-  const sessionFile = resolveTrustedSessionFile(session.rolloutPath, codexRoot);
+  const trustedPath = findRolloutFile(codexRoot, session.id);
+  if (!trustedPath) throw new Error('会话文件不存在或身份校验失败。');
+  const sessionFile = resolveTrustedSessionFile(trustedPath, codexRoot);
   shell.showItemInFolder(sessionFile);
   return { ok: true };
 });
