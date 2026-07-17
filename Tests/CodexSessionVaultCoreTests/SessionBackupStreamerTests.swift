@@ -8,6 +8,44 @@ struct SessionBackupStreamerTests {
     private let chunkSize = 1_048_576
 
     @Test
+    func bufferedWriterDefaultsToOneMiB() {
+        #expect(BufferedBackupWriter.defaultCapacity == chunkSize)
+    }
+
+    @Test
+    func bufferedWriterCombinesSmallAppendsAndSplitsLargeData() throws {
+        var chunks: [Data] = []
+        var writer = BufferedBackupWriter(capacity: 8) { chunks.append($0) }
+
+        try writer.append(Data("one".utf8))
+        try writer.append(byte: 0x0A)
+        try writer.append(Data("two".utf8))
+        try writer.append(byte: 0x0A)
+        try writer.append(Data("0123456789".utf8))
+        try writer.flush()
+
+        #expect(chunks.map(\.count) == [8, 8, 2])
+        #expect(chunks.reduce(into: Data(), { $0.append($1) }) == Data("one\ntwo\n0123456789".utf8))
+    }
+
+    @Test
+    func bufferedWriterKeepsPendingBytesWhenAFlushFails() throws {
+        var attempts = 0
+        var writer = BufferedBackupWriter(capacity: 4) { _ in
+            attempts += 1
+            throw StreamerTestError.injectedWriteFailure
+        }
+
+        #expect(throws: StreamerTestError.injectedWriteFailure) {
+            try writer.append(Data("four".utf8))
+        }
+        #expect(throws: StreamerTestError.injectedWriteFailure) {
+            try writer.flush()
+        }
+        #expect(attempts == 2)
+    }
+
+    @Test
     func rebuildStreamsFileLargerThanThreeChunks() throws {
         var sourceData = Data(repeating: 0x61, count: chunkSize * 3 + 17)
         sourceData.append(0x0A)

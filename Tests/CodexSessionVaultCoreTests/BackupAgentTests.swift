@@ -41,6 +41,189 @@ func initialScanBacksUpCompleteLinesAndUpdatesManifest() throws {
     {"role":"assistant","content":"On it"}
 
     """)
+    #expect(try backupAgentMode(fixture.paths.stateRoot) == 0o700)
+    #expect(try backupAgentMode(fixture.paths.cursorDatabaseURL) == 0o600)
+    #expect(try backupAgentMode(fixture.paths.localStatusURL) == 0o600)
+}
+
+@Test
+func initialScanPublishesMatchingVerificationSidecar() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "10101010-1010-1010-1010-101010101010"
+    try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"verified"}"# + "\n"
+    )
+
+    try fixture.makeAgent().performOneShotScan()
+
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let verification = try BackupVerificationStore(
+        fileURL: fixture.paths.verificationURL,
+        createParentDirectories: false
+    ).load()
+    let entry = try #require(verification.sessions[sessionID])
+    #expect(entry.backupPath == record.backupPath)
+    #expect(entry.byteCount == record.bytesBackedUp)
+    #expect(entry.lineCount == record.lineCount)
+    #expect(!entry.chunkHashes.isEmpty)
+    #expect(entry.verifiedAt == fixture.now)
+}
+
+@Test
+func emptySessionPublishesAZeroByteVerifiedBackup() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "10601060-1060-1060-1060-106010601060"
+    try fixture.writeSession(named: "\(sessionID).jsonl", contents: "")
+
+    try fixture.makeAgent().performOneShotScan()
+
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    let entry = try #require(BackupVerificationStore(
+        fileURL: fixture.paths.verificationURL,
+        createParentDirectories: false
+    ).load().sessions[sessionID])
+    #expect(try target.resourceValues(forKeys: [.fileSizeKey]).fileSize == 0)
+    #expect(entry.byteCount == 0)
+    #expect(entry.lineCount == 0)
+    #expect(entry.chunkHashes.isEmpty)
+}
+
+@Test
+func uploadReadbackReportsVerifyingProgressPhase() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    try fixture.writeSession(
+        named: "10501050-1050-1050-1050-105010501050.jsonl",
+        contents: #"{"role":"user","content":"progress"}"# + "\n"
+    )
+    var phases: [BackupProgressPhase] = []
+
+    try fixture.makeAgent(progressHandler: { phases.append($0.phase) }).performOneShotScan()
+
+    #expect(phases.contains(.verifying))
+    #expect(phases.last == .seeding)
+}
+
+@Test
+func rebuildReadbackFailureRetriesOnceThenPublishesVerifiedFile() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "10201020-1020-1020-1020-102010201020"
+    try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"retry readback"}"# + "\n"
+    )
+    var syncCount = 0
+    let committer = BackupFileCommitter(synchronize: { handle in
+        syncCount += 1
+        try handle.synchronize()
+        if syncCount == 1 {
+            try handle.seek(toOffset: 0)
+            try handle.write(contentsOf: Data("x".utf8))
+            try handle.synchronize()
+        }
+    })
+
+    try fixture.makeAgent(fileCommitter: committer).performOneShotScan()
+
+    #expect(syncCount == 2)
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    #expect(try String(contentsOf: target, encoding: .utf8).contains("retry readback"))
+    let verification = try BackupVerificationStore(
+        fileURL: fixture.paths.verificationURL,
+        createParentDirectories: false
+    ).load()
+    #expect(verification.sessions[sessionID]?.byteCount == record.bytesBackedUp)
+}
+
+@Test
+func twoRebuildReadbackFailuresPreserveFormalBackupAndMetadata() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "10301030-1030-1030-1030-103010301030"
+    let source = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"old payload"}"# + "\n"
+    )
+    try fixture.makeAgent().performOneShotScan()
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    let targetBefore = try Data(contentsOf: target)
+    let manifestBefore = try Data(contentsOf: fixture.paths.manifestURL)
+    let cursorBefore = try Data(contentsOf: fixture.paths.cursorDatabaseURL)
+    let verificationBefore = try Data(contentsOf: fixture.paths.verificationURL)
+    try Data((#"{"role":"user","content":"new payload"}"# + "\n").utf8).write(to: source)
+    try FileManager.default.setAttributes(
+        [.modificationDate: fixture.now.addingTimeInterval(60)],
+        ofItemAtPath: source.path
+    )
+    var syncCount = 0
+    let committer = BackupFileCommitter(synchronize: { handle in
+        syncCount += 1
+        try handle.synchronize()
+        try handle.seek(toOffset: 0)
+        try handle.write(contentsOf: Data("x".utf8))
+        try handle.synchronize()
+    })
+
+    var reportedError: Error?
+    do {
+        try fixture.makeAgent(fileCommitter: committer).performOneShotScan()
+    } catch {
+        reportedError = error
+    }
+
+    #expect(reportedError?.localizedDescription.contains("\(sessionID).jsonl") == true)
+    #expect(reportedError?.localizedDescription.contains("JSONL") == true)
+    #expect(syncCount == 2)
+    #expect(try Data(contentsOf: target) == targetBefore)
+    #expect(try Data(contentsOf: fixture.paths.manifestURL) == manifestBefore)
+    #expect(try Data(contentsOf: fixture.paths.cursorDatabaseURL) == cursorBefore)
+    #expect(try Data(contentsOf: fixture.paths.verificationURL) == verificationBefore)
+}
+
+@Test
+func twoAppendReadbackFailuresRollbackToLastVerifiedLength() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "10401040-1040-1040-1040-104010401040"
+    let first = #"{"role":"user","content":"first"}"# + "\n"
+    let second = #"{"role":"assistant","content":"second"}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: first)
+    try fixture.makeAgent().performOneShotScan()
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    let targetBefore = try Data(contentsOf: target)
+    let manifestBefore = try Data(contentsOf: fixture.paths.manifestURL)
+    let cursorBefore = try Data(contentsOf: fixture.paths.cursorDatabaseURL)
+    let verificationBefore = try Data(contentsOf: fixture.paths.verificationURL)
+    let oldOffset = Int64(targetBefore.count)
+    try fixture.append(second, to: source)
+    var syncCount = 0
+    let committer = BackupFileCommitter(synchronize: { handle in
+        syncCount += 1
+        try handle.synchronize()
+        if syncCount == 1 || syncCount == 3 {
+            try handle.seek(toOffset: UInt64(oldOffset))
+            try handle.write(contentsOf: Data("x".utf8))
+            try handle.synchronize()
+        }
+    })
+
+    #expect(throws: (any Error).self) {
+        try fixture.makeAgent(fileCommitter: committer).performOneShotScan()
+    }
+
+    #expect(syncCount == 3)
+    #expect(try Data(contentsOf: target) == targetBefore)
+    #expect(try Data(contentsOf: fixture.paths.manifestURL) == manifestBefore)
+    #expect(try Data(contentsOf: fixture.paths.cursorDatabaseURL) == cursorBefore)
+    #expect(try Data(contentsOf: fixture.paths.verificationURL) == verificationBefore)
 }
 
 @Test
@@ -92,9 +275,16 @@ func partialTrailingLineIsBackedUpOnlyAfterItIsCompleted() throws {
     let initialManifest = try fixture.loadManifest()
     let initialRecord = try #require(initialManifest.sessions[sessionID])
     let backupURL = fixture.paths.backupRoot.appendingPathComponent(initialRecord.backupPath)
-    #expect(FileManager.default.fileExists(atPath: backupURL.path) == false)
+    #expect(FileManager.default.fileExists(atPath: backupURL.path))
+    #expect(try backupURL.resourceValues(forKeys: [.fileSizeKey]).fileSize == 0)
     #expect(initialRecord.lineCount == 0)
     #expect(initialRecord.bytesBackedUp == 0)
+    let initialVerification = try BackupVerificationStore(
+        fileURL: fixture.paths.verificationURL,
+        createParentDirectories: false
+    ).load().sessions[sessionID]
+    #expect(initialVerification?.byteCount == 0)
+    #expect(initialVerification?.chunkHashes == [])
 
     try fixture.append("\n", to: sourceURL)
     try agent.performOneShotScan()
@@ -143,6 +333,7 @@ func cursorAdvancesAndPreventsDuplicateBackup() throws {
     #expect(cursor.lastByteOffset == Int64(fixture.lineBytes([
         #"{"role":"user","content":"Only once"}"#
     ])))
+    #expect(cursor.sourceFileIdentity != nil)
     #expect(cursor.lineCount == 1)
     #expect(record.lineCount == 1)
 }
@@ -205,6 +396,33 @@ func steadyStateScanDoesNotRewriteCursor() throws {
 }
 
 @Test
+func mismatchedStoredIdentityIsNotTreatedAsTheSameCursor() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "26262626-2626-2626-2626-262626262626"
+    let source = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"identity"}"# + "\n"
+    )
+    try fixture.makeAgent().performOneShotScan()
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    var cursor = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+    cursor.sourceFileIdentity = "stale:identity"
+    try cursorStore.upsert(cursor)
+    fixture.resetSpies()
+
+    try fixture.makeAgent().performOneShotScan()
+
+    let refreshed = try #require(try cursorStore.cursor(sourcePath: record.sourcePath))
+    let expectedIdentity = try BackupFileCommitter().inspectSource(source).fileIdentity
+    #expect(refreshed.sourceFileIdentity == expectedIdentity)
+    #expect(fixture.targetStatCount == 1)
+    #expect(fixture.cursorWriteBatchCount == 1)
+}
+
+@Test
 func unchangedScanStopsBeforeTargetAccess() throws {
     let fixture = try BackupAgentFixture.seededSession()
     defer { fixture.cleanup() }
@@ -235,7 +453,7 @@ func unchangedFiveHundredSessionScanUsesOneCursorReadAndNoTargetCalls() throws {
 }
 
 @Test
-func appendReadsAndVerifiesOnlyNewRangeAndClearsFullHash() throws {
+func appendReadsBoundedOldAnchorsAndNewRangeAndClearsFullHash() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
     let sessionID = "13131313-1313-1313-1313-131313131313"
@@ -250,8 +468,13 @@ func appendReadsAndVerifiesOnlyNewRangeAndClearsFullHash() throws {
     let newOffset = oldOffset + Int64(Data(secondLine.utf8).count)
     try fixture.makeAgent().performOneShotScan()
 
-    #expect(!fixture.sourceBodyReadRanges.isEmpty)
-    #expect(fixture.sourceBodyReadRanges.allSatisfy { $0 == oldOffset..<newOffset })
+    let newRange = oldOffset..<newOffset
+    let oldAnchorReads = fixture.sourceBodyReadRanges.filter { $0.upperBound <= oldOffset }
+    #expect(fixture.sourceBodyReadRanges.contains(newRange))
+    #expect(oldAnchorReads.count <= 3)
+    #expect(fixture.sourceBodyReadRanges.allSatisfy {
+        $0 == newRange || $0.upperBound <= oldOffset
+    })
     #expect(fixture.targetStatCount == 1)
     #expect(fixture.fullHashCount == 0)
     #expect(fixture.manifestWriteCount == 1)
@@ -260,6 +483,170 @@ func appendReadsAndVerifiesOnlyNewRangeAndClearsFullHash() throws {
     let record = try #require(fixture.loadManifest().sessions[sessionID])
     #expect(record.contentHash == nil)
     #expect(record.bytesBackedUp == newOffset)
+}
+
+@Test
+func growingFullRewriteWithChangedFirstAnchorRebuildsImmediately() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "23232323-2323-2323-2323-232323232323"
+    let original = largeVerifiedSessionLine()
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: original)
+    try fixture.makeAgent().performOneShotScan()
+    let originalRecord = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(originalRecord.backupPath)
+    var rewritten = Data(original.utf8)
+    rewritten[100] = rewritten[100] == 0x61 ? 0x62 : 0x61
+    rewritten.append(Data((#"{"role":"assistant","content":"growth"}"# + "\n").utf8))
+    try rewritten.write(to: source)
+    try FileManager.default.setAttributes(
+        [.modificationDate: fixture.now.addingTimeInterval(120)],
+        ofItemAtPath: source.path
+    )
+    fixture.resetSpies()
+
+    try fixture.makeAgent().performOneShotScan()
+
+    #expect(try Data(contentsOf: target) == rewritten)
+    #expect(fixture.sourceBodyReadRanges.contains(0..<Int64(rewritten.count)))
+}
+
+@Test
+func normalLargeAppendUsesAtMostThreeOldAnchorsWithoutRebuild() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "24242424-2424-2424-2424-242424242424"
+    let original = largeVerifiedSessionLine()
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: original)
+    try fixture.makeAgent().performOneShotScan()
+    let originalRecord = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(originalRecord.backupPath)
+    let oldOffset = Int64(Data(original.utf8).count)
+    let appended = #"{"role":"assistant","content":"append"}"# + "\n"
+    try fixture.append(appended, to: source)
+    let newOffset = oldOffset + Int64(Data(appended.utf8).count)
+    fixture.resetSpies()
+
+    try fixture.makeAgent().performOneShotScan()
+
+    let oldRangeReads = fixture.sourceBodyReadRanges.filter { $0.upperBound <= oldOffset }
+    #expect(oldRangeReads.count == 3)
+    #expect(oldRangeReads.allSatisfy {
+        $0.upperBound - $0.lowerBound <= Int64(BackupVerificationDocument.defaultChunkSize)
+    })
+    #expect(!fixture.sourceBodyReadRanges.contains(0..<newOffset))
+    #expect(try Data(contentsOf: target) == Data(contentsOf: source))
+}
+
+@Test
+func dailyAuditRepairsGrowingRewriteOutsideAppendAnchorsAndRefreshesMetadata() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "27272727-2727-2727-2727-272727272727"
+    let original = largeVerifiedSessionLine()
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: original)
+    let agent = fixture.makeAgent()
+    try agent.performOneShotScan()
+    let originalRecord = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(originalRecord.backupPath)
+    let verificationStore = BackupVerificationStore(
+        fileURL: fixture.paths.verificationURL,
+        createParentDirectories: false
+    )
+    let originalVerification = try #require(verificationStore.load().sessions[sessionID])
+    let changedChunkIndex = 1
+    let lastChunkIndex = originalVerification.chunkHashes.count - 1
+    let anchorIndices = Set([0, lastChunkIndex / 2, lastChunkIndex])
+    #expect(originalVerification.chunkHashes.count >= 5)
+    #expect(!anchorIndices.contains(changedChunkIndex))
+    var rewritten = Data(original.utf8)
+    let changedOffset = BackupVerificationDocument.defaultChunkSize + 100
+    rewritten[changedOffset] = rewritten[changedOffset] == 0x61 ? 0x62 : 0x61
+    let growth = Data((#"{"role":"assistant","content":"daily repair"}"# + "\n").utf8)
+    rewritten.append(growth)
+    try rewritten.write(to: source)
+    try FileManager.default.setAttributes(
+        [.modificationDate: fixture.now.addingTimeInterval(120)],
+        ofItemAtPath: source.path
+    )
+    fixture.resetSpies()
+
+    try agent.performOneShotScan()
+
+    let staleTarget = try Data(contentsOf: target)
+    #expect(staleTarget != rewritten)
+    #expect(!fixture.sourceBodyReadRanges.contains(0..<Int64(rewritten.count)))
+    let incrementalVerification = try #require(verificationStore.load().sessions[sessionID])
+    #expect(incrementalVerification.chunkHashes[changedChunkIndex]
+        == originalVerification.chunkHashes[changedChunkIndex])
+
+    fixture.now = fixture.now.addingTimeInterval(86_401)
+    let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000027"))
+    let outcome = try agent.performIntegrityAuditIfDue(deviceID: deviceID)
+
+    let fullVerification = try BackupFileVerifier().verifyFull(source)
+    let repairedVerification = try #require(verificationStore.load().sessions[sessionID])
+    let repairedRecord = try #require(fixture.loadManifest().sessions[sessionID])
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    let repairedCursor = try #require(try cursorStore.cursor(sourcePath: repairedRecord.sourcePath))
+    let auditState = try fixture.loadAuditState()
+    #expect(outcome == .completed(checked: 1, repaired: 1))
+    #expect(try Data(contentsOf: target) == rewritten)
+    #expect(repairedVerification.byteCount == Int64(rewritten.count))
+    #expect(repairedVerification.lineCount == 2)
+    #expect(repairedVerification.chunkHashes == fullVerification.chunkHashes)
+    #expect(repairedVerification.verifiedAt == fixture.now)
+    #expect(repairedRecord.contentHash == fullVerification.contentHash)
+    #expect(repairedRecord.lastBackedUpAt == fixture.now)
+    #expect(repairedCursor.lastByteOffset == Int64(rewritten.count))
+    #expect(repairedCursor.updatedAt == fixture.now.timeIntervalSince1970)
+    #expect(auditState.lastCompletedAt == fixture.now)
+    #expect(auditState.repairedCount == 1)
+}
+
+@Test
+func sourceGrowthDuringAppendTruncatesTargetAndDoesNotAdvanceMetadata() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "25252525-2525-2525-2525-252525252525"
+    let first = #"{"role":"user","content":"first"}"# + "\n"
+    let second = #"{"role":"assistant","content":"second"}"# + "\n"
+    let third = #"{"role":"assistant","content":"changed during scan"}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: first)
+    try fixture.makeAgent().performOneShotScan()
+    let manifestBefore = try fixture.loadManifest()
+    let recordBefore = try #require(manifestBefore.sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(recordBefore.backupPath)
+    let targetBefore = try Data(contentsOf: target)
+    let cursorStore = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try cursorStore.open()
+    let cursorBefore = try #require(try cursorStore.cursor(sourcePath: recordBefore.sourcePath))
+    let verificationBefore = try BackupVerificationStore(
+        fileURL: fixture.paths.verificationURL,
+        createParentDirectories: false
+    ).load()
+    try fixture.append(second, to: source)
+    var injectedSourceGrowth = false
+    let committer = BackupFileCommitter(synchronize: { handle in
+        try handle.synchronize()
+        guard !injectedSourceGrowth else { return }
+        injectedSourceGrowth = true
+        try fixture.append(third, to: source)
+    })
+
+    #expect(throws: (any Error).self) {
+        try fixture.makeAgent(fileCommitter: committer).performOneShotScan()
+    }
+
+    #expect(injectedSourceGrowth)
+    #expect(try Data(contentsOf: target) == targetBefore)
+    #expect(try fixture.loadManifest().sessions[sessionID] == recordBefore)
+    #expect(try cursorStore.cursor(sourcePath: recordBefore.sourcePath) == cursorBefore)
+    #expect(try BackupVerificationStore(
+        fileURL: fixture.paths.verificationURL,
+        createParentDirectories: false
+    ).load() == verificationBefore)
 }
 
 @Test
@@ -298,7 +685,7 @@ func emptySeedAndEmptyRebuildStoreCanonicalContentHash() throws {
     let emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     #expect(try fixture.loadManifest().sessions[sessionID]?.contentHash == emptyHash)
 
-    try Data("complete\n".utf8).write(to: source)
+    try Data((#"{"role":"user","content":"complete"}"# + "\n").utf8).write(to: source)
     try FileManager.default.setAttributes(
         [.modificationDate: fixture.now.addingTimeInterval(120)],
         ofItemAtPath: source.path
@@ -347,7 +734,13 @@ func appendTitleFallbackUsesOnlyNewRangeInsteadOfLargeTargetPrefix() throws {
     let newOffset = oldOffset + Int64(Data(newTitleLine.utf8).count)
     let updatedRecord = try #require(fixture.loadManifest().sessions[sessionID])
     #expect(updatedRecord.title == "new appended title")
-    #expect(fixture.sourceBodyReadRanges.allSatisfy { $0 == oldOffset..<newOffset })
+    let newRange = oldOffset..<newOffset
+    let oldAnchorReads = fixture.sourceBodyReadRanges.filter { $0.upperBound <= oldOffset }
+    #expect(fixture.sourceBodyReadRanges.contains(newRange))
+    #expect(oldAnchorReads.count <= 3)
+    #expect(fixture.sourceBodyReadRanges.allSatisfy {
+        $0 == newRange || $0.upperBound <= oldOffset
+    })
 }
 
 @Test
@@ -753,6 +1146,54 @@ func persistedStatusIsPublishedThroughSendableCallback() throws {
 }
 
 @Test
+func noChangeTimerTicksStayLocalUntilHealthAndHeartbeatDeadlines() throws {
+    let fixture = try BackupAgentFixture(now: Date(timeIntervalSince1970: 1_784_092_800))
+    defer { fixture.cleanup() }
+    try fixture.writeSession(
+        named: "68686868-6868-6868-6868-686868686868.jsonl",
+        contents: #"{"role":"user","content":"steady"}"# + "\n"
+    )
+    let validations = LockedInvocationCounter()
+    let remoteWrites = LockedInvocationCounter()
+    let agent = fixture.makeAgent(
+        targetValidator: BackupTargetValidator { validations.increment() },
+        remoteStatusWriter: { data, url in
+            remoteWrites.increment()
+            try DurableAtomicWriter().write(data, to: url, createParentDirectories: false)
+        },
+        healthCheckInterval: 300,
+        remoteHeartbeatInterval: 1_800
+    )
+    defer { agent.stop() }
+    try agent.performOneShotScan()
+    validations.reset()
+    remoteWrites.reset()
+    let startedAt = fixture.now
+
+    fixture.now = startedAt.addingTimeInterval(299)
+    agent.requestImmediateScan(.timer)
+    Thread.sleep(forTimeInterval: 0.1)
+    #expect(validations.value == 0)
+    #expect(remoteWrites.value == 0)
+
+    fixture.now = startedAt.addingTimeInterval(300)
+    agent.requestImmediateScan(.timer)
+    #expect(validations.wait(for: 1))
+    #expect(remoteWrites.value == 0)
+
+    fixture.now = startedAt.addingTimeInterval(1_799)
+    agent.requestImmediateScan(.timer)
+    #expect(validations.wait(for: 2))
+    #expect(remoteWrites.value == 0)
+
+    fixture.now = startedAt.addingTimeInterval(1_800)
+    agent.requestImmediateScan(.timer)
+    #expect(validations.wait(for: 3))
+    #expect(remoteWrites.wait(for: 1))
+    #expect(try fixture.loadStatus().lastHeartbeatAt == fixture.now)
+}
+
+@Test
 func concurrentTriggersAreSerializedAndOneDrainIsCappedAtTwoScans() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
@@ -830,6 +1271,7 @@ func stoppedPartialSeedRetainsPendingStateAndReplacementCatchesUp() throws {
     )
     #expect(pendingRecords.count == 1)
     #expect(pendingRecords.first?["sourcePath"] as? String == secondSource.path)
+    #expect(try backupAgentMode(fixture.paths.pendingSourcesURL) == 0o600)
 
     let replacement = fixture.makeAgent()
     try replacement.performOneShotScan()
@@ -843,6 +1285,11 @@ func stoppedPartialSeedRetainsPendingStateAndReplacementCatchesUp() throws {
         JSONSerialization.jsonObject(with: Data(contentsOf: fixture.paths.pendingSourcesURL)) as? [[String: Any]]
     )
     #expect(clearedPending.isEmpty)
+}
+
+private func backupAgentMode(_ url: URL) throws -> Int {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    return ((attributes[.posixPermissions] as? NSNumber)?.intValue ?? -1) & 0o777
 }
 
 @Test
@@ -956,7 +1403,7 @@ func stoppedAgentCannotEraseAuditInterruptionWhenAuditStartsLater() throws {
 }
 
 @Test
-func periodicScanWhileAuditTimerWaitsDoesNotStarveScheduledAudit() throws {
+func noChangeTimerTickDoesNotStarveScheduledAudit() throws {
     let fixture = try BackupAgentFixture.seededSession()
     defer { fixture.cleanup() }
     let previousAudit = fixture.now.addingTimeInterval(-86_401)
@@ -986,7 +1433,6 @@ func periodicScanWhileAuditTimerWaitsDoesNotStarveScheduledAudit() throws {
     #expect(scansFinished.wait(timeout: .now() + 5) == .success)
     #expect(timers.waitForScheduledCount(1))
     agent.requestImmediateScan(.timer)
-    #expect(scansFinished.wait(timeout: .now() + 5) == .success)
     timers.fire(at: 0)
 
     #expect(outcomes.waitForCount(1))
@@ -1081,8 +1527,8 @@ func twoNoChangeTimerTicksDoNotInterruptRunningAuditOrQueueBackupWork() throws {
     agent.requestImmediateScan(.timer)
     agent.requestImmediateScan(.timer)
 
-    #expect(fixture.cursorReadBatchCount == 2)
-    #expect(fixture.sqliteRunnerInvocationCount == 2)
+    #expect(fixture.cursorReadBatchCount == 0)
+    #expect(fixture.sqliteRunnerInvocationCount == 0)
     #expect(fixture.sourceBodyReadCount == 0)
     #expect(fixture.targetStatCount == 0)
     #expect(fixture.cursorWriteBatchCount == 0)
@@ -1148,8 +1594,8 @@ func timerTickWithCompleteAppendInterruptsAuditAndBacksUpAppend() throws {
 
     agent.requestImmediateScan(.timer)
 
-    #expect(fixture.cursorReadBatchCount == 1)
-    #expect(fixture.sqliteRunnerInvocationCount == 1)
+    #expect(fixture.cursorReadBatchCount == 0)
+    #expect(fixture.sqliteRunnerInvocationCount == 0)
     #expect(fixture.sourceBodyReadCount == 0)
     #expect(fixture.targetStatCount == 0)
     #expect(fixture.cursorWriteBatchCount == 0)
@@ -1275,7 +1721,11 @@ func oversizedLineBeyondLimitSetsErrorStatusAndContinuesOtherSessions() throws {
         named: "\(healthySessionID).jsonl",
         contents: #"{"role":"user","content":"healthy"}"# + "\n"
     )
-    let agent = fixture.makeAgent()
+    let validations = LockedInvocationCounter()
+    let agent = fixture.makeAgent(
+        targetValidator: BackupTargetValidator { validations.increment() }
+    )
+    defer { agent.stop() }
 
     try agent.performOneShotScan()
 
@@ -1295,6 +1745,11 @@ func oversizedLineBeyondLimitSetsErrorStatusAndContinuesOtherSessions() throws {
     #expect(try String(contentsOf: healthyBackupURL, encoding: .utf8) == #"{"role":"user","content":"healthy"}"# + "\n")
     #expect(status.status == .error)
     #expect(status.lastError?.contains("exceeds maximum JSONL line size") == true)
+
+    validations.reset()
+    agent.requestImmediateScan(.timer)
+    #expect(validations.wait(for: 1))
+    #expect(agent.stopAndAwaitQuiescence(timeout: 10))
 }
 
 @Test
@@ -1341,7 +1796,7 @@ func corruptedManifestBackupPathOutsideBackupRootIsRepairedWithoutWritingOutside
 private final class BackupAgentFixture {
     let root: URL
     let paths: BackupPaths
-    let now: Date
+    var now: Date
     private(set) var sourceBodyReadRanges: [Range<Int64>] = []
     private(set) var targetStatCount = 0
     private(set) var fullHashCount = 0
@@ -1399,6 +1854,7 @@ private final class BackupAgentFixture {
 
     func makeAgent(
         tailer: SessionTailer = SessionTailer(),
+        fileCommitter: BackupFileCommitter = BackupFileCommitter(),
         targetValidator: BackupTargetValidator? = nil,
         deviceID: UUID? = nil,
         initialStatus: BackupStatus? = nil,
@@ -1410,7 +1866,11 @@ private final class BackupAgentFixture {
         ) -> Task<Void, Never>)? = nil,
         auditWillStart: @escaping @Sendable () -> Void = {},
         auditDidFinish: @escaping @Sendable (IntegrityAuditOutcome) -> Void = { _ in },
+        progressHandler: ((BackupProgress) -> Void)? = nil,
         statusHandler: (@Sendable (BackupStatus) -> Void)? = nil,
+        remoteStatusWriter: ((Data, URL) throws -> Void)? = nil,
+        healthCheckInterval: TimeInterval = 300,
+        remoteHeartbeatInterval: TimeInterval = 1_800,
         integrityAuditorFactory: ((BackupPaths) -> BackupIntegrityAuditor)? = nil
     ) -> BackupAgent {
         BackupAgent(
@@ -1420,7 +1880,12 @@ private final class BackupAgentFixture {
             targetValidator: targetValidator,
             deviceID: deviceID,
             initialStatus: initialStatus,
+            fileCommitter: fileCommitter,
+            progressHandler: progressHandler,
             statusHandler: statusHandler,
+            remoteStatusWriter: remoteStatusWriter,
+            healthCheckInterval: healthCheckInterval,
+            remoteHeartbeatInterval: remoteHeartbeatInterval,
             auditDelayProvider: auditDelayProvider,
             auditTimerScheduler: auditTimerScheduler,
             sessionBackupStreamer: SessionBackupStreamer(chunkSize: 1_048_576),
@@ -1569,6 +2034,16 @@ private enum BackupAgentFixtureError: Error {
     case sqliteFailed(String)
 }
 
+private func largeVerifiedSessionLine() -> String {
+    #"{"role":"user","content":""#
+        + String(
+            repeating: "a",
+            count: 4 * BackupVerificationDocument.defaultChunkSize + 128
+        )
+        + #""}"#
+        + "\n"
+}
+
 private final class LockedStatusRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [BackupStatus] = []
@@ -1593,6 +2068,30 @@ private final class LockedStatusRecorder: @unchecked Sendable {
             Thread.sleep(forTimeInterval: 0.01)
         }
         return lock.withLock { storage.contains(where: predicate) }
+    }
+}
+
+private final class LockedInvocationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int { lock.withLock { storedValue } }
+
+    func increment() {
+        lock.withLock { storedValue += 1 }
+    }
+
+    func reset() {
+        lock.withLock { storedValue = 0 }
+    }
+
+    func wait(for expected: Int, timeout: TimeInterval = 5) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if value >= expected { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return value >= expected
     }
 }
 

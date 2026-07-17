@@ -28,7 +28,9 @@ public final class NASConfigurationStore {
         try NASJSONFile.write(
             encoder.encode(configuration),
             to: fileURL,
-            fileManager: fileManager
+            fileManager: fileManager,
+            permissions: 0o600,
+            parentDirectoryPermissions: 0o700
         )
     }
 }
@@ -38,11 +40,15 @@ enum NASJSONFile {
         _ data: Data,
         to destination: URL,
         fileManager: FileManager,
+        permissions: NSNumber? = nil,
+        parentDirectoryPermissions: NSNumber? = nil,
         createParentDirectories: Bool = true
     ) throws {
         try DurableAtomicWriter(fileManager: fileManager).write(
             data,
             to: destination,
+            permissions: permissions,
+            parentDirectoryPermissions: parentDirectoryPermissions,
             createParentDirectories: createParentDirectories
         )
     }

@@ -5,6 +5,7 @@ public enum NASSetupState: String, Codable, Sendable {
     case disconnected
     case validating
     case seeding
+    case verifying
     case running
     case pending
     case error
@@ -179,6 +180,7 @@ public final class NASBackupRuntime {
         )
         do {
             let target = try configurationService.resolveActiveTarget()
+            try configurationService.verifyWritable(target)
             startAgent(for: target, trigger: .startup)
         } catch NASConfigurationError.configurationMissing {
             snapshot = .unconfigured
@@ -202,12 +204,15 @@ public final class NASBackupRuntime {
             startAgent(for: target, trigger: .activation)
             return target
         } catch {
-            if let previous = try? configurationService.resolveActiveTarget() {
+            let activationError = error
+            do {
+                let previous = try configurationService.resolveActiveTarget()
+                try configurationService.verifyWritable(previous)
                 startAgent(for: previous, trigger: .activation)
-            } else {
+            } catch {
                 markDisconnected(error)
             }
-            throw error
+            throw activationError
         }
     }
 
@@ -223,6 +228,7 @@ public final class NASBackupRuntime {
         snapshot = NASSetupSnapshot(state: .validating, configuration: snapshot.configuration)
         do {
             let target = try configurationService.resolveActiveTarget()
+            try configurationService.verifyWritable(target)
             startAgent(for: target, trigger: trigger)
         } catch {
             markDisconnected(error)
@@ -278,7 +284,7 @@ public final class NASBackupRuntime {
         lastAppliedCallbackSequence = 0
         activeTarget = target
         snapshot = snapshot(
-            state: initialStatus?.status == .error ? .error : .running,
+            state: initialStatus?.status == .error ? .error : .validating,
             configuration: target.configuration,
             status: initialStatus
         )
@@ -349,9 +355,13 @@ public final class NASBackupRuntime {
             generation: generation,
             sequence: sequence
         ) else { return }
-        let state: NASSetupState = progress.pendingFiles > 0
-            ? (progress.phase == .seeding ? .seeding : .pending)
-            : .running
+        let state: NASSetupState = if progress.phase == .verifying {
+            .verifying
+        } else if progress.pendingFiles > 0 {
+            progress.phase == .seeding ? .seeding : .pending
+        } else {
+            snapshot.state
+        }
         snapshot = NASSetupSnapshot(
             state: state,
             configuration: configuration,

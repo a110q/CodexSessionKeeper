@@ -36,9 +36,56 @@ struct StreamedAppendResult: Equatable, Sendable {
     let firstTitle: String?
 }
 
+struct BufferedBackupWriter {
+    static let defaultCapacity = 1_048_576
+
+    private let capacity: Int
+    private let writeChunk: (Data) throws -> Void
+    private var buffer: Data
+
+    init(
+        capacity: Int = Self.defaultCapacity,
+        writeChunk: @escaping (Data) throws -> Void
+    ) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        self.writeChunk = writeChunk
+        self.buffer = Data()
+        self.buffer.reserveCapacity(capacity)
+    }
+
+    mutating func append(_ data: Data) throws {
+        var offset = data.startIndex
+        while offset < data.endIndex {
+            let available = capacity - buffer.count
+            let count = min(available, data.distance(from: offset, to: data.endIndex))
+            let end = data.index(offset, offsetBy: count)
+            buffer.append(contentsOf: data[offset..<end])
+            offset = end
+            if buffer.count == capacity {
+                try flush()
+            }
+        }
+    }
+
+    mutating func append(byte: UInt8) throws {
+        buffer.append(byte)
+        if buffer.count == capacity {
+            try flush()
+        }
+    }
+
+    mutating func flush() throws {
+        guard !buffer.isEmpty else { return }
+        try writeChunk(buffer)
+        buffer.removeAll(keepingCapacity: true)
+    }
+}
+
 public struct SessionBackupStreamer: Sendable {
     private static let maximumChunkSize = 1_048_576
     private static let newlineByte: UInt8 = 0x0A
+    private static let newline = Data([newlineByte])
 
     private let chunkSize: Int
     private let maxLineBytes: Int
@@ -71,7 +118,8 @@ public struct SessionBackupStreamer: Sendable {
         source: URL,
         through maximumOffset: Int64?,
         destination: URL,
-        atomicWriter: DurableAtomicWriter
+        atomicWriter: DurableAtomicWriter,
+        verifyTemporary: ((URL, StreamedBackupResult) throws -> Void)? = nil
     ) throws -> StreamedBackupResult {
         if let maximumOffset, maximumOffset < 0 {
             throw CocoaError(.fileReadCorruptFile)
@@ -88,7 +136,30 @@ public struct SessionBackupStreamer: Sendable {
         var firstTitle: String?
         var lineOffset: Int64 = 0
 
-        try atomicWriter.replace(at: destination) { destinationHandle in
+        try atomicWriter.replace(
+            at: destination,
+            verifyTemporary: { temporaryURL in
+                guard let verifyTemporary else { return }
+                let verificationDigest = digest
+                try verifyTemporary(
+                    temporaryURL,
+                    StreamedBackupResult(
+                        committedByteCount: committedByteCount,
+                        lineCount: lineCount,
+                        contentHash: Self.hexDigest(verificationDigest.finalize()),
+                        pendingPartialLine: self.cursorPartialLine(
+                            pendingLine,
+                            blockedError: blockedError
+                        ),
+                        blockedError: blockedError,
+                        firstTitle: firstTitle
+                    )
+                )
+            }
+        ) { destinationHandle in
+            var bufferedWriter = BufferedBackupWriter {
+                try destinationHandle.write(contentsOf: $0)
+            }
             readLoop: while remaining.map({ $0 > 0 }) ?? true {
                 let requestedCount = remaining.map { Int(min($0, Int64(chunkSize))) } ?? chunkSize
                 guard requestedCount > 0,
@@ -119,13 +190,12 @@ public struct SessionBackupStreamer: Sendable {
                     }
 
                     if !pendingLine.isEmpty {
-                        try destinationHandle.write(contentsOf: pendingLine)
+                        try bufferedWriter.append(pendingLine)
                         digest.update(data: pendingLine)
                         committedByteCount += Int64(pendingLine.count)
                     }
-                    let newline = Data([Self.newlineByte])
-                    try destinationHandle.write(contentsOf: newline)
-                    digest.update(data: newline)
+                    try bufferedWriter.append(byte: Self.newlineByte)
+                    digest.update(data: Self.newline)
                     committedByteCount += 1
                     lineCount += 1
                     pendingLine.removeAll(keepingCapacity: true)
@@ -146,22 +216,16 @@ public struct SessionBackupStreamer: Sendable {
                     }
                 }
             }
+            try bufferedWriter.flush()
         }
 
-        let cursorPartialLine: Data
-        if blockedError != nil || pendingLine.isEmpty {
-            cursorPartialLine = Data()
-        } else if pendingLine.count <= maxPendingPartialBytes {
-            cursorPartialLine = pendingLine
-        } else {
-            cursorPartialLine = Data([0])
-        }
+        let partialLineForCursor = cursorPartialLine(pendingLine, blockedError: blockedError)
 
         return StreamedBackupResult(
             committedByteCount: committedByteCount,
             lineCount: lineCount,
             contentHash: Self.hexDigest(digest.finalize()),
-            pendingPartialLine: cursorPartialLine,
+            pendingPartialLine: partialLineForCursor,
             blockedError: blockedError,
             firstTitle: firstTitle
         )
@@ -194,6 +258,9 @@ public struct SessionBackupStreamer: Sendable {
         var pendingLine = Data()
         var blockedError: String?
         var firstTitle: String?
+        var bufferedWriter = BufferedBackupWriter {
+            try destinationHandle.write(contentsOf: $0)
+        }
 
         readLoop: while true {
             guard let chunk = try sourceHandle.read(upToCount: chunkSize), !chunk.isEmpty else {
@@ -218,10 +285,10 @@ public struct SessionBackupStreamer: Sendable {
                 }
 
                 if !pendingLine.isEmpty {
-                    try destinationHandle.write(contentsOf: pendingLine)
+                    try bufferedWriter.append(pendingLine)
                     appendedByteCount += Int64(pendingLine.count)
                 }
-                try destinationHandle.write(contentsOf: Data([Self.newlineByte]))
+                try bufferedWriter.append(byte: Self.newlineByte)
                 appendedByteCount += 1
                 lineCount += 1
                 pendingLine.removeAll(keepingCapacity: true)
@@ -242,6 +309,7 @@ public struct SessionBackupStreamer: Sendable {
             }
         }
 
+        try bufferedWriter.flush()
         if appendedByteCount > 0 {
             try synchronize(destinationHandle)
         }

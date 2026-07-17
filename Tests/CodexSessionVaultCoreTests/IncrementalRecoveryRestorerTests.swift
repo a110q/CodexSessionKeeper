@@ -25,6 +25,37 @@ struct IncrementalRecoveryRestorerTests {
     }
 
     @Test
+    func restoreStreamsAFileLargerThanThreeVerificationChunks() throws {
+        let fixture = try DirectRecoveryFixture()
+        defer { fixture.cleanup() }
+        let line = fixture.line(String(repeating: "x", count: 64 * 1_024))
+        let minimumBytes = BackupVerificationDocument.defaultChunkSize * 3 + 17
+        let repetitions = (minimumBytes + line.utf8.count - 1) / line.utf8.count
+        let source = try fixture.addBackup(
+            sessionID: "multi-chunk",
+            title: "Multi chunk",
+            contents: String(repeating: line, count: repetitions)
+        )
+        let expected = try BackupFileVerifier().verifyFull(source)
+        let restorer = IncrementalRecoveryRestorer(paths: fixture.paths)
+
+        let plan = try restorer.preflight(sessionIDs: ["multi-chunk"], currentSessionIDs: [])
+        let result = try restorer.restore(plan, to: fixture.paths.codexRoot)
+
+        let destination = fixture.recoveredURL(sessionID: "multi-chunk")
+        let restored = try BackupFileVerifier().verifyFull(
+            destination,
+            expectedByteCount: expected.byteCount,
+            expectedLineCount: expected.lineCount,
+            expectedContentHash: expected.contentHash,
+            expectedChunkHashes: expected.chunkHashes
+        )
+        #expect(expected.chunkHashes.count > 3)
+        #expect(restored == expected)
+        #expect(result.restoredSessionIDs == ["multi-chunk"])
+    }
+
+    @Test
     func oneUnsafeSourceFailsWholePreflightWithoutCreatingDestinations() throws {
         let fixture = try DirectRecoveryFixture()
         defer { fixture.cleanup() }
@@ -80,6 +111,117 @@ struct IncrementalRecoveryRestorerTests {
         }
         #expect(FileManager.default.fileExists(atPath: fixture.recoveredURL(sessionID: "changed").path) == false)
     }
+
+    @Test
+    func preflightRejectsSameLengthTamperingAndUntrustedLegacyBackups() throws {
+        let fixture = try DirectRecoveryFixture()
+        defer { fixture.cleanup() }
+        let source = try fixture.addBackup(
+            sessionID: "tampered",
+            title: "Tampered",
+            contents: fixture.line("safe-data")
+        )
+        try Data(fixture.line("evil-data").utf8).write(to: source)
+        let restorer = IncrementalRecoveryRestorer(paths: fixture.paths)
+
+        #expect(throws: (any Error).self) {
+            _ = try restorer.preflight(sessionIDs: ["tampered"], currentSessionIDs: [])
+        }
+
+        try fixture.addBackup(sessionID: "untrusted", title: "Untrusted", contents: fixture.line("legacy"))
+        try fixture.removeVerification(sessionID: "untrusted")
+        try fixture.clearContentHash(sessionID: "untrusted")
+        #expect(throws: (any Error).self) {
+            _ = try restorer.preflight(sessionIDs: ["untrusted"], currentSessionIDs: [])
+        }
+    }
+
+    @Test
+    func legacyContentHashBackupStillRestores() throws {
+        let fixture = try DirectRecoveryFixture()
+        defer { fixture.cleanup() }
+        try fixture.addBackup(sessionID: "legacy", title: "Legacy", contents: fixture.line("trusted"))
+        try fixture.removeVerification(sessionID: "legacy")
+        let restorer = IncrementalRecoveryRestorer(paths: fixture.paths)
+
+        let plan = try restorer.preflight(sessionIDs: ["legacy"], currentSessionIDs: [])
+        let result = try restorer.restore(plan, to: fixture.paths.codexRoot)
+
+        #expect(result.restoredSessionIDs == ["legacy"])
+    }
+
+    @Test
+    func freshComputerWithoutCodexDirectoryRestoresAfterSuccessfulPreflight() throws {
+        let fixture = try DirectRecoveryFixture()
+        defer { fixture.cleanup() }
+        try fixture.addBackup(sessionID: "fresh", title: "Fresh", contents: fixture.line("fresh"))
+        try FileManager.default.removeItem(at: fixture.paths.codexRoot)
+        let restorer = IncrementalRecoveryRestorer(paths: fixture.paths)
+
+        let plan = try restorer.preflight(sessionIDs: ["fresh"], currentSessionIDs: [])
+        #expect(FileManager.default.fileExists(atPath: fixture.paths.codexRoot.path) == false)
+        let result = try restorer.restore(plan, to: fixture.paths.codexRoot)
+
+        #expect(result.restoredSessionIDs == ["fresh"])
+        #expect(FileManager.default.fileExists(atPath: fixture.recoveredURL(sessionID: "fresh").path))
+    }
+
+    @Test
+    func stagingVerificationRejectsSourceReplacementAfterPreflight() throws {
+        let fixture = try DirectRecoveryFixture()
+        defer { fixture.cleanup() }
+        let source = try fixture.addBackup(
+            sessionID: "replaced",
+            title: "Replaced",
+            contents: fixture.line("original")
+        )
+        let restorer = IncrementalRecoveryRestorer(paths: fixture.paths)
+        let plan = try restorer.preflight(sessionIDs: ["replaced"], currentSessionIDs: [])
+        try Data(fixture.line("modified").utf8).write(to: source)
+
+        #expect(throws: (any Error).self) {
+            _ = try restorer.restore(plan, to: fixture.paths.codexRoot)
+        }
+        #expect(FileManager.default.fileExists(atPath: fixture.recoveredURL(sessionID: "replaced").path) == false)
+    }
+
+    @Test
+    func freshDirectoryCreatorRejectsCodexSymlinkRace() throws {
+        let fixture = try DirectRecoveryFixture()
+        defer { fixture.cleanup() }
+        try fixture.addBackup(sessionID: "linked-root", title: "Linked", contents: fixture.line("safe"))
+        let restorer = IncrementalRecoveryRestorer(paths: fixture.paths)
+        let plan = try restorer.preflight(sessionIDs: ["linked-root"], currentSessionIDs: [])
+        let outside = fixture.root.appendingPathComponent("outside-codex", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.removeItem(at: fixture.paths.codexRoot)
+        try FileManager.default.createSymbolicLink(at: fixture.paths.codexRoot, withDestinationURL: outside)
+
+        #expect(throws: (any Error).self) {
+            _ = try restorer.restore(plan, to: fixture.paths.codexRoot)
+        }
+        #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("sessions").path) == false)
+    }
+
+    @Test
+    func indexWriteFailureRollsBackAllNewlyPublishedSessions() throws {
+        let fixture = try DirectRecoveryFixture()
+        defer { fixture.cleanup() }
+        try fixture.addBackup(sessionID: "index-failure", title: "Index failure", contents: fixture.line("safe"))
+        let restorer = IncrementalRecoveryRestorer(paths: fixture.paths)
+        let plan = try restorer.preflight(sessionIDs: ["index-failure"], currentSessionIDs: [])
+        let indexURL = fixture.paths.codexRoot.appendingPathComponent("session_index.jsonl", isDirectory: true)
+        try FileManager.default.createDirectory(at: indexURL, withIntermediateDirectories: false)
+
+        #expect(throws: (any Error).self) {
+            _ = try restorer.restore(plan, to: fixture.paths.codexRoot)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: fixture.recoveredURL(sessionID: "index-failure").path) == false)
+        var isDirectory: ObjCBool = false
+        #expect(FileManager.default.fileExists(atPath: indexURL.path, isDirectory: &isDirectory))
+        #expect(isDirectory.boolValue)
+    }
 }
 
 private final class DirectRecoveryFixture {
@@ -87,6 +229,7 @@ private final class DirectRecoveryFixture {
     let paths: BackupPaths
     let now = Date(timeIntervalSince1970: 1_783_824_000)
     private var records: [String: BackupSessionRecord] = [:]
+    private var verifications: [String: BackupSessionVerification] = [:]
 
     init() throws {
         root = FileManager.default.temporaryDirectory
@@ -109,8 +252,24 @@ private final class DirectRecoveryFixture {
         let source = paths.backupRoot.appendingPathComponent(relativePath)
         try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(contents.utf8).write(to: source)
-        records[sessionID] = record(sessionID: sessionID, title: title, backupPath: relativePath)
+        let verified = try BackupFileVerifier().verifyFull(source)
+        records[sessionID] = record(
+            sessionID: sessionID,
+            title: title,
+            backupPath: relativePath,
+            byteCount: verified.byteCount,
+            lineCount: verified.lineCount,
+            contentHash: verified.contentHash
+        )
+        verifications[sessionID] = BackupSessionVerification(
+            backupPath: relativePath,
+            byteCount: verified.byteCount,
+            lineCount: verified.lineCount,
+            chunkHashes: verified.chunkHashes,
+            verifiedAt: now
+        )
         try saveManifest()
+        try saveVerification()
         return source
     }
 
@@ -121,7 +280,14 @@ private final class DirectRecoveryFixture {
         let source = paths.backupRoot.appendingPathComponent(relativePath)
         try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createSymbolicLink(at: source, withDestinationURL: outside)
-        records[sessionID] = record(sessionID: sessionID, title: sessionID, backupPath: relativePath)
+        records[sessionID] = record(
+            sessionID: sessionID,
+            title: sessionID,
+            backupPath: relativePath,
+            byteCount: Int64(Data(line("outside").utf8).count),
+            lineCount: 1,
+            contentHash: nil
+        )
         try saveManifest()
     }
 
@@ -155,7 +321,24 @@ private final class DirectRecoveryFixture {
         try? FileManager.default.removeItem(at: root)
     }
 
-    private func record(sessionID: String, title: String, backupPath: String) -> BackupSessionRecord {
+    func removeVerification(sessionID: String) throws {
+        verifications.removeValue(forKey: sessionID)
+        try saveVerification()
+    }
+
+    func clearContentHash(sessionID: String) throws {
+        records[sessionID]?.contentHash = nil
+        try saveManifest()
+    }
+
+    private func record(
+        sessionID: String,
+        title: String,
+        backupPath: String,
+        byteCount: Int64,
+        lineCount: Int,
+        contentHash: String?
+    ) -> BackupSessionRecord {
         BackupSessionRecord(
             sessionId: sessionID,
             sourcePath: paths.codexRoot.appendingPathComponent("sessions/\(sessionID).jsonl").path,
@@ -163,9 +346,10 @@ private final class DirectRecoveryFixture {
             title: title,
             firstSeenAt: now,
             lastBackedUpAt: now,
-            lineCount: 1,
-            bytesBackedUp: 32,
-            status: "active"
+            lineCount: lineCount,
+            bytesBackedUp: byteCount,
+            status: "active",
+            contentHash: contentHash
         )
     }
 
@@ -178,5 +362,11 @@ private final class DirectRecoveryFixture {
             sessions: records
         )
         try BackupManifestStore(manifestURL: paths.manifestURL).save(manifest)
+    }
+
+    private func saveVerification() throws {
+        try BackupVerificationStore(fileURL: paths.verificationURL).save(
+            BackupVerificationDocument(sessions: verifications)
+        )
     }
 }

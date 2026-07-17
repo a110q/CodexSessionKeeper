@@ -29,15 +29,18 @@ enum IntegrityAuditStreamPhase: Equatable, Sendable {
 struct IntegrityAuditInstrumentation: @unchecked Sendable {
     let didReadChunk: @Sendable (URL, Int64, Int) -> Void
     let didStreamChunk: @Sendable (IntegrityAuditStreamPhase, URL, Int64, Int) -> Void
+    let didWriteChunk: @Sendable (IntegrityAuditStreamPhase, URL, Int) -> Void
     let checkpoint: @Sendable (IntegrityAuditCheckpoint) throws -> Void
 
     init(
         didReadChunk: @escaping @Sendable (URL, Int64, Int) -> Void = { _, _, _ in },
         didStreamChunk: @escaping @Sendable (IntegrityAuditStreamPhase, URL, Int64, Int) -> Void = { _, _, _, _ in },
+        didWriteChunk: @escaping @Sendable (IntegrityAuditStreamPhase, URL, Int) -> Void = { _, _, _ in },
         checkpoint: @escaping @Sendable (IntegrityAuditCheckpoint) throws -> Void = { _ in }
     ) {
         self.didReadChunk = didReadChunk
         self.didStreamChunk = didStreamChunk
+        self.didWriteChunk = didWriteChunk
         self.checkpoint = checkpoint
     }
 }
@@ -221,6 +224,11 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             manifest.updatedAt = now
             try manifestStore.save(manifest)
         }
+        try refreshVerification(
+            manifest: manifest,
+            cursorsBySession: currentCursorsBySession,
+            verifiedAt: now
+        )
         if !staleCursorSourcePaths.isEmpty {
             let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
             try cursorStore.open()
@@ -241,6 +249,50 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             repairCount: state.repairedCount
         )
         return .completed(checked: checked, repaired: repaired)
+    }
+
+    private func refreshVerification(
+        manifest: BackupManifest,
+        cursorsBySession: [String: BackupCursor],
+        verifiedAt: Date
+    ) throws {
+        guard !cursorsBySession.isEmpty else { return }
+        let store = BackupVerificationStore(
+            fileURL: paths.verificationURL,
+            createParentDirectories: false,
+            fileManager: fileManager
+        )
+        var document = try store.load()
+        let original = document
+        let verifier = BackupFileVerifier(chunkSize: document.chunkSize)
+        for sessionID in cursorsBySession.keys.sorted() {
+            guard let cursor = cursorsBySession[sessionID],
+                  let record = manifest.sessions[sessionID],
+                  cursor.backupPath == record.backupPath,
+                  cursor.lastByteOffset == record.bytesBackedUp else {
+                continue
+            }
+            let target = try trustedPendingURL(
+                relativePath: record.backupPath,
+                allowedRoots: [paths.sessionsRoot, paths.archivedSessionsRoot]
+            )
+            let result = try verifier.verifyFull(
+                target,
+                expectedByteCount: record.bytesBackedUp,
+                expectedLineCount: record.lineCount,
+                expectedContentHash: record.contentHash
+            )
+            document.sessions[sessionID] = BackupSessionVerification(
+                backupPath: record.backupPath,
+                byteCount: result.byteCount,
+                lineCount: result.lineCount,
+                chunkHashes: result.chunkHashes,
+                verifiedAt: verifiedAt
+            )
+        }
+        if document != original {
+            try store.save(document)
+        }
     }
 
     func recordInitialSeedCompleted(at date: Date) throws {
@@ -443,17 +495,10 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         let repairHash: String
         let quarantine: QuarantineCopy
         do {
-            repairHash = try writeValidatedRepairTemporary(
+            repairHash = try writeAndVerifyRepairTemporary(
                 source: revalidated.source,
                 byteCount: revalidated.cursor.lastByteOffset,
                 destination: repairTemporary,
-                interruptionRequested: interruptionRequested
-            )
-            try verifyFile(
-                repairTemporary,
-                expectedByteCount: revalidated.cursor.lastByteOffset,
-                expectedHash: repairHash,
-                phase: .repairTemporaryVerification,
                 interruptionRequested: interruptionRequested
             )
 
@@ -860,6 +905,10 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             }
         )
         try writer.replace(at: destination, createParentDirectories: false) { destinationHandle in
+            var bufferedWriter = BufferedBackupWriter { chunk in
+                try destinationHandle.write(contentsOf: chunk)
+                instrumentation.didWriteChunk(.repairTemporary, destination, chunk.count)
+            }
             var offset: Int64 = 0
             while remaining > 0 {
                 try requireNotInterrupted(interruptionRequested)
@@ -868,7 +917,7 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
                     throw IntegrityAuditError.invalidCommittedSource(source.path)
                 }
                 try validateJSONLChunk(chunk, pendingLine: &pendingLine, source: source)
-                try destinationHandle.write(contentsOf: chunk)
+                try bufferedWriter.append(chunk)
                 digest.update(data: chunk)
                 instrumentation.didStreamChunk(.repairTemporary, source, offset, chunk.count)
                 remaining -= Int64(chunk.count)
@@ -878,8 +927,41 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             guard pendingLine.isEmpty else {
                 throw IntegrityAuditError.invalidCommittedSource(source.path)
             }
+            try bufferedWriter.flush()
         }
         return Self.hexDigest(digest.finalize())
+    }
+
+    private func writeAndVerifyRepairTemporary(
+        source: URL,
+        byteCount: Int64,
+        destination: URL,
+        interruptionRequested: @Sendable () -> Bool
+    ) throws -> String {
+        for attempt in 0..<2 {
+            let hash = try writeValidatedRepairTemporary(
+                source: source,
+                byteCount: byteCount,
+                destination: destination,
+                interruptionRequested: interruptionRequested
+            )
+            do {
+                try verifyFile(
+                    destination,
+                    expectedByteCount: byteCount,
+                    expectedHash: hash,
+                    phase: .repairTemporaryVerification,
+                    interruptionRequested: interruptionRequested
+                )
+                return hash
+            } catch IntegrityAuditControl.interrupted {
+                throw IntegrityAuditControl.interrupted
+            } catch {
+                try? fileManager.removeItem(at: destination)
+                if attempt == 1 { throw error }
+            }
+        }
+        throw IntegrityAuditError.verificationFailed(destination.path)
     }
 
     private func validateJSONLChunk(
@@ -1125,6 +1207,8 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         try DurableAtomicWriter(fileManager: fileManager, synchronize: synchronize).write(
             try encoder.encode(state),
             to: paths.auditStateURL,
+            permissions: 0o600,
+            parentDirectoryPermissions: 0o700,
             createParentDirectories: true
         )
     }
@@ -1168,6 +1252,8 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         try writer.write(
             try encoder.encode(pendingRepair),
             to: pendingRepairMetadataURL,
+            permissions: 0o600,
+            parentDirectoryPermissions: 0o700,
             createParentDirectories: true
         )
     }
@@ -1205,6 +1291,8 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         try DurableAtomicWriter(fileManager: fileManager, synchronize: synchronize).write(
             data,
             to: paths.localStatusURL,
+            permissions: 0o600,
+            parentDirectoryPermissions: 0o700,
             createParentDirectories: true
         )
         if fileManager.fileExists(atPath: paths.remoteStatusURL.path) {

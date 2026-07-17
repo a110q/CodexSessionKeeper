@@ -31,7 +31,20 @@ struct NASBackupRuntimeTests {
         #expect(fixture.agentFactory.agents[0].startCount == 1)
         #expect(fixture.agentFactory.agents[0].pollingIntervals == [30])
         #expect(fixture.agentFactory.agents[0].triggers == [.startup])
-        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().state == .validating)
+    }
+
+    @Test
+    func startupPerformsOneExplicitWritableProbe() throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        fixture.writeProbeCount.reset()
+        let runtime = fixture.makeRuntime()
+
+        try runtime.initialize()
+
+        #expect(fixture.writeProbeCount.value == 1)
     }
 
     @Test
@@ -54,7 +67,7 @@ struct NASBackupRuntimeTests {
 
         #expect(fixture.agentFactory.agents.count == 1)
         #expect(fixture.agentFactory.agents[0].triggers == [.reconnect])
-        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().state == .validating)
     }
 
     @Test
@@ -75,7 +88,7 @@ struct NASBackupRuntimeTests {
 
         #expect(fixture.agentFactory.agents.count == 1)
         #expect(healthyAgent.stopCount == 0)
-        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().state == .validating)
         #expect(runtime.setupSnapshot().lastError == nil)
     }
 
@@ -98,7 +111,7 @@ struct NASBackupRuntimeTests {
 
         #expect(fixture.agentFactory.agents.count == 1)
         #expect(healthyAgent.stopCount == 0)
-        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().state == .validating)
     }
 
     @Test
@@ -123,7 +136,7 @@ struct NASBackupRuntimeTests {
         fixture.scheduler.fireNext()
         #expect(fixture.agentFactory.agents.count == 1)
         #expect(fixture.agentFactory.agents[0].triggers == [.reconnect])
-        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().state == .validating)
     }
 
     @Test
@@ -203,6 +216,39 @@ struct NASBackupRuntimeTests {
     }
 
     @Test
+    func verifiedStateRequiresFinalStatusAfterReadbackProgress() async throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        let agent = try #require(fixture.agentFactory.agents.first)
+
+        #expect(runtime.setupSnapshot().state == .validating)
+        agent.publishProgress(BackupProgress(
+            totalFiles: 1,
+            completedFiles: 0,
+            pendingFiles: 1,
+            phase: .verifying
+        ))
+        await Task.yield()
+        #expect(runtime.setupSnapshot().state == .verifying)
+
+        agent.publishProgress(BackupProgress(
+            totalFiles: 1,
+            completedFiles: 1,
+            pendingFiles: 0,
+            phase: .scanning
+        ))
+        await Task.yield()
+        #expect(runtime.setupSnapshot().state == .verifying)
+
+        agent.publishStatus(fixture.status(health: .running, message: nil))
+        await Task.yield()
+        #expect(runtime.setupSnapshot().state == .running)
+    }
+
+    @Test
     func manualRetryAfterReconnectStartsAgent() throws {
         let fixture = try NASRuntimeFixture()
         defer { fixture.cleanup() }
@@ -216,7 +262,7 @@ struct NASBackupRuntimeTests {
 
         #expect(fixture.agentFactory.agents.count == 1)
         #expect(fixture.agentFactory.agents[0].triggers == [.reconnect])
-        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().state == .validating)
     }
 
     @Test
@@ -309,7 +355,7 @@ struct NASBackupRuntimeTests {
         ))
         await Task.yield()
 
-        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().state == .validating)
         #expect(runtime.setupSnapshot().lastError == nil)
     }
 
@@ -358,7 +404,7 @@ struct NASBackupRuntimeTests {
         #expect(fixture.agentFactory.agents[1].paths.backupRoot == previous.backupRoot)
         #expect(fixture.agentFactory.agents[1].startCount == 1)
         #expect(fixture.agentFactory.agents[1].triggers == [.activation])
-        #expect(runtime.setupSnapshot().state == .running)
+        #expect(runtime.setupSnapshot().state == .validating)
     }
 
     @Test
@@ -391,6 +437,7 @@ private final class NASRuntimeFixture {
     let service: NASConfigurationService
     let agentFactory = RecordingNASAgentFactory()
     let scheduler = RecordingRetryScheduler()
+    let writeProbeCount = RuntimeWriteProbeCounter()
     private let connectivity = NASRuntimeConnectivity()
     private(set) var statusReadCount = 0
     var connected: Bool {
@@ -421,6 +468,7 @@ private final class NASRuntimeFixture {
         let selectedRemountURL = remountURL
         let selectedConnectivity = connectivity
         let selectedDeviceID = deviceID
+        let selectedWriteProbeCount = writeProbeCount
         let locator = CompanyNASLocator(mountedVolumes: {
             guard selectedConnectivity.isConnected else { return [] }
             return [NASMountedVolume(rootURL: selectedMountRoot, remountURL: selectedRemountURL)]
@@ -432,7 +480,7 @@ private final class NASRuntimeFixture {
             deviceName: { "Runtime Mac" },
             deviceID: { selectedDeviceID },
             now: { Date(timeIntervalSince1970: 1_783_824_000) },
-            writeProbe: NASWriteProbe { _ in }
+            writeProbe: NASWriteProbe { _ in selectedWriteProbeCount.increment() }
         )
     }
 
@@ -555,6 +603,21 @@ private final class NASRuntimeFixture {
 
     func cleanup() {
         try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private final class RuntimeWriteProbeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int { lock.withLock { storedValue } }
+
+    func increment() {
+        lock.withLock { storedValue += 1 }
+    }
+
+    func reset() {
+        lock.withLock { storedValue = 0 }
     }
 }
 

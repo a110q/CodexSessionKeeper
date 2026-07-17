@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 public enum BackupTargetValidationError: Error, Equatable, Sendable {
@@ -55,6 +56,17 @@ public struct BackupFileStats: Equatable, Sendable {
 public struct BackupSourceMetadata: Sendable {
     public let byteCount: Int64
     public let modifiedAt: TimeInterval
+    public let fileIdentity: String?
+
+    public init(
+        byteCount: Int64,
+        modifiedAt: TimeInterval,
+        fileIdentity: String? = nil
+    ) {
+        self.byteCount = byteCount
+        self.modifiedAt = modifiedAt
+        self.fileIdentity = fileIdentity
+    }
 }
 
 public struct BackupTargetState: Sendable {
@@ -118,10 +130,14 @@ public final class BackupFileCommitter {
         let handle = try FileHandle(forWritingTo: target)
         do {
             try handle.seekToEnd()
-            for line in lines {
-                try handle.write(contentsOf: line)
-                try handle.write(contentsOf: Self.newline)
+            var bufferedWriter = BufferedBackupWriter {
+                try handle.write(contentsOf: $0)
             }
+            for line in lines {
+                try bufferedWriter.append(line)
+                try bufferedWriter.append(byte: Self.newlineByte)
+            }
+            try bufferedWriter.flush()
             try synchronize(handle)
             try handle.close()
         } catch {
@@ -136,13 +152,22 @@ public final class BackupFileCommitter {
     }
 
     public func inspectSource(_ source: URL) throws -> BackupSourceMetadata {
-        let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
+        let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true else {
             throw BackupPathsError.unsafeSource(source.path)
         }
+        var sourceStat = stat()
+        guard lstat(source.path, &sourceStat) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard sourceStat.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+            throw BackupPathsError.unsafeSource(source.path)
+        }
         return BackupSourceMetadata(
-            byteCount: Int64(values.fileSize ?? 0),
-            modifiedAt: values.contentModificationDate?.timeIntervalSince1970 ?? 0
+            byteCount: Int64(sourceStat.st_size),
+            modifiedAt: TimeInterval(sourceStat.st_mtimespec.tv_sec)
+                + TimeInterval(sourceStat.st_mtimespec.tv_nsec) / 1_000_000_000,
+            fileIdentity: "\(sourceStat.st_dev):\(sourceStat.st_ino)"
         )
     }
 
@@ -177,7 +202,8 @@ public final class BackupFileCommitter {
         through maximumOffset: Int64? = nil,
         at target: URL,
         under backupRoot: URL,
-        using streamer: SessionBackupStreamer = SessionBackupStreamer()
+        using streamer: SessionBackupStreamer = SessionBackupStreamer(),
+        verifyTemporary: ((URL, StreamedBackupResult) throws -> Void)? = nil
     ) throws -> StreamedBackupResult {
         try ensureParent(of: target, under: backupRoot)
         return try streamer.rebuildCompleteLines(
@@ -187,8 +213,31 @@ public final class BackupFileCommitter {
             atomicWriter: DurableAtomicWriter(
                 fileManager: fileManager,
                 synchronize: synchronize
-            )
+            ),
+            verifyTemporary: verifyTemporary
         )
+    }
+
+    func truncateTarget(
+        _ target: URL,
+        to byteCount: Int64,
+        under backupRoot: URL
+    ) throws {
+        guard byteCount >= 0 else { throw CocoaError(.fileWriteInvalidFileName) }
+        try ensureParent(of: target, under: backupRoot)
+        let values = try target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw BackupTargetValidationError.unsafeTarget(target.path)
+        }
+        let handle = try FileHandle(forWritingTo: target)
+        do {
+            try handle.truncate(atOffset: UInt64(byteCount))
+            try synchronize(handle)
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
     }
 
     func appendCompleteLines(

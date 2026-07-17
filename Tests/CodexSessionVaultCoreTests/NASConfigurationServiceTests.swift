@@ -59,6 +59,9 @@ struct NASConfigurationServiceTests {
         #expect(marker.deviceDirectoryName == target.deviceRoot.lastPathComponent)
         #expect(FileManager.default.fileExists(atPath: target.backupRoot.path))
         #expect(FileManager.default.fileExists(atPath: target.employeeRoot.appendingPathComponent("devices").path))
+        #expect(try nasConfigurationMode(fixture.localStateRoot) == 0o700)
+        #expect(try nasConfigurationMode(fixture.store.fileURL) == 0o600)
+        #expect(try nasConfigurationMode(target.employeeRoot) == 0o755)
     }
 
     @Test
@@ -88,6 +91,24 @@ struct NASConfigurationServiceTests {
         #expect(resolved.configuration == activated.configuration)
         #expect(resolved.deviceRoot.path == activated.deviceRoot.path)
         #expect(resolved.backupRoot.path == activated.backupRoot.path)
+    }
+
+    @Test
+    func savedTargetResolutionIsReadOnlyUntilWritableCheckIsExplicit() throws {
+        let fixture = try NASConfigurationFixture()
+        defer { fixture.cleanup() }
+        try fixture.createDepartment("运营部", employees: ["陈超"])
+        let probeCount = LockedIntCounter()
+        let service = fixture.makeService(writeProbe: NASWriteProbe { _ in probeCount.increment() })
+        let activated = try service.activate(department: "运营部", employee: "陈超")
+        probeCount.reset()
+
+        let resolved = try service.resolveActiveTarget()
+
+        #expect(probeCount.value == 0)
+        try service.verifyWritable(resolved)
+        #expect(probeCount.value == 1)
+        #expect(resolved.deviceRoot == activated.deviceRoot)
     }
 
     @Test
@@ -196,6 +217,23 @@ struct NASConfigurationServiceTests {
     }
 }
 
+private final class LockedIntCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int {
+        lock.withLock { storedValue }
+    }
+
+    func increment() {
+        lock.withLock { storedValue += 1 }
+    }
+
+    func reset() {
+        lock.withLock { storedValue = 0 }
+    }
+}
+
 private final class NASConfigurationFixture {
     let tempRoot: URL
     let mountRoot: URL
@@ -262,4 +300,9 @@ private extension JSONDecoder {
         decoder.dateDecodingStrategy = .iso8601
         return decoder
     }
+}
+
+private func nasConfigurationMode(_ url: URL) throws -> Int {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    return ((attributes[.posixPermissions] as? NSNumber)?.intValue ?? -1) & 0o777
 }

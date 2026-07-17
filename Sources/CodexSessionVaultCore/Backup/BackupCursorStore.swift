@@ -7,6 +7,7 @@ public struct BackupCursor: Equatable, Sendable {
     public var lastByteOffset: Int64
     public var lastSourceSize: Int64
     public var lastSourceModifiedAt: TimeInterval
+    public var sourceFileIdentity: String?
     public var lineCount: Int
     public var pendingPartialLine: Data
     public var status: String
@@ -24,7 +25,8 @@ public struct BackupCursor: Equatable, Sendable {
         pendingPartialLine: Data,
         status: String,
         lastError: String?,
-        updatedAt: TimeInterval
+        updatedAt: TimeInterval,
+        sourceFileIdentity: String? = nil
     ) {
         self.sessionId = sessionId
         self.sourcePath = sourcePath
@@ -32,6 +34,7 @@ public struct BackupCursor: Equatable, Sendable {
         self.lastByteOffset = lastByteOffset
         self.lastSourceSize = lastSourceSize
         self.lastSourceModifiedAt = lastSourceModifiedAt
+        self.sourceFileIdentity = sourceFileIdentity
         self.lineCount = lineCount
         self.pendingPartialLine = pendingPartialLine
         self.status = status
@@ -68,12 +71,29 @@ public final class BackupCursorStore {
     }
 
     public func open() throws {
+        let parent = databaseURL.deletingLastPathComponent()
         try fileManager.createDirectory(
-            at: databaseURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+            at: parent,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
         )
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+        if (try? fileManager.destinationOfSymbolicLink(atPath: databaseURL.path)) != nil {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        let databaseExisted = fileManager.fileExists(atPath: databaseURL.path)
+        if !databaseExisted {
+            guard fileManager.createFile(
+                atPath: databaseURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: databaseURL.path)
 
-        try execute("""
+        let createTable = """
         CREATE TABLE IF NOT EXISTS backup_cursors (
             source_path TEXT NOT NULL PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -81,13 +101,25 @@ public final class BackupCursorStore {
             last_byte_offset INTEGER NOT NULL,
             last_source_size INTEGER NOT NULL,
             last_source_modified_at REAL NOT NULL,
+            source_file_identity TEXT,
             line_count INTEGER NOT NULL,
             pending_partial_line TEXT NOT NULL,
             status TEXT NOT NULL,
             last_error TEXT,
             updated_at REAL NOT NULL
         );
-        """)
+        """
+        if databaseExisted {
+            let columns = try cursorColumnNames()
+            if columns.isEmpty {
+                try execute(createTable)
+            } else if !columns.contains("source_file_identity") {
+                try execute("ALTER TABLE backup_cursors ADD COLUMN source_file_identity TEXT;")
+            }
+        } else {
+            try execute(createTable)
+        }
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: databaseURL.path)
     }
 
     public func loadAll() throws -> [String: BackupCursor] {
@@ -107,6 +139,7 @@ public final class BackupCursorStore {
             last_byte_offset,
             last_source_size,
             last_source_modified_at,
+            source_file_identity,
             line_count,
             pending_partial_line,
             status,
@@ -177,6 +210,7 @@ public final class BackupCursorStore {
             last_byte_offset,
             last_source_size,
             last_source_modified_at,
+            source_file_identity,
             line_count,
             pending_partial_line,
             status,
@@ -189,6 +223,7 @@ public final class BackupCursorStore {
             \(cursor.lastByteOffset),
             \(cursor.lastSourceSize),
             \(cursor.lastSourceModifiedAt),
+            \(Self.sqlNullableText(cursor.sourceFileIdentity)),
             \(cursor.lineCount),
             \(Self.sqlText(pendingPartialLine)),
             \(Self.sqlText(cursor.status)),
@@ -201,6 +236,7 @@ public final class BackupCursorStore {
             last_byte_offset = excluded.last_byte_offset,
             last_source_size = excluded.last_source_size,
             last_source_modified_at = excluded.last_source_modified_at,
+            source_file_identity = excluded.source_file_identity,
             line_count = excluded.line_count,
             pending_partial_line = excluded.pending_partial_line,
             status = excluded.status,
@@ -219,6 +255,17 @@ public final class BackupCursorStore {
             arguments: baseSQLiteArguments + mode + ["-json", databaseURL.path],
             input: sql
         )
+    }
+
+    private func cursorColumnNames() throws -> Set<String> {
+        let output = try queryJSON(
+            "SELECT name FROM pragma_table_info('backup_cursors') ORDER BY cid;",
+            readOnly: true
+        )
+        guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+        return Set(try decoder.decode([CursorColumnRow].self, from: Data(output.utf8)).map(\.name))
     }
 
     private var baseSQLiteArguments: [String] {
@@ -306,6 +353,7 @@ private struct CursorRow: Decodable {
     var lastByteOffset: Int64
     var lastSourceSize: Int64
     var lastSourceModifiedAt: TimeInterval
+    var sourceFileIdentity: String?
     var lineCount: Int
     var pendingPartialLine: String
     var status: String
@@ -319,6 +367,7 @@ private struct CursorRow: Decodable {
         case lastByteOffset = "last_byte_offset"
         case lastSourceSize = "last_source_size"
         case lastSourceModifiedAt = "last_source_modified_at"
+        case sourceFileIdentity = "source_file_identity"
         case lineCount = "line_count"
         case pendingPartialLine = "pending_partial_line"
         case status
@@ -342,9 +391,14 @@ private struct CursorRow: Decodable {
             pendingPartialLine: pendingPartialLineData,
             status: status,
             lastError: lastError,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            sourceFileIdentity: sourceFileIdentity
         )
     }
+}
+
+private struct CursorColumnRow: Decodable {
+    var name: String
 }
 
 private enum BackupCursorStoreError: Error, Sendable {

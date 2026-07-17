@@ -7,6 +7,15 @@ public struct IncrementalRecoveryItem: Equatable, Sendable {
     public let backupPath: String
     public let recoveredFilename: String
     public let updatedAt: Date
+    public let expectedVerification: IncrementalRecoveryVerificationExpectation
+}
+
+public struct IncrementalRecoveryVerificationExpectation: Equatable, Sendable {
+    public let byteCount: Int64
+    public let lineCount: Int
+    public let contentHash: String
+    public let chunkSize: Int
+    public let chunkHashes: [String]?
 }
 
 public struct IncrementalRecoveryPlan: Equatable, Sendable {
@@ -53,6 +62,7 @@ public enum IncrementalRecoveryError: Error, LocalizedError, Equatable, Sendable
     case noSelectedSessions
     case sessionNotFound(String)
     case sourceChanged(String)
+    case unverifiedBackup(String)
 
     public var errorDescription: String? {
         switch self {
@@ -62,6 +72,8 @@ public enum IncrementalRecoveryError: Error, LocalizedError, Equatable, Sendable
             return "NAS 备份清单中找不到会话：\(sessionID)"
         case let .sourceChanged(sessionID):
             return "NAS 会话备份在预检后发生变化：\(sessionID)"
+        case let .unverifiedBackup(sessionID):
+            return "NAS 会话备份未通过完整校验，已拒绝恢复：\(sessionID)"
         }
     }
 }
@@ -88,6 +100,11 @@ public final class IncrementalRecoveryRestorer {
         let requested = Array(Set(sessionIDs)).sorted()
         guard !requested.isEmpty else { throw IncrementalRecoveryError.noSelectedSessions }
         let manifest = try loadManifest()
+        let verification = try BackupVerificationStore(
+            fileURL: paths.verificationURL,
+            createParentDirectories: false,
+            fileManager: fileManager
+        ).load()
         let catalog = IncrementalBackupCatalog(paths: paths, fileManager: fileManager)
         var items: [IncrementalRecoveryItem] = []
         var skipped: [String] = []
@@ -101,6 +118,12 @@ public final class IncrementalRecoveryRestorer {
                 continue
             }
             let sourceURL = try catalog.validatedBackupFileURL(for: record)
+            let expectedVerification = try validateBackup(
+                sourceURL,
+                sessionID: sessionID,
+                record: record,
+                verification: verification
+            )
             let title = displayTitle(for: record)
             items.append(IncrementalRecoveryItem(
                 sessionID: sessionID,
@@ -108,7 +131,8 @@ public final class IncrementalRecoveryRestorer {
                 sourceURL: sourceURL,
                 backupPath: record.backupPath,
                 recoveredFilename: uniqueFilename(for: sessionID, used: &usedFilenames),
-                updatedAt: record.lastBackedUpAt ?? record.firstSeenAt
+                updatedAt: record.lastBackedUpAt ?? record.firstSeenAt,
+                expectedVerification: expectedVerification
             ))
         }
         return IncrementalRecoveryPlan(items: items, skippedExistingSessionIDs: skipped)
@@ -143,40 +167,161 @@ public final class IncrementalRecoveryRestorer {
             }
         }
 
-        if !prepared.isEmpty, !fileManager.fileExists(atPath: recoveredRoot.path) {
-            try fileManager.createDirectory(at: recoveredRoot, withIntermediateDirectories: false)
+        guard !prepared.isEmpty else {
+            return IncrementalRecoveryResult(
+                restoredSessionIDs: [],
+                skippedExistingSessionIDs: skipped.sorted(),
+                threadRecords: []
+            )
+        }
+
+        let trustedRecoveredRoot = try SecureRecoveryDirectoryCreator.createRecoveredDirectory(
+            under: codexRoot,
+            fileManager: fileManager
+        )
+        guard trustedRecoveredRoot.standardizedFileURL == recoveredRoot.standardizedFileURL else {
+            throw RestoreFilesystemValidationError.unsafePath(recoveredRoot.path)
+        }
+        let stagingRoot = recoveredRoot.appendingPathComponent(
+            ".recovery-staging-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try RestoreFilesystemValidator.validateDestination(stagingRoot, under: codexRoot)
+        try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: false)
+        defer { try? fileManager.removeItem(at: stagingRoot) }
+
+        var staged: [(entry: (item: IncrementalRecoveryItem, source: URL, destination: URL), url: URL)] = []
+        for entry in prepared {
+            let stagingURL = stagingRoot.appendingPathComponent(entry.item.recoveredFilename)
+            try stageAndVerify(entry: entry, at: stagingURL)
+            staged.append((entry, stagingURL))
         }
 
         var restored: [String] = []
         var threadRecords: [IncrementalRecoveryThreadRecord] = []
-        for entry in prepared {
-            let contents = try Data(contentsOf: entry.source)
-            do {
-                try writer.writeIfAbsent(contents, to: entry.destination)
-            } catch {
+        var published: [URL] = []
+        do {
+            for stagedEntry in staged {
+                let entry = stagedEntry.entry
                 if fileManager.fileExists(atPath: entry.destination.path) {
                     skipped.insert(entry.item.sessionID)
                     continue
                 }
-                throw error
+                do {
+                    try fileManager.moveItem(at: stagedEntry.url, to: entry.destination)
+                } catch {
+                    if fileManager.fileExists(atPath: entry.destination.path) {
+                        skipped.insert(entry.item.sessionID)
+                        continue
+                    }
+                    throw error
+                }
+                published.append(entry.destination)
+                restored.append(entry.item.sessionID)
+                threadRecords.append(IncrementalRecoveryThreadRecord(
+                    sessionID: entry.item.sessionID,
+                    title: entry.item.title,
+                    rolloutPath: entry.destination.path,
+                    updatedAt: entry.item.updatedAt
+                ))
             }
-            restored.append(entry.item.sessionID)
-            threadRecords.append(IncrementalRecoveryThreadRecord(
-                sessionID: entry.item.sessionID,
-                title: entry.item.title,
-                rolloutPath: entry.destination.path,
-                updatedAt: entry.item.updatedAt
-            ))
-        }
 
-        if !threadRecords.isEmpty {
-            try mergeSessionIndex(threadRecords, codexRoot: codexRoot)
+            if !threadRecords.isEmpty {
+                try mergeSessionIndex(threadRecords, codexRoot: codexRoot)
+            }
+        } catch {
+            for destination in published {
+                try? fileManager.removeItem(at: destination)
+            }
+            throw error
         }
         return IncrementalRecoveryResult(
             restoredSessionIDs: restored.sorted(),
             skippedExistingSessionIDs: skipped.sorted(),
             threadRecords: threadRecords.sorted { $0.sessionID < $1.sessionID }
         )
+    }
+
+    private func validateBackup(
+        _ sourceURL: URL,
+        sessionID: String,
+        record: BackupSessionRecord,
+        verification: BackupVerificationDocument
+    ) throws -> IncrementalRecoveryVerificationExpectation {
+        guard record.bytesBackedUp >= 0, record.lineCount >= 0 else {
+            throw IncrementalRecoveryError.unverifiedBackup(sessionID)
+        }
+        let verifier = BackupFileVerifier(chunkSize: verification.chunkSize)
+        if let entry = verification.sessions[sessionID] {
+            guard entry.backupPath == record.backupPath,
+                  entry.byteCount == record.bytesBackedUp,
+                  entry.lineCount == record.lineCount else {
+                throw IncrementalRecoveryError.unverifiedBackup(sessionID)
+            }
+            let result = try verifier.verifyFull(
+                sourceURL,
+                expectedByteCount: record.bytesBackedUp,
+                expectedLineCount: record.lineCount,
+                expectedChunkHashes: entry.chunkHashes
+            )
+            return IncrementalRecoveryVerificationExpectation(
+                byteCount: result.byteCount,
+                lineCount: result.lineCount,
+                contentHash: result.contentHash,
+                chunkSize: verification.chunkSize,
+                chunkHashes: entry.chunkHashes
+            )
+        }
+
+        guard let contentHash = record.contentHash, Self.isSHA256(contentHash) else {
+            throw IncrementalRecoveryError.unverifiedBackup(sessionID)
+        }
+        let result = try verifier.verifyFull(
+            sourceURL,
+            expectedByteCount: record.bytesBackedUp,
+            expectedLineCount: record.lineCount,
+            expectedContentHash: contentHash
+        )
+        return IncrementalRecoveryVerificationExpectation(
+            byteCount: result.byteCount,
+            lineCount: result.lineCount,
+            contentHash: result.contentHash,
+            chunkSize: verification.chunkSize,
+            chunkHashes: nil
+        )
+    }
+
+    private func stageAndVerify(
+        entry: (item: IncrementalRecoveryItem, source: URL, destination: URL),
+        at stagingURL: URL
+    ) throws {
+        try RestoreFilesystemValidator.validateSource(entry.source, under: paths.backupRoot)
+        let sourceHandle = try FileHandle(forReadingFrom: entry.source)
+        defer { try? sourceHandle.close() }
+        let expected = entry.item.expectedVerification
+        try writer.replace(
+            at: stagingURL,
+            verifyTemporary: { temporaryURL in
+                _ = try BackupFileVerifier(chunkSize: expected.chunkSize).verifyFull(
+                    temporaryURL,
+                    expectedByteCount: expected.byteCount,
+                    expectedLineCount: expected.lineCount,
+                    expectedContentHash: expected.contentHash,
+                    expectedChunkHashes: expected.chunkHashes
+                )
+            },
+            writer: { destinationHandle in
+                while let chunk = try sourceHandle.read(upToCount: expected.chunkSize), !chunk.isEmpty {
+                    try destinationHandle.write(contentsOf: chunk)
+                }
+            }
+        )
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64 && value.unicodeScalars.allSatisfy { scalar in
+            (48...57).contains(scalar.value) || (65...70).contains(scalar.value) || (97...102).contains(scalar.value)
+        }
     }
 
     private func loadManifest() throws -> BackupManifest {
@@ -195,9 +340,7 @@ public final class IncrementalRecoveryRestorer {
         var lines: [Data] = []
         var existingIDs = Set<String>()
         if fileManager.fileExists(atPath: indexURL.path) {
-            let data = try Data(contentsOf: indexURL)
-            for line in data.split(separator: 0x0A) where !line.isEmpty {
-                let lineData = Data(line)
+            for lineData in try readIndexLines(indexURL) where !lineData.isEmpty {
                 lines.append(lineData)
                 if let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                    let id = object["id"] as? String {
@@ -217,6 +360,32 @@ public final class IncrementalRecoveryRestorer {
             output.append(0x0A)
         }
         try writer.write(output, to: indexURL)
+    }
+
+    private func readIndexLines(_ indexURL: URL) throws -> [Data] {
+        let handle = try FileHandle(forReadingFrom: indexURL)
+        defer { try? handle.close() }
+        var lines: [Data] = []
+        var pending = Data()
+        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+            var start = chunk.startIndex
+            for newline in chunk.indices where chunk[newline] == 0x0A {
+                if start < newline {
+                    pending.append(contentsOf: chunk[start..<newline])
+                }
+                lines.append(pending)
+                pending.removeAll(keepingCapacity: true)
+                start = chunk.index(after: newline)
+            }
+            if start < chunk.endIndex {
+                pending.append(contentsOf: chunk[start..<chunk.endIndex])
+            }
+            guard pending.count <= SessionTailer.defaultMaxLineBytes else {
+                throw BackupFileVerificationError.lineTooLong(SessionTailer.defaultMaxLineBytes)
+            }
+        }
+        if !pending.isEmpty { lines.append(pending) }
+        return lines
     }
 
     private func displayTitle(for record: BackupSessionRecord) -> String {

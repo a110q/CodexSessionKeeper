@@ -200,7 +200,6 @@ public final class NASConfigurationService {
             named: "incremental-backups",
             under: deviceRoot
         )
-        try writeProbe.verify(deviceRoot)
         return NASBackupTarget(
             configuration: configuration,
             employeeRoot: employeeRoot,
@@ -208,6 +207,16 @@ public final class NASConfigurationService {
             backupRoot: backupRoot,
             localStateRoot: localStateRoot.appendingPathComponent(configuration.deviceID.uuidString.lowercased(), isDirectory: true)
         )
+    }
+
+    public func verifyWritable(_ target: NASBackupTarget) throws {
+        let resolved = try resolveActiveTarget()
+        guard resolved.configuration == target.configuration,
+              resolved.deviceRoot == target.deviceRoot,
+              resolved.backupRoot == target.backupRoot else {
+            throw NASConfigurationError.invalidDeviceMarker(target.deviceRoot.path)
+        }
+        try writeProbe.verify(resolved.deviceRoot)
     }
 
     public func recoverySources() throws -> [NASRecoverySource] {

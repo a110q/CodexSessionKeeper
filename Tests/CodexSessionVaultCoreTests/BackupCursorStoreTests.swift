@@ -146,6 +146,58 @@ func cursorStoreUpsertsAndLoadsCursor() throws {
     let loaded = try store.cursor(sourcePath: cursor.sourcePath)
 
     #expect(loaded == cursor)
+    #expect(try cursorStoreMode(tempDirectory.appendingPathComponent("nested")) == 0o700)
+    #expect(try cursorStoreMode(tempDirectory.appendingPathComponent("nested/cursors.sqlite")) == 0o600)
+}
+
+@Test
+func cursorStoreMigratesLegacySchemaWithoutLosingRows() throws {
+    let tempDirectory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: tempDirectory) }
+    let databaseURL = tempDirectory.appendingPathComponent("legacy.sqlite")
+    try executeSQLite(
+        """
+        CREATE TABLE backup_cursors (
+            source_path TEXT NOT NULL PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            backup_path TEXT NOT NULL,
+            last_byte_offset INTEGER NOT NULL,
+            last_source_size INTEGER NOT NULL,
+            last_source_modified_at REAL NOT NULL,
+            line_count INTEGER NOT NULL,
+            pending_partial_line TEXT NOT NULL,
+            status TEXT NOT NULL,
+            last_error TEXT,
+            updated_at REAL NOT NULL
+        );
+        INSERT INTO backup_cursors VALUES (
+            '/tmp/legacy.jsonl',
+            'legacy-session',
+            'sessions/legacy.jsonl',
+            9,
+            12,
+            1700000000,
+            1,
+            '',
+            'active',
+            NULL,
+            1700000001
+        );
+        """,
+        databaseURL: databaseURL
+    )
+    let store = BackupCursorStore(databaseURL: databaseURL)
+
+    try store.open()
+
+    var migrated = try #require(try store.cursor(sourcePath: "/tmp/legacy.jsonl"))
+    #expect(migrated.sessionId == "legacy-session")
+    #expect(migrated.lastByteOffset == 9)
+    #expect(migrated.sourceFileIdentity == nil)
+
+    migrated.sourceFileIdentity = "42:99"
+    try store.upsert(migrated)
+    #expect(try store.cursor(sourcePath: migrated.sourcePath)?.sourceFileIdentity == "42:99")
 }
 
 @Test
@@ -369,6 +421,11 @@ private func makeTemporaryDirectory() throws -> URL {
         .appendingPathComponent("CodexSessionVaultCoreTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+private func cursorStoreMode(_ url: URL) throws -> Int {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    return ((attributes[.posixPermissions] as? NSNumber)?.intValue ?? -1) & 0o777
 }
 
 private func writeExecutableScript(_ contents: String, named name: String, in directory: URL) throws -> URL {

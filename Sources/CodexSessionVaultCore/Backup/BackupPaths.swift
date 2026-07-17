@@ -34,6 +34,10 @@ public struct BackupPaths: Sendable {
         backupRoot.appendingPathComponent("manifest.json", isDirectory: false)
     }
 
+    public var verificationURL: URL {
+        backupRoot.appendingPathComponent("verification.json", isDirectory: false)
+    }
+
     public var cursorDatabaseURL: URL {
         stateRoot.appendingPathComponent("cursors.sqlite", isDirectory: false)
     }

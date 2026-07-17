@@ -110,6 +110,43 @@ private struct RolloutFileMetadata {
     var createdAt: Date?
 }
 
+private struct SessionRestorePreflight {
+    let sessionIDs: Set<String>
+    let sourceRoot: URL
+    let destinationRoot: URL
+    let sourceFiles: [TrustedSessionFile]
+    let fingerprints: [SessionFileFingerprint]
+    let destinationFingerprints: [SessionFileFingerprint]
+    let missingDestinationFiles: [SessionFileAbsenceExpectation]
+    let lineMutations: [SessionRestoreLineMutation]
+
+    func validateCurrent() throws {
+        for fingerprint in fingerprints { try fingerprint.validateCurrent() }
+        for expectation in missingDestinationFiles { try expectation.validateCurrent() }
+    }
+
+    func validateDestinationCurrent(_ destination: URL) throws {
+        let path = destination.standardizedFileURL.path
+        for expectation in missingDestinationFiles where expectation.fileURL.path == path {
+            try expectation.validateCurrent()
+        }
+        for fingerprint in destinationFingerprints
+        where fingerprint.fileURL.standardizedFileURL.path == path {
+            try fingerprint.validateCurrent()
+        }
+    }
+
+    func destinationMustRemainMissing(_ destination: URL) -> Bool {
+        let path = destination.standardizedFileURL.path
+        return missingDestinationFiles.contains { $0.fileURL.path == path }
+    }
+}
+
+private struct SessionRestoreLineMutation {
+    let destinationURL: URL
+    let output: Data
+}
+
 enum AppSection: String, CaseIterable, Identifiable {
     case sessions = "会话管理"
     case snapshots = "快照恢复"
@@ -341,6 +378,7 @@ final class VaultModel: ObservableObject {
     @Published var snapshotName = ""
     @Published var lastError: String?
     @Published private(set) var nasSetupSnapshot = NASSetupSnapshot.unconfigured
+    @Published private(set) var launchAtLoginSnapshot = LaunchAtLoginSnapshot(enabled: false)
     @Published var nasDepartments: [NASDirectoryOption] = []
     @Published var nasEmployees: [NASDirectoryOption] = []
     @Published var selectedNASDepartment = ""
@@ -360,9 +398,11 @@ final class VaultModel: ObservableObject {
     private var sessionSearchTask: Task<Void, Never>?
     private var nasRuntime: NASBackupRuntime!
     private var nasConfigurationService: NASConfigurationService!
+    private let launchAtLoginController: MacLaunchAtLoginController
     private var nasStatusTask: Task<Void, Never>?
     private var currentCancellationURL: URL?
     fileprivate var operationCancellationURL: URL?
+    private let vaultPreparationFailure: String?
 
     private var snapshotRootURL: URL {
         URL(fileURLWithPath: vaultRoot).appendingPathComponent("snapshots", isDirectory: true)
@@ -385,11 +425,20 @@ final class VaultModel: ObservableObject {
 
     init(codexRoot explicitCodexRoot: String? = nil, vaultRoot explicitVaultRoot: String? = nil, refreshOnInit: Bool = true) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        codexRoot = explicitCodexRoot ?? "\(home)/.codex"
-        vaultRoot = explicitVaultRoot ?? "\(home)/.codex-session-vault"
+        launchAtLoginController = MacLaunchAtLoginController()
+        let resolvedCodexRoot = explicitCodexRoot ?? "\(home)/.codex"
+        let resolvedVaultRoot = explicitVaultRoot ?? "\(home)/.codex-session-vault"
+        codexRoot = resolvedCodexRoot
+        vaultRoot = resolvedVaultRoot
         autoRestoreOnLaunch = false
         UserDefaults.standard.set(false, forKey: Self.autoRestoreDefaultsKey)
-        let vaultURL = URL(fileURLWithPath: vaultRoot, isDirectory: true)
+        let vaultURL = URL(fileURLWithPath: resolvedVaultRoot, isDirectory: true)
+        do {
+            try LocalVaultPermissionHardener().prepareVault(at: vaultURL)
+            vaultPreparationFailure = nil
+        } catch {
+            vaultPreparationFailure = "本地仓库权限加固失败：\(error.localizedDescription)"
+        }
         let store = NASConfigurationStore(
             fileURL: vaultURL.appendingPathComponent("nas-backup-settings.json")
         )
@@ -400,8 +449,13 @@ final class VaultModel: ObservableObject {
         nasConfigurationService = service
         nasRuntime = NASBackupRuntime(
             configurationService: service,
-            codexRoot: URL(fileURLWithPath: codexRoot, isDirectory: true)
+            codexRoot: URL(fileURLWithPath: resolvedCodexRoot, isDirectory: true)
         )
+        if let vaultPreparationFailure {
+            lastError = vaultPreparationFailure
+            status = "本地仓库初始化失败"
+            return
+        }
         if refreshOnInit {
             refresh()
             initializeNASBackup()
@@ -466,7 +520,8 @@ final class VaultModel: ObservableObject {
         case .disconnected: return "公司 NAS 会话备份：NAS 未连接"
         case .validating: return "公司 NAS 会话备份：验证中"
         case .seeding: return "公司 NAS 会话备份：正在建立初始备份"
-        case .running: return "公司 NAS 会话备份：正常"
+        case .verifying: return "公司 NAS 会话备份：正在校验"
+        case .running: return "公司 NAS 会话备份：备份已验证"
         case .pending: return "公司 NAS 会话备份：存在待补传内容"
         case .error: return "公司 NAS 会话备份：失败"
         }
@@ -476,6 +531,9 @@ final class VaultModel: ObservableObject {
         if let error = nasSetupSnapshot.lastError, !error.isEmpty { return Self.shortBackupDetail(error) }
         guard let configuration = nasSetupSnapshot.configuration else { return "请完成部门和姓名配置" }
         let identity = "\(configuration.department)/\(configuration.employee) · \(configuration.deviceName)"
+        if nasSetupSnapshot.state == .verifying {
+            return "\(identity) · 正在回读校验已上传备份"
+        }
         if nasSetupSnapshot.pendingCount > 0 {
             return "\(identity) · 待补传 \(nasSetupSnapshot.pendingCount)"
         }
@@ -540,6 +598,7 @@ final class VaultModel: ObservableObject {
     func refresh() {
         lastError = nil
         do {
+            try ensureVaultPrepared()
             try ensureDirectories()
             currentState = inspectCurrentState()
             sessions = try loadSessions()
@@ -561,12 +620,20 @@ final class VaultModel: ObservableObject {
     }
 
     private func initializeNASBackup() {
+        do {
+            try ensureVaultPrepared()
+        } catch {
+            lastError = error.localizedDescription
+            status = "本地仓库初始化失败"
+            return
+        }
         try? nasRuntime.initialize()
         syncNASSetupSnapshot()
         if nasSetupSnapshot.state == .unconfigured {
             isNASSetupPresented = true
             refreshNASCatalog()
         } else {
+            ensureLaunchAtLoginEnabled()
             refreshNASRecoverySources()
         }
         startNASStatusRefreshLoop()
@@ -588,6 +655,11 @@ final class VaultModel: ObservableObject {
 
     private func syncNASSetupSnapshot() {
         nasSetupSnapshot = nasRuntime.setupSnapshot()
+        guard nasSetupSnapshot.configuration != nil else { return }
+        let next = launchAtLoginController.currentState()
+        if next != launchAtLoginSnapshot {
+            launchAtLoginSnapshot = next
+        }
     }
 
     func refreshNASCatalog() {
@@ -636,6 +708,13 @@ final class VaultModel: ObservableObject {
     }
 
     func activateSelectedNASIdentity() {
+        do {
+            try ensureVaultPrepared()
+        } catch {
+            lastError = error.localizedDescription
+            status = "NAS 配置失败"
+            return
+        }
         guard nasDepartments.contains(where: { $0.name == selectedNASDepartment }),
               nasEmployees.contains(where: { $0.name == selectedNASEmployee }) else {
             lastError = "请从当前 NAS 列表选择部门和姓名。"
@@ -656,6 +735,7 @@ final class VaultModel: ObservableObject {
                 employee: selectedNASEmployee
             )
             syncNASSetupSnapshot()
+            ensureLaunchAtLoginEnabled()
             refreshNASRecoverySources()
             isNASSetupPresented = false
             lastError = nil
@@ -667,6 +747,13 @@ final class VaultModel: ObservableObject {
 
     func retryNASBackup() {
         do {
+            try ensureVaultPrepared()
+        } catch {
+            lastError = error.localizedDescription
+            status = "NAS 重新连接失败"
+            return
+        }
+        do {
             try nasRuntime.retry()
             syncNASSetupSnapshot()
             refreshNASRecoverySources()
@@ -677,6 +764,18 @@ final class VaultModel: ObservableObject {
         }
     }
 
+    func retryLaunchAtLogin() {
+        ensureLaunchAtLoginEnabled()
+    }
+
+    func openLoginItemSettings() {
+        launchAtLoginController.openSystemSettings()
+    }
+
+    private func ensureLaunchAtLoginEnabled() {
+        launchAtLoginSnapshot = launchAtLoginController.ensureEnabled()
+    }
+
     func presentNASReconfiguration() {
         selectedNASDepartment = nasSetupSnapshot.configuration?.department ?? ""
         selectedNASEmployee = nasSetupSnapshot.configuration?.employee ?? ""
@@ -685,15 +784,29 @@ final class VaultModel: ObservableObject {
     }
 
     func stopNASBackup() {
+        do {
+            try ensureVaultPrepared()
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
         nasRuntime.stop()
     }
 
     func requestNASBackupScan(_ trigger: BackupScanTrigger) {
+        do {
+            try ensureVaultPrepared()
+        } catch {
+            lastError = error.localizedDescription
+            status = "NAS 备份不可用"
+            return
+        }
         nasRuntime.requestImmediateScan(trigger)
     }
 
     func refreshNASRecoverySources() {
         do {
+            try ensureVaultPrepared()
             let sources = try nasRuntime.recoverySources()
             nasRecoverySources = sources
             if !sources.contains(where: { $0.id == selectedNASRecoverySourceID }) {
@@ -833,6 +946,7 @@ final class VaultModel: ObservableObject {
 
     func refreshIncrementalBackupCandidates() {
         do {
+            try ensureVaultPrepared()
             guard let source = nasRecoverySources.first(where: { $0.id == selectedNASRecoverySourceID }) else {
                 throw VaultError.commandFailed("请先选择一个 NAS 备份设备。")
             }
@@ -897,6 +1011,13 @@ final class VaultModel: ObservableObject {
     }
 
     func runLaunchAutoRestoreIfNeeded(force: Bool = false) {
+        do {
+            try ensureVaultPrepared()
+        } catch {
+            lastError = error.localizedDescription
+            status = "自动找回检查失败"
+            return
+        }
         guard autoRestoreOnLaunch, force || !didRunLaunchAutoRestore else { return }
         didRunLaunchAutoRestore = true
 
@@ -1417,13 +1538,21 @@ final class VaultModel: ObservableObject {
     }
 
     func openSelectedSessionFile() {
-        guard let session = selectedSession, !session.rolloutPath.isEmpty else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: session.rolloutPath))
+        guard let session = selectedSession,
+              let trusted = try? TrustedSessionFileResolver.resolve(
+                sessionIDs: [session.id],
+                under: URL(fileURLWithPath: codexRoot, isDirectory: true)
+              ).first else { return }
+        NSWorkspace.shared.open(trusted.fileURL)
     }
 
     func revealSelectedSessionFile() {
-        guard let session = selectedSession, !session.rolloutPath.isEmpty else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: session.rolloutPath)])
+        guard let session = selectedSession,
+              let trusted = try? TrustedSessionFileResolver.resolve(
+                sessionIDs: [session.id],
+                under: URL(fileURLWithPath: codexRoot, isDirectory: true)
+              ).first else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([trusted.fileURL])
     }
 
     func openCodexRoot() {
@@ -1495,6 +1624,13 @@ final class VaultModel: ObservableObject {
         command: VaultWorkerCommand,
         onSuccess: @escaping (VaultWorkerResponse) -> Void
     ) async {
+        do {
+            try ensureVaultPrepared()
+        } catch {
+            lastError = error.localizedDescription
+            status = "操作失败"
+            return
+        }
         let cancellationURL = fileManager.temporaryDirectory
             .appendingPathComponent("codex-session-vault-cancel-\(UUID().uuidString)")
         currentCancellationURL = cancellationURL
@@ -1558,11 +1694,26 @@ final class VaultModel: ObservableObject {
         }
     }
 
+    private func ensureVaultPrepared() throws {
+        if let vaultPreparationFailure {
+            throw VaultError.commandFailed(vaultPreparationFailure)
+        }
+    }
+
     private func ensureDirectories() throws {
+        try ensureVaultPrepared()
         if !fileManager.fileExists(atPath: codexRoot) {
             throw VaultError.codexRootMissing(codexRoot)
         }
-        try fileManager.createDirectory(at: snapshotRootURL, withIntermediateDirectories: true)
+        if (try? fileManager.destinationOfSymbolicLink(atPath: snapshotRootURL.path)) != nil {
+            throw LocalVaultPermissionHardeningError.rootIsSymbolicLink(snapshotRootURL.path)
+        }
+        try fileManager.createDirectory(
+            at: snapshotRootURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: snapshotRootURL.path)
     }
 
     private func loadSnapshots() throws -> [SnapshotMeta] {
@@ -1668,23 +1819,11 @@ final class VaultModel: ObservableObject {
 
     private func loadSessionsFromFiles(root: URL) throws -> [CodexSession] {
         let titleMaps = loadTitleMaps(root: root)
-        var fileURLs: [URL] = []
-        for directory in ["sessions", "archived_sessions"] {
-            let dirURL = root.appendingPathComponent(directory, isDirectory: true)
-            guard let enumerator = fileManager.enumerator(
-                at: dirURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .creationDateKey, .contentModificationDateKey, .fileSizeKey]
-            ) else {
-                continue
-            }
-            for case let fileURL as URL in enumerator where fileURL.pathExtension == "jsonl" {
-                fileURLs.append(fileURL)
-            }
-        }
+        let fileReferences = try TrustedSessionFileResolver.discover(under: root)
 
-        let sessions = fileURLs.compactMap { fileURL -> CodexSession? in
-            let id = extractSessionID(from: fileURL)
-            guard !id.isEmpty else { return nil }
+        let sessions = fileReferences.compactMap { reference -> CodexSession? in
+            let fileURL = reference.fileURL
+            let id = reference.sessionID
             let metadata = rolloutFileMetadata(fileURL)
             let values = try? fileURL.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey, .fileSizeKey])
             let updatedAt = values?.contentModificationDate ?? metadata.createdAt ?? Date(timeIntervalSince1970: 0)
@@ -1771,18 +1910,6 @@ final class VaultModel: ObservableObject {
         return sessionsByID.values.sorted { $0.updatedAt > $1.updatedAt }
     }
 
-    private func extractSessionID(from fileURL: URL) -> String {
-        let pattern = #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return "" }
-        let text = fileURL.lastPathComponent
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = regex.firstMatch(in: text, range: range),
-              let idRange = Range(match.range, in: text) else {
-            return ""
-        }
-        return String(text[idRange]).lowercased()
-    }
-
     private func rolloutFileMetadata(_ fileURL: URL) -> RolloutFileMetadata {
         var metadata = RolloutFileMetadata()
         for line in ((try? readLineData(fileURL)) ?? []).prefix(160) {
@@ -1838,7 +1965,7 @@ final class VaultModel: ObservableObject {
         CodexSession(
             id: row.id,
             title: row.title,
-            rolloutPath: rolloutPathOverride ?? row.rolloutPath,
+            rolloutPath: rolloutPathOverride ?? "",
             cwd: row.cwd,
             modelProvider: row.modelProvider,
             model: row.model?.isEmpty == false ? row.model! : "unknown",
@@ -1883,7 +2010,16 @@ final class VaultModel: ObservableObject {
         }
         let snapshotURL = snapshotRootURL.appendingPathComponent(id, isDirectory: true)
         let dataURL = snapshotURL.appendingPathComponent(dataDir, isDirectory: true)
-        try fileManager.createDirectory(at: dataURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(
+            at: snapshotURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try fileManager.createDirectory(
+            at: dataURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
 
         let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
         let requestedPaths = candidatePaths ?? backupCandidates
@@ -1938,7 +2074,19 @@ final class VaultModel: ObservableObject {
 
         let encoded = try JSONEncoder.snapshot.encode(meta)
         try checkOperationCancellation()
-        try encoded.write(to: snapshotURL.appendingPathComponent(metadataFile), options: .atomic)
+        do {
+            try LocalVaultPermissionHardener().hardenTree(at: snapshotURL)
+            try DurableAtomicWriter().write(
+                encoded,
+                to: snapshotURL.appendingPathComponent(metadataFile),
+                permissions: 0o600,
+                parentDirectoryPermissions: 0o700,
+                createParentDirectories: false
+            )
+        } catch {
+            try? fileManager.removeItem(at: snapshotURL)
+            throw error
+        }
         return meta
     }
 
@@ -1957,12 +2105,11 @@ final class VaultModel: ObservableObject {
         extraCandidatePaths: [String] = []
     ) throws -> SnapshotMeta {
         try checkOperationCancellation()
-        try ensureDirectories()
         let targetIDs = Set(sessions.map(\.id))
         guard !targetIDs.isEmpty || !extraCandidatePaths.isEmpty else {
             throw VaultError.commandFailed("没有可备份的会话。")
         }
-
+        let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
         let now = Date()
         let baseID = "\(Self.timestampID(now))-\(reason)"
         var id = baseID
@@ -1974,76 +2121,87 @@ final class VaultModel: ObservableObject {
 
         let snapshotURL = snapshotRootURL.appendingPathComponent(id, isDirectory: true)
         let dataURL = snapshotURL.appendingPathComponent(dataDir, isDirectory: true)
-        let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
-        try fileManager.createDirectory(at: dataURL, withIntermediateDirectories: true)
-
-        var includedPaths = Set<String>()
-
-        for relPath in extraCandidatePaths {
-            try checkOperationCancellation()
-            guard !stateDatabaseSnapshotPaths.contains(relPath),
-                  !conversationLineMergePaths.contains(relPath) else {
-                continue
-            }
-            let src = root.appendingPathComponent(relPath)
-            guard fileManager.fileExists(atPath: src.path) else { continue }
-            try copyReplacing(src: src, dst: dataURL.appendingPathComponent(relPath))
-            includedPaths.insert(relPath)
-        }
-
-        for relPath in conversationLineMergePaths {
-            try checkOperationCancellation()
-            let src = root.appendingPathComponent(relPath)
-            guard fileManager.fileExists(atPath: src.path) else { continue }
-            let dst = dataURL.appendingPathComponent(relPath)
-            try writeFilteredLineFile(
-                src: src,
-                dst: dst,
-                uniqueKey: relPath == "session_index.jsonl" ? "id" : nil,
-                allowedSessionIDs: targetIDs
-            )
-            includedPaths.insert(relPath)
-        }
-
-        try checkOperationCancellation()
-        try copyRolloutFiles(sessionIDs: targetIDs, from: root, to: dataURL, includedPaths: &includedPaths)
-        try checkOperationCancellation()
-        try copyShellSnapshots(sessionIDs: targetIDs, from: root, to: dataURL, includedPaths: &includedPaths)
-
-        try checkOperationCancellation()
-        if try copyConsistentStateDatabase(from: root, to: dataURL) {
-            includedPaths.insert("state_5.sqlite")
-        }
-
-        try checkOperationCancellation()
-        let restorableIDs = try sanitizeSnapshotData(dataURL: dataURL, snapshotCodexRoot: codexRoot)
-        var finalIncludedPaths = includedPaths
-        try checkOperationCancellation()
-        if try copyExternalAttachments(sessionIDs: restorableIDs, from: dataURL) {
-            finalIncludedPaths.insert("external_attachments")
-        }
-        let counts = snapshotSessionCounts(dataURL: dataURL, sessionIDs: restorableIDs)
-        let state = inspectCurrentState()
-        let meta = SnapshotMeta(
-            id: id,
-            name: name,
-            createdAt: now,
-            codexRoot: codexRoot,
-            reason: reason,
-            kind: snapshotKind(for: reason),
-            modelProvider: state.modelProvider,
-            model: state.model,
-            accountFingerprint: state.accountFingerprint,
-            sessionCount: counts.active,
-            archivedSessionCount: counts.archived,
-            sizeBytes: directorySize(dataURL),
-            includedPaths: finalIncludedPaths.sorted(),
-            appVersion: appVersion
+        let protectionPlan = try SessionProtectionSnapshotPlan.preflight(
+            sessionIDs: targetIDs,
+            codexRoot: root,
+            destinationRoot: dataURL,
+            fileManager: fileManager
         )
+        try ensureDirectories()
 
-        let encoded = try JSONEncoder.snapshot.encode(meta)
-        try checkOperationCancellation()
-        try encoded.write(to: snapshotURL.appendingPathComponent(metadataFile), options: .atomic)
+        var snapshotCreated = false
+        let meta: SnapshotMeta
+        do {
+            try fileManager.createDirectory(
+                at: snapshotURL,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            snapshotCreated = true
+            try fileManager.createDirectory(
+                at: dataURL,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+
+            var includedPaths = try protectionPlan.materialize()
+            for relPath in extraCandidatePaths {
+                try checkOperationCancellation()
+                guard !stateDatabaseSnapshotPaths.contains(relPath),
+                      !conversationLineMergePaths.contains(relPath) else {
+                    continue
+                }
+                let src = root.appendingPathComponent(relPath)
+                guard fileManager.fileExists(atPath: src.path) else { continue }
+                try copyReplacing(src: src, dst: dataURL.appendingPathComponent(relPath))
+                includedPaths.insert(relPath)
+            }
+
+            try checkOperationCancellation()
+            if try copyConsistentStateDatabase(from: root, to: dataURL) {
+                includedPaths.insert("state_5.sqlite")
+            }
+
+            try checkOperationCancellation()
+            let restorableIDs = try sanitizeSnapshotData(dataURL: dataURL, snapshotCodexRoot: codexRoot)
+            var finalIncludedPaths = includedPaths
+            try checkOperationCancellation()
+            if try copyExternalAttachments(sessionIDs: restorableIDs, from: dataURL) {
+                finalIncludedPaths.insert("external_attachments")
+            }
+            let counts = snapshotSessionCounts(dataURL: dataURL, sessionIDs: restorableIDs)
+            let state = inspectCurrentState()
+            meta = SnapshotMeta(
+                id: id,
+                name: name,
+                createdAt: now,
+                codexRoot: codexRoot,
+                reason: reason,
+                kind: snapshotKind(for: reason),
+                modelProvider: state.modelProvider,
+                model: state.model,
+                accountFingerprint: state.accountFingerprint,
+                sessionCount: counts.active,
+                archivedSessionCount: counts.archived,
+                sizeBytes: directorySize(dataURL),
+                includedPaths: finalIncludedPaths.sorted(),
+                appVersion: appVersion
+            )
+
+            let encoded = try JSONEncoder.snapshot.encode(meta)
+            try checkOperationCancellation()
+            try LocalVaultPermissionHardener().hardenTree(at: snapshotURL)
+            try DurableAtomicWriter().write(
+                encoded,
+                to: snapshotURL.appendingPathComponent(metadataFile),
+                permissions: 0o600,
+                parentDirectoryPermissions: 0o700,
+                createParentDirectories: false
+            )
+        } catch {
+            if snapshotCreated { try? fileManager.removeItem(at: snapshotURL) }
+            throw error
+        }
         try enforceAutomaticSnapshotRetention()
         return meta
     }
@@ -2067,7 +2225,205 @@ final class VaultModel: ObservableObject {
         return restorePaths
     }
 
-    private func restore(snapshot: SnapshotMeta, mode: RestoreMode) throws {
+    private func preflightSessionRestore(
+        snapshot: SnapshotMeta,
+        sessionIDs requestedSessionIDs: Set<String>? = nil,
+        checkDatabaseConflicts: Bool = true,
+        replaceIndexes: Bool = false
+    ) throws -> SessionRestorePreflight {
+        _ = try validatedRestorePaths(for: snapshot)
+        let sourceRoot = try snapshotDataURL(snapshot)
+        let destinationRoot = URL(fileURLWithPath: codexRoot, isDirectory: true)
+        let sessionIDs: Set<String>
+        if let requestedSessionIDs {
+            sessionIDs = requestedSessionIDs
+        } else {
+            sessionIDs = Set(try loadSessions(in: snapshot).filter(\.existsOnDisk).map(\.id))
+        }
+        let sourceFiles = try TrustedSessionFileResolver.resolve(
+            sessionIDs: sessionIDs,
+            under: sourceRoot
+        )
+        let found = Set(sourceFiles.map(\.sessionID))
+        let missing = sessionIDs.subtracting(found)
+        guard missing.isEmpty else {
+            throw VaultError.commandFailed("快照缺少可信会话文件：\(missing.sorted().joined(separator: ", "))")
+        }
+
+        var fingerprints = sourceFiles.map(\.fingerprint)
+        var destinationFingerprints: [SessionFileFingerprint] = []
+        var missingDestinationFiles: [SessionFileAbsenceExpectation] = []
+        var lineMutations: [SessionRestoreLineMutation] = []
+        let canonicalSourceRoot = sourceRoot.resolvingSymlinksInPath()
+        for sourceFile in sourceFiles {
+            guard let relative = relativePath(sourceFile.fileURL, under: canonicalSourceRoot) else {
+                throw VaultError.commandFailed("可信会话文件越出快照目录：\(sourceFile.fileURL.path)")
+            }
+            let destination = destinationRoot.appendingPathComponent(relative)
+            if fileManager.fileExists(atPath: destination.path) {
+                let fingerprint = try TrustedSessionFileResolver.validate(
+                    destination,
+                    expectedSessionID: sourceFile.sessionID,
+                    under: destinationRoot
+                )
+                fingerprints.append(fingerprint)
+                destinationFingerprints.append(fingerprint)
+            } else {
+                missingDestinationFiles.append(
+                    try SessionFileAbsenceExpectation.requireMissing(destination)
+                )
+            }
+        }
+        for (name, kind) in [
+            ("history.jsonl", SessionJSONLKind.history),
+            ("history.jsonl.bak", SessionJSONLKind.historyBackup),
+            ("session_index.jsonl", SessionJSONLKind.sessionIndex)
+        ] {
+            let source = sourceRoot.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: source.path) else { continue }
+            let sourceDocument = try SessionJSONLValidator.parse(source, kind: kind)
+            fingerprints.append(sourceDocument.fingerprint)
+            let destination = destinationRoot.appendingPathComponent(name)
+            let destinationDocument: SessionJSONLDocument?
+            if fileManager.fileExists(atPath: destination.path) {
+                let document = try SessionJSONLValidator.parse(destination, kind: kind)
+                destinationDocument = document
+                let fingerprint = document.fingerprint
+                fingerprints.append(fingerprint)
+                destinationFingerprints.append(fingerprint)
+            } else {
+                destinationDocument = nil
+                missingDestinationFiles.append(
+                    try SessionFileAbsenceExpectation.requireMissing(destination)
+                )
+            }
+            lineMutations.append(SessionRestoreLineMutation(
+                destinationURL: destination,
+                output: SessionJSONLRestoreOutput.build(
+                    source: sourceDocument.records,
+                    destination: destinationDocument?.records ?? [],
+                    sessionIDs: sessionIDs,
+                    uniqueBySessionID: kind == .sessionIndex,
+                    replace: replaceIndexes
+                )
+            ))
+        }
+        if checkDatabaseConflicts,
+           snapshot.includedPaths.contains("state_5.sqlite") {
+            let sourceDatabase = sourceRoot.appendingPathComponent("state_5.sqlite")
+            let destinationDatabase = destinationRoot.appendingPathComponent("state_5.sqlite")
+            if fileManager.fileExists(atPath: sourceDatabase.path),
+               fileManager.fileExists(atPath: destinationDatabase.path) {
+                try RestoreFilesystemValidator.validateSource(sourceDatabase, under: sourceRoot)
+                try RestoreFilesystemValidator.validateDestination(destinationDatabase, under: destinationRoot)
+                _ = try StateDatabaseRestoreService().preflightMerge(
+                    source: sourceDatabase,
+                    destination: destinationDatabase,
+                    sessionIDs: sessionIDs
+                )
+            }
+        }
+        return SessionRestorePreflight(
+            sessionIDs: sessionIDs,
+            sourceRoot: sourceRoot,
+            destinationRoot: destinationRoot,
+            sourceFiles: sourceFiles,
+            fingerprints: fingerprints,
+            destinationFingerprints: destinationFingerprints,
+            missingDestinationFiles: missingDestinationFiles,
+            lineMutations: lineMutations
+        )
+    }
+
+    private func publishSessionRestore(
+        _ preflight: SessionRestorePreflight
+    ) throws {
+        try preflight.validateCurrent()
+        let canonicalSourceRoot = preflight.sourceRoot.resolvingSymlinksInPath()
+        for trusted in preflight.sourceFiles {
+            try checkOperationCancellation()
+            guard let relPath = relativePath(trusted.fileURL, under: canonicalSourceRoot) else {
+                throw VaultError.commandFailed("可信会话文件越出快照目录：\(trusted.fileURL.path)")
+            }
+            let destination = preflight.destinationRoot.appendingPathComponent(relPath)
+            try RestoreFilesystemValidator.validateSource(trusted.fileURL, under: canonicalSourceRoot)
+            try RestoreFilesystemValidator.validateDestination(destination, under: preflight.destinationRoot)
+            try preflight.validateDestinationCurrent(destination)
+            let writeContents: (FileHandle) throws -> Void = { destinationHandle in
+                let sourceHandle = try FileHandle(forReadingFrom: trusted.fileURL)
+                defer { try? sourceHandle.close() }
+                while let chunk = try sourceHandle.read(upToCount: 4 * 1024 * 1024), !chunk.isEmpty {
+                    try destinationHandle.write(contentsOf: chunk)
+                }
+            }
+            let writer = DurableAtomicWriter()
+            if preflight.destinationMustRemainMissing(destination) {
+                try writer.writeIfAbsent(
+                    at: destination,
+                    permissions: 0o600,
+                    createParentDirectories: true,
+                    verifyTemporary: { temporary in
+                        try trusted.fingerprint.validateContent(at: temporary)
+                    },
+                    writer: writeContents
+                )
+            } else {
+                try writer.replace(
+                    at: destination,
+                    permissions: 0o600,
+                    createParentDirectories: true,
+                    verifyTemporary: { temporary in
+                        try trusted.fingerprint.validateContent(at: temporary)
+                    },
+                    writer: writeContents
+                )
+            }
+        }
+
+        for mutation in preflight.lineMutations {
+            try checkOperationCancellation()
+            let destination = mutation.destinationURL
+            try preflight.validateDestinationCurrent(destination)
+            let destinationMustRemainMissing = preflight.destinationMustRemainMissing(destination)
+            let writer = DurableAtomicWriter()
+            if destinationMustRemainMissing {
+                try writer.writeIfAbsent(
+                    mutation.output,
+                    to: destination,
+                    permissions: 0o600,
+                    createParentDirectories: true
+                )
+            } else {
+                try writer.write(
+                    mutation.output,
+                    to: destination,
+                    permissions: 0o600,
+                    createParentDirectories: true
+                )
+            }
+        }
+    }
+
+    private func rolloutPathUpdates(
+        for preflight: SessionRestorePreflight
+    ) throws -> [StateDatabaseRolloutPathUpdate] {
+        let canonicalSourceRoot = preflight.sourceRoot.resolvingSymlinksInPath()
+        return try preflight.sourceFiles.map { trusted in
+            guard let relPath = relativePath(trusted.fileURL, under: canonicalSourceRoot) else {
+                throw VaultError.commandFailed("可信会话文件越出快照目录：\(trusted.fileURL.path)")
+            }
+            return StateDatabaseRolloutPathUpdate(
+                sessionID: trusted.sessionID,
+                rolloutPath: preflight.destinationRoot.appendingPathComponent(relPath).path
+            )
+        }
+    }
+
+    private func restore(
+        snapshot: SnapshotMeta,
+        mode: RestoreMode,
+        sessionPreflight: SessionRestorePreflight
+    ) throws {
         try checkOperationCancellation()
         let dataURL = try snapshotDataURL(snapshot)
         let validatedPaths = try validatedRestorePaths(for: snapshot)
@@ -2083,7 +2439,8 @@ final class VaultModel: ObservableObject {
                 to: root,
                 includedPaths: snapshot.includedPaths,
                 snapshotCodexRoot: snapshot.codexRoot,
-                attachmentSnapshotID: snapshot.id
+                attachmentSnapshotID: snapshot.id,
+                sessionPreflight: sessionPreflight
             )
         case .full:
             try checkOperationCancellation()
@@ -2092,7 +2449,8 @@ final class VaultModel: ObservableObject {
                 to: root,
                 validatedPaths: validatedPaths,
                 snapshotCodexRoot: snapshot.codexRoot,
-                attachmentSnapshotID: snapshot.id
+                attachmentSnapshotID: snapshot.id,
+                sessionPreflight: sessionPreflight
             )
         }
     }
@@ -2102,7 +2460,8 @@ final class VaultModel: ObservableObject {
         to root: URL,
         validatedPaths: [ValidatedRestorePath],
         snapshotCodexRoot: String,
-        attachmentSnapshotID: String
+        attachmentSnapshotID: String,
+        sessionPreflight: SessionRestorePreflight
     ) throws {
         try checkOperationCancellation()
         let included = Set(validatedPaths.map(\.relativePath))
@@ -2110,37 +2469,33 @@ final class VaultModel: ObservableObject {
         for restorePath in validatedPaths {
             try checkOperationCancellation()
             let relPath = restorePath.relativePath
-            guard relPath != "external_attachments" else { continue }
+            guard relPath != "external_attachments",
+                  !stateDatabaseSnapshotPaths.contains(relPath),
+                  !conversationLineMergePaths.contains(relPath),
+                  relPath != "sessions",
+                  relPath != "archived_sessions" else { continue }
             let src = restorePath.sourceURL
             let dst = restorePath.destinationURL
             guard fileManager.fileExists(atPath: src.path) else { continue }
             try copyReplacing(src: src, dst: dst, sourceRoot: dataURL, destinationRoot: root)
         }
 
+        try publishSessionRestore(sessionPreflight)
+
         guard included.contains("state_5.sqlite") else { return }
 
         try checkOperationCancellation()
-        let restorableSessionIDs = try restorableSessionIDs(from: dataURL, snapshotCodexRoot: snapshotCodexRoot)
+        let restorableSessionIDs = sessionPreflight.sessionIDs
+        let sourceDatabase = dataURL.appendingPathComponent("state_5.sqlite")
         let database = root.appendingPathComponent("state_5.sqlite")
-        if fileManager.fileExists(atPath: database.path) {
-            try RestoreFilesystemValidator.validateDestination(database, under: root)
-            try checkOperationCancellation()
-            try pruneStateDatabase(database: database, sqlite: "/usr/bin/sqlite3", allowedSessionIDs: restorableSessionIDs)
-            try checkOperationCancellation()
-            try repairStateDatabaseRolloutPaths(database: database, root: root, sessionIDs: restorableSessionIDs)
-        }
-
-        for relPath in conversationLineMergePaths where included.contains(relPath) {
-            try checkOperationCancellation()
-            let lineFile = root.appendingPathComponent(relPath)
-            guard fileManager.fileExists(atPath: lineFile.path) else { continue }
-            try writeFilteredLineFile(
-                src: lineFile,
-                dst: lineFile,
-                uniqueKey: relPath == "session_index.jsonl" ? "id" : nil,
-                allowedSessionIDs: restorableSessionIDs
-            )
-        }
+        try RestoreFilesystemValidator.validateSource(sourceDatabase, under: dataURL)
+        try RestoreFilesystemValidator.validateDestination(database, under: root)
+        try StateDatabaseRestoreService().replace(
+            source: sourceDatabase,
+            destination: database,
+            sessionIDs: restorableSessionIDs,
+            rolloutPathUpdates: try rolloutPathUpdates(for: sessionPreflight)
+        )
         try checkOperationCancellation()
         try restoreExternalAttachments(
             sessionIDs: restorableSessionIDs,
@@ -2154,36 +2509,24 @@ final class VaultModel: ObservableObject {
         to root: URL,
         includedPaths: [String],
         snapshotCodexRoot: String,
-        attachmentSnapshotID: String? = nil
+        attachmentSnapshotID: String? = nil,
+        sessionPreflight: SessionRestorePreflight
     ) throws {
         try checkOperationCancellation()
         let included = Set(includedPaths)
-        let restorableSessionIDs = try included.contains("state_5.sqlite")
-            ? restorableSessionIDs(from: dataURL, snapshotCodexRoot: snapshotCodexRoot)
+        let restorableSessionIDs: Set<String>? = included.contains("state_5.sqlite")
+            ? sessionPreflight.sessionIDs
             : nil
 
         for relPath in conversationDirectoryPaths where included.contains(relPath) {
+            if relPath == "sessions" || relPath == "archived_sessions" { continue }
             try checkOperationCancellation()
             let src = dataURL.appendingPathComponent(relPath)
             let dst = root.appendingPathComponent(relPath)
             guard fileManager.fileExists(atPath: src.path) else { continue }
             try mergeDirectory(src: src, dst: dst, sourceRoot: dataURL, destinationRoot: root)
         }
-
-        for relPath in conversationLineMergePaths where included.contains(relPath) {
-            try checkOperationCancellation()
-            let src = dataURL.appendingPathComponent(relPath)
-            let dst = root.appendingPathComponent(relPath)
-            guard fileManager.fileExists(atPath: src.path) else { continue }
-            try RestoreFilesystemValidator.validateSource(src, under: dataURL)
-            try RestoreFilesystemValidator.validateDestination(dst, under: root)
-            try mergeLineFile(
-                src: src,
-                dst: dst,
-                uniqueKey: relPath == "session_index.jsonl" ? "id" : nil,
-                allowedSessionIDs: restorableSessionIDs
-            )
-        }
+        try publishSessionRestore(sessionPreflight)
 
         if included.contains("state_5.sqlite") {
             try checkOperationCancellation()
@@ -2192,11 +2535,13 @@ final class VaultModel: ObservableObject {
             if fileManager.fileExists(atPath: src.path) {
                 try RestoreFilesystemValidator.validateSource(src, under: dataURL)
                 try RestoreFilesystemValidator.validateDestination(dst, under: root)
-                try mergeStateDatabase(src: src, dst: dst, allowedSessionIDs: restorableSessionIDs)
+                try StateDatabaseRestoreService().merge(
+                    source: src,
+                    destination: dst,
+                    sessionIDs: restorableSessionIDs ?? [],
+                    rolloutPathUpdates: try rolloutPathUpdates(for: sessionPreflight)
+                )
                 try checkOperationCancellation()
-                if let restorableSessionIDs {
-                    try repairStateDatabaseRolloutPaths(database: dst, root: root, sessionIDs: restorableSessionIDs)
-                }
             }
         }
         try checkOperationCancellation()
@@ -2209,54 +2554,41 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    private func restoreSingleSession(snapshot: SnapshotMeta, session: CodexSession) throws {
+    private func restoreSingleSession(
+        snapshot: SnapshotMeta,
+        preflight: SessionRestorePreflight
+    ) throws {
+        try restoreSessions(snapshot: snapshot, preflight: preflight)
+    }
+
+    private func restoreSessions(
+        snapshot: SnapshotMeta,
+        preflight: SessionRestorePreflight
+    ) throws {
         try checkOperationCancellation()
         let dataURL = try snapshotDataURL(snapshot)
         guard fileManager.fileExists(atPath: dataURL.path) else { throw VaultError.invalidSnapshot }
 
         let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
-
-        guard let sourceFileURL = resolvedRolloutFileURL(
-            sessionID: session.id,
-            rolloutPath: session.rolloutPath,
-            dataRoot: dataURL,
-            snapshotCodexRoot: snapshot.codexRoot
-        ),
-              let rolloutRelPath = relativePath(sourceFileURL, under: dataURL) else {
-            throw VaultError.commandFailed("这个快照里的会话文件路径无法映射到当前 Codex 数据目录。")
-        }
-
-        let dst = root.appendingPathComponent(rolloutRelPath)
-        try checkOperationCancellation()
-        try copyReplacing(src: sourceFileURL, dst: dst, sourceRoot: dataURL, destinationRoot: root)
-
-        for relPath in conversationLineMergePaths {
-            try checkOperationCancellation()
-            let src = dataURL.appendingPathComponent(relPath)
-            let dst = root.appendingPathComponent(relPath)
-            guard fileManager.fileExists(atPath: src.path) else { continue }
-            try RestoreFilesystemValidator.validateSource(src, under: dataURL)
-            try RestoreFilesystemValidator.validateDestination(dst, under: root)
-            try mergeJSONLLines(matchingSessionID: session.id, from: src, into: dst)
-        }
-
-        try checkOperationCancellation()
-        try restoreShellSnapshots(sessionID: session.id, from: dataURL, to: root)
+        try publishSessionRestore(preflight)
 
         let srcDB = dataURL.appendingPathComponent("state_5.sqlite")
         let dstDB = root.appendingPathComponent("state_5.sqlite")
-        if fileManager.fileExists(atPath: srcDB.path), fileManager.fileExists(atPath: dstDB.path) {
+        if fileManager.fileExists(atPath: srcDB.path) {
             try RestoreFilesystemValidator.validateSource(srcDB, under: dataURL)
             try RestoreFilesystemValidator.validateDestination(dstDB, under: root)
             try checkOperationCancellation()
-            try mergeSingleSessionStateDatabase(src: srcDB, dst: dstDB, sessionID: session.id)
-            try checkOperationCancellation()
-            try updateThreadRolloutPath(database: dstDB, sessionID: session.id, rolloutPath: dst.path)
+            try StateDatabaseRestoreService().merge(
+                source: srcDB,
+                destination: dstDB,
+                sessionIDs: preflight.sessionIDs,
+                rolloutPathUpdates: try rolloutPathUpdates(for: preflight)
+            )
         }
         try checkOperationCancellation()
         try restoreExternalAttachments(
-            sessionIDs: [session.id],
+            sessionIDs: preflight.sessionIDs,
             from: dataURL,
             snapshotID: snapshot.id
         )
@@ -2285,39 +2617,13 @@ final class VaultModel: ObservableObject {
         dataRoot: URL,
         snapshotCodexRoot: String
     ) -> URL? {
-        if let relPath = snapshotRelativePath(for: rolloutPath, snapshotCodexRoot: snapshotCodexRoot) {
-            let candidate = dataRoot.appendingPathComponent(relPath)
-            if fileManager.fileExists(atPath: candidate.path) {
-                return candidate
-            }
-        }
-
-        let directURL = URL(fileURLWithPath: rolloutPath)
-        if directURL.path.hasPrefix(dataRoot.standardizedFileURL.path + "/"),
-           fileManager.fileExists(atPath: directURL.path) {
-            return directURL
-        }
-
+        _ = rolloutPath
+        _ = snapshotCodexRoot
         return findRolloutFile(sessionID: sessionID, root: dataRoot)
     }
 
     private func findRolloutFile(sessionID: String, root: URL) -> URL? {
-        for directory in ["sessions", "archived_sessions"] {
-            let dirURL = root.appendingPathComponent(directory, isDirectory: true)
-            guard let enumerator = fileManager.enumerator(at: dirURL, includingPropertiesForKeys: [.isRegularFileKey]) else {
-                continue
-            }
-
-            for case let fileURL as URL in enumerator {
-                guard fileURL.pathExtension == "jsonl",
-                      fileURL.lastPathComponent.contains(sessionID),
-                      fileManager.fileExists(atPath: fileURL.path) else {
-                    continue
-                }
-                return fileURL
-            }
-        }
-        return nil
+        try? TrustedSessionFileResolver.resolve(sessionIDs: [sessionID], under: root).first?.fileURL
     }
 
     private func relativePath(_ fileURL: URL, under root: URL) -> String? {
@@ -2363,12 +2669,17 @@ final class VaultModel: ObservableObject {
                 status = "已取消自动找回：当前 \(currentVisibleCount) 个会话，快照 \(snapshotCount) 个会话"
                 return
             }
+            let sessionPreflight = try preflightSessionRestore(snapshot: latestSnapshot)
             _ = try createSystemSnapshot(
                 name: "Pre-Auto-Restore Backup",
                 reason: "pre-auto-restore",
                 candidatePaths: autoProtectionCandidates
             )
-            try restore(snapshot: latestSnapshot, mode: .conversationsOnly)
+            try restore(
+                snapshot: latestSnapshot,
+                mode: .conversationsOnly,
+                sessionPreflight: sessionPreflight
+            )
             refresh()
             selectedID = latestSnapshot.id
             selectedSection = .sessions
@@ -2421,35 +2732,6 @@ final class VaultModel: ObservableObject {
         snapshot.sessionCount + snapshot.archivedSessionCount
     }
 
-    private func delete(session: CodexSession) throws {
-        try checkOperationCancellation()
-        let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
-
-        if !session.rolloutPath.isEmpty {
-            try checkOperationCancellation()
-            let rolloutURL = URL(fileURLWithPath: session.rolloutPath)
-            if fileManager.fileExists(atPath: rolloutURL.path) {
-                try fileManager.removeItem(at: rolloutURL)
-                try removeEmptyParents(startingAt: rolloutURL.deletingLastPathComponent(), stopAt: root)
-            }
-        }
-
-        try checkOperationCancellation()
-        try removeRolloutFiles(sessionID: session.id, root: root)
-        try checkOperationCancellation()
-        try removeJSONLLines(matchingSessionID: session.id, from: root.appendingPathComponent("history.jsonl"))
-        try checkOperationCancellation()
-        try removeJSONLLines(matchingSessionID: session.id, from: root.appendingPathComponent("history.jsonl.bak"))
-        try checkOperationCancellation()
-        try removeJSONLLines(matchingSessionID: session.id, from: root.appendingPathComponent("session_index.jsonl"))
-        try checkOperationCancellation()
-        try removeShellSnapshots(sessionID: session.id, root: root)
-        try checkOperationCancellation()
-        try deleteSessionDatabaseRows(sessionID: session.id, root: root)
-        try checkOperationCancellation()
-        try deleteAppDatabaseRows(sessionID: session.id, root: root)
-    }
-
     private func deleteSessionDatabaseRows(sessionID: String, root: URL) throws {
         let database = root.appendingPathComponent("state_5.sqlite")
         guard fileManager.fileExists(atPath: database.path) else { return }
@@ -2484,27 +2766,6 @@ final class VaultModel: ObservableObject {
         try runCommand(executable: "/usr/bin/sqlite3", arguments: [database.path, sql])
     }
 
-    private func removeRolloutFiles(sessionID: String, root: URL) throws {
-        for directory in ["sessions", "archived_sessions"] {
-            try checkOperationCancellation()
-            let dirURL = root.appendingPathComponent(directory, isDirectory: true)
-            guard let enumerator = fileManager.enumerator(at: dirURL, includingPropertiesForKeys: [.isRegularFileKey]) else {
-                continue
-            }
-
-            for case let fileURL as URL in enumerator {
-                try checkOperationCancellation()
-                guard fileURL.pathExtension == "jsonl",
-                      fileURL.lastPathComponent.contains(sessionID),
-                      fileManager.fileExists(atPath: fileURL.path) else {
-                    continue
-                }
-                try fileManager.removeItem(at: fileURL)
-                try removeEmptyParents(startingAt: fileURL.deletingLastPathComponent(), stopAt: dirURL)
-            }
-        }
-    }
-
     private func deleteAppDatabaseRows(sessionID: String, root: URL) throws {
         let database = root.appendingPathComponent("sqlite/codex-dev.db")
         guard fileManager.fileExists(atPath: database.path) else { return }
@@ -2516,52 +2777,6 @@ final class VaultModel: ObservableObject {
         COMMIT;
         """
         try runCommand(executable: "/usr/bin/sqlite3", arguments: [database.path, sql])
-    }
-
-    private func removeJSONLLines(matchingSessionID sessionID: String, from url: URL) throws {
-        guard fileManager.fileExists(atPath: url.path) else { return }
-        try checkOperationCancellation()
-        let lines = try readLineData(url)
-        var output = Data()
-
-        for line in lines {
-            try checkOperationCancellation()
-            guard !line.isWhitespaceOrEmpty else { continue }
-            if lineContainsSessionID(line, sessionID: sessionID) {
-                continue
-            }
-            output.append(line)
-            output.append(0x0A)
-        }
-
-        try output.write(to: url, options: .atomic)
-    }
-
-    private func lineContainsSessionID(_ line: Data, sessionID: String) -> Bool {
-        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            return String(decoding: line, as: UTF8.self).contains(sessionID)
-        }
-        if let value = object["session_id"] as? String, value == sessionID { return true }
-        if let value = object["id"] as? String, value == sessionID { return true }
-        if let value = object["thread_id"] as? String, value == sessionID { return true }
-        return false
-    }
-
-    private func lineContainsAnySessionID(_ line: Data, sessionIDs: Set<String>) -> Bool {
-        guard !sessionIDs.isEmpty else { return false }
-        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            let text = String(decoding: line, as: UTF8.self)
-            return sessionIDs.contains { text.contains($0) }
-        }
-
-        for key in ["session_id", "id", "thread_id"] {
-            if let value = object[key] as? String, sessionIDs.contains(value) {
-                return true
-            }
-        }
-
-        let text = String(decoding: line, as: UTF8.self)
-        return sessionIDs.contains { text.contains($0) }
     }
 
     private func restorableSessionIDs(from dataURL: URL, snapshotCodexRoot: String) throws -> Set<String> {
@@ -2578,22 +2793,6 @@ final class VaultModel: ObservableObject {
             ) == nil ? nil : row.id
         }
         return Set(ids)
-    }
-
-    private func removeShellSnapshots(sessionID: String, root: URL) throws {
-        let shellDir = root.appendingPathComponent("shell_snapshots", isDirectory: true)
-        guard let enumerator = fileManager.enumerator(at: shellDir, includingPropertiesForKeys: nil) else {
-            return
-        }
-
-        for case let fileURL as URL in enumerator {
-            try checkOperationCancellation()
-            guard fileURL.lastPathComponent.contains(sessionID),
-                  fileManager.fileExists(atPath: fileURL.path) else {
-                continue
-            }
-            try fileManager.removeItem(at: fileURL)
-        }
     }
 
     private func removeEmptyParents(startingAt url: URL, stopAt root: URL) throws {
@@ -2730,140 +2929,61 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    private func mergeLineFile(
-        src: URL,
-        dst: URL,
-        uniqueKey: String?,
-        allowedSessionIDs: Set<String>? = nil
-    ) throws {
-        try checkOperationCancellation()
-        try fileManager.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-        if !fileManager.fileExists(atPath: dst.path) {
-            if let allowedSessionIDs {
-                try writeFilteredLineFile(src: src, dst: dst, uniqueKey: uniqueKey, allowedSessionIDs: allowedSessionIDs)
-            } else {
-                try copyReplacing(src: src, dst: dst)
-            }
-            return
-        }
-
-        let currentLines = try readLineData(dst)
-        let snapshotLines = try readLineData(src)
-        var merged: [Data] = []
-        var seen = Set<String>()
-
-        func addLine(_ line: Data, requiresAllowedSession: Bool) {
-            guard !line.isWhitespaceOrEmpty else { return }
-            if requiresAllowedSession,
-               let allowedSessionIDs,
-               !lineContainsAnySessionID(line, sessionIDs: allowedSessionIDs) {
-                return
-            }
-            let identity = uniqueKey.flatMap { jsonLineIdentity(line, key: $0) } ?? line
-                .base64EncodedString()
-            guard !seen.contains(identity) else { return }
-            seen.insert(identity)
-            merged.append(line)
-        }
-
-        currentLines.forEach { addLine($0, requiresAllowedSession: false) }
-        try checkOperationCancellation()
-        snapshotLines.forEach { addLine($0, requiresAllowedSession: true) }
-
-        var output = Data()
-        for line in merged {
-            output.append(line)
-            output.append(0x0A)
-        }
-        try output.write(to: dst, options: .atomic)
-        try checkOperationCancellation()
-    }
-
     private func writeFilteredLineFile(
         src: URL,
         dst: URL,
         uniqueKey: String?,
-        allowedSessionIDs: Set<String>
+        allowedSessionIDs: Set<String>,
+        destinationMustRemainMissing: Bool = false
     ) throws {
         try checkOperationCancellation()
-        let snapshotLines = try readLineData(src)
+        let source = try SessionJSONLValidator.parse(src, kind: sessionJSONLKind(for: dst))
+        let allowed = Set(allowedSessionIDs.compactMap(SessionJSONLValidator.normalizeSessionID))
         var output = Data()
         var seen = Set<String>()
 
-        for line in snapshotLines {
+        for record in source.records {
             try checkOperationCancellation()
-            guard !line.isWhitespaceOrEmpty,
-                  lineContainsAnySessionID(line, sessionIDs: allowedSessionIDs) else {
-                continue
-            }
-            let identity = uniqueKey.flatMap { jsonLineIdentity(line, key: $0) } ?? line
-                .base64EncodedString()
-            guard !seen.contains(identity) else { continue }
-            seen.insert(identity)
-            output.append(line)
+            guard allowed.contains(record.sessionID) else { continue }
+            let identity = uniqueKey == nil ? record.rawData.base64EncodedString() : record.sessionID
+            guard seen.insert(identity).inserted else { continue }
+            output.append(record.rawData)
             output.append(0x0A)
         }
 
-        try output.write(to: dst, options: .atomic)
+        let writer = DurableAtomicWriter()
+        if destinationMustRemainMissing {
+            try writer.writeIfAbsent(
+                output,
+                to: dst,
+                permissions: 0o600,
+                createParentDirectories: true
+            )
+        } else {
+            try writer.write(
+                output,
+                to: dst,
+                permissions: 0o600,
+                createParentDirectories: true
+            )
+        }
     }
 
-    private func mergeJSONLLines(matchingSessionID sessionID: String, from src: URL, into dst: URL) throws {
-        try checkOperationCancellation()
-        try fileManager.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let currentLines = fileManager.fileExists(atPath: dst.path) ? try readLineData(dst) : []
-        let snapshotLines = try readLineData(src).filter { line in
-            !line.isWhitespaceOrEmpty && lineContainsSessionID(line, sessionID: sessionID)
-        }
-
-        var merged: [Data] = []
-        var seen = Set<String>()
-
-        func addLine(_ line: Data) {
-            guard !line.isWhitespaceOrEmpty else { return }
-            let identity = line.base64EncodedString()
-            guard !seen.contains(identity) else { return }
-            seen.insert(identity)
-            merged.append(line)
-        }
-
-        currentLines.forEach(addLine)
-        try checkOperationCancellation()
-        snapshotLines.forEach(addLine)
-
-        var output = Data()
-        for line in merged {
-            output.append(line)
-            output.append(0x0A)
-        }
-        try output.write(to: dst, options: .atomic)
-    }
-
-    private func restoreShellSnapshots(sessionID: String, from dataURL: URL, to root: URL) throws {
-        let srcDir = dataURL.appendingPathComponent("shell_snapshots", isDirectory: true)
-        let dstDir = root.appendingPathComponent("shell_snapshots", isDirectory: true)
-        try RestoreFilesystemValidator.validateSource(srcDir, under: dataURL, recursive: true, allowMissing: true)
-        try RestoreFilesystemValidator.validateDestination(dstDir, under: root, recursive: true)
-        guard let enumerator = fileManager.enumerator(at: srcDir, includingPropertiesForKeys: [.isDirectoryKey]) else {
-            return
-        }
-
-        for case let srcURL as URL in enumerator {
-            try checkOperationCancellation()
-            let values = try srcURL.resourceValues(forKeys: [.isDirectoryKey])
-            guard values.isDirectory != true, srcURL.lastPathComponent.contains(sessionID) else { continue }
-            let dstURL = dstDir.appendingPathComponent(srcURL.lastPathComponent)
-            try copyReplacing(src: srcURL, dst: dstURL, sourceRoot: dataURL, destinationRoot: root)
+    private func sessionJSONLKind(for url: URL) -> SessionJSONLKind {
+        switch url.lastPathComponent {
+        case "session_index.jsonl": .sessionIndex
+        case "history.jsonl.bak": .historyBackup
+        default: .history
         }
     }
 
     private func loadConversationMessages(for session: CodexSession) throws -> [ConversationMessage] {
-        guard !session.rolloutPath.isEmpty else {
-            throw VaultError.commandFailed("这个会话没有记录文件路径。")
-        }
-        let url = URL(fileURLWithPath: session.rolloutPath)
-        guard fileManager.fileExists(atPath: url.path) else {
-            throw VaultError.commandFailed("会话文件不存在：\(session.rolloutPath)")
+        let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
+        guard let url = try TrustedSessionFileResolver.resolve(
+            sessionIDs: [session.id],
+            under: root
+        ).first?.fileURL else {
+            throw VaultError.commandFailed("会话文件不存在或身份校验失败。")
         }
 
         let lines = try readLineData(url)
@@ -3028,59 +3148,6 @@ final class VaultModel: ObservableObject {
         return "\(key):\(value)"
     }
 
-    private func mergeStateDatabase(src: URL, dst: URL, allowedSessionIDs: Set<String>? = nil) throws {
-        if let allowedSessionIDs, allowedSessionIDs.isEmpty {
-            return
-        }
-
-        let sqlite = "/usr/bin/sqlite3"
-        guard fileManager.isExecutableFile(atPath: sqlite) else { throw VaultError.sqliteUnavailable }
-
-        if !fileManager.fileExists(atPath: dst.path) {
-            try fileManager.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let sql = "VACUUM INTO \(sqliteStringLiteral(dst.path));"
-            try runCommand(executable: sqlite, arguments: [src.path, sql])
-            try purgeAccountBindings(database: dst, sqlite: sqlite)
-            if let allowedSessionIDs {
-                try pruneStateDatabase(database: dst, sqlite: sqlite, allowedSessionIDs: allowedSessionIDs)
-            }
-            return
-        }
-
-        let statements = try stateDatabaseMergeStatements(src: src, dst: dst, allowedSessionIDs: allowedSessionIDs)
-        guard !statements.isEmpty else { return }
-
-        let sql = """
-        PRAGMA foreign_keys = OFF;
-        ATTACH DATABASE \(sqliteStringLiteral(src.path)) AS snapshot;
-        BEGIN IMMEDIATE;
-        \(statements.joined(separator: "\n"))
-        COMMIT;
-        DETACH DATABASE snapshot;
-        PRAGMA foreign_keys = ON;
-        """
-        try runCommand(executable: sqlite, arguments: [dst.path, sql])
-    }
-
-    private func mergeSingleSessionStateDatabase(src: URL, dst: URL, sessionID: String) throws {
-        let sqlite = "/usr/bin/sqlite3"
-        guard fileManager.isExecutableFile(atPath: sqlite) else { throw VaultError.sqliteUnavailable }
-
-        let statements = try singleSessionStateDatabaseMergeStatements(src: src, dst: dst, sessionID: sessionID)
-        guard !statements.isEmpty else { return }
-
-        let sql = """
-        PRAGMA foreign_keys = OFF;
-        ATTACH DATABASE \(sqliteStringLiteral(src.path)) AS snapshot;
-        BEGIN IMMEDIATE;
-        \(statements.joined(separator: "\n"))
-        COMMIT;
-        DETACH DATABASE snapshot;
-        PRAGMA foreign_keys = ON;
-        """
-        try runCommand(executable: sqlite, arguments: [dst.path, sql])
-    }
-
     private func updateThreadRolloutPath(database: URL, sessionID: String, rolloutPath: String, archived: Bool? = nil) throws {
         let archivedAssignment = archived.map { ", archived = \($0 ? 1 : 0)" } ?? ""
         let sql = """
@@ -3089,19 +3156,6 @@ final class VaultModel: ObservableObject {
         WHERE id = \(sqliteStringLiteral(sessionID));
         """
         try runCommand(executable: "/usr/bin/sqlite3", arguments: [database.path, sql])
-    }
-
-    private func repairStateDatabaseRolloutPaths(database: URL, root: URL, sessionIDs: Set<String>) throws {
-        for sessionID in sessionIDs {
-            guard let rolloutURL = findRolloutFile(sessionID: sessionID, root: root) else { continue }
-            let relPath = relativePath(rolloutURL, under: root)
-            try updateThreadRolloutPath(
-                database: database,
-                sessionID: sessionID,
-                rolloutPath: rolloutURL.path,
-                archived: relPath?.hasPrefix("archived_sessions/")
-            )
-        }
     }
 
     private func purgeAccountBindings(database: URL, sqlite: String) throws {
@@ -3115,27 +3169,6 @@ final class VaultModel: ObservableObject {
         let sql = statements.joined(separator: "\n")
         guard !sql.isEmpty else { return }
         _ = try? runCommand(executable: sqlite, arguments: [database.path, sql])
-    }
-
-    private func stateDatabaseMergeStatements(
-        src: URL,
-        dst: URL,
-        allowedSessionIDs: Set<String>? = nil
-    ) throws -> [String] {
-        var statements: [String] = []
-        for table in conversationStateTables {
-            let sourceColumns = try sqliteTableColumns(database: src, table: table)
-            let destColumns = try sqliteTableColumns(database: dst, table: table)
-            let commonColumns = destColumns.filter { sourceColumns.contains($0) }
-            guard !commonColumns.isEmpty else { continue }
-
-            let columnList = commonColumns.map(sqliteIdentifier).joined(separator: ", ")
-            let whereClause = stateDatabaseWhereClause(table: table, allowedSessionIDs: allowedSessionIDs)
-            statements.append(
-                "INSERT OR REPLACE INTO \(sqliteIdentifier(table)) (\(columnList)) SELECT \(columnList) FROM snapshot.\(sqliteIdentifier(table))\(whereClause);"
-            )
-        }
-        return statements
     }
 
     private func pruneStateDatabase(database: URL, sqlite: String, allowedSessionIDs: Set<String>) throws {
@@ -3185,49 +3218,6 @@ final class VaultModel: ObservableObject {
         default:
             return "thread_id NOT IN (\(ids))"
         }
-    }
-
-    private func stateDatabaseWhereClause(table: String, allowedSessionIDs: Set<String>?) -> String {
-        guard let allowedSessionIDs else { return "" }
-        guard !allowedSessionIDs.isEmpty else { return " WHERE 0" }
-
-        let ids = allowedSessionIDs.map(sqliteStringLiteral).joined(separator: ", ")
-        switch table {
-        case "threads":
-            return " WHERE id IN (\(ids))"
-        case "thread_spawn_edges":
-            return " WHERE parent_thread_id IN (\(ids)) OR child_thread_id IN (\(ids))"
-        case "agent_job_items":
-            return " WHERE assigned_thread_id IN (\(ids))"
-        default:
-            return " WHERE thread_id IN (\(ids))"
-        }
-    }
-
-    private func singleSessionStateDatabaseMergeStatements(src: URL, dst: URL, sessionID: String) throws -> [String] {
-        var statements: [String] = []
-        let quotedSessionID = sqliteStringLiteral(sessionID)
-
-        func appendInsert(table: String, whereClause: String) throws {
-            let sourceColumns = try sqliteTableColumns(database: src, table: table)
-            let destColumns = try sqliteTableColumns(database: dst, table: table)
-            let commonColumns = destColumns.filter { sourceColumns.contains($0) }
-            guard !commonColumns.isEmpty else { return }
-
-            let columnList = commonColumns.map(sqliteIdentifier).joined(separator: ", ")
-            statements.append(
-                "INSERT OR REPLACE INTO \(sqliteIdentifier(table)) (\(columnList)) SELECT \(columnList) FROM snapshot.\(sqliteIdentifier(table)) WHERE \(whereClause);"
-            )
-        }
-
-        try appendInsert(table: "threads", whereClause: "id = \(quotedSessionID)")
-        try appendInsert(table: "thread_goals", whereClause: "thread_id = \(quotedSessionID)")
-        try appendInsert(table: "thread_dynamic_tools", whereClause: "thread_id = \(quotedSessionID)")
-        try appendInsert(table: "stage1_outputs", whereClause: "thread_id = \(quotedSessionID)")
-        try appendInsert(table: "thread_spawn_edges", whereClause: "parent_thread_id = \(quotedSessionID) OR child_thread_id = \(quotedSessionID)")
-        try appendInsert(table: "agent_job_items", whereClause: "assigned_thread_id = \(quotedSessionID)")
-
-        return statements
     }
 
     private func sqliteTableExists(database: URL, table: String) throws -> Bool {
@@ -3321,59 +3311,12 @@ final class VaultModel: ObservableObject {
         to dataURL: URL,
         includedPaths: inout Set<String>
     ) throws {
-        for directory in ["sessions", "archived_sessions"] {
+        let trustedFiles = try TrustedSessionFileResolver.resolve(sessionIDs: sessionIDs, under: root)
+        for trusted in trustedFiles {
             try checkOperationCancellation()
-            let dirURL = root.appendingPathComponent(directory, isDirectory: true)
-            guard let enumerator = fileManager.enumerator(at: dirURL, includingPropertiesForKeys: [.isRegularFileKey]) else {
-                continue
-            }
-
-            var didCopyDirectory = false
-            for case let fileURL as URL in enumerator {
-                try checkOperationCancellation()
-                guard fileURL.pathExtension == "jsonl",
-                      sessionIDs.contains(where: { fileURL.lastPathComponent.contains($0) }),
-                      let relPath = relativePath(fileURL, under: root) else {
-                    continue
-                }
-
-                try copyReplacing(src: fileURL, dst: dataURL.appendingPathComponent(relPath))
-                didCopyDirectory = true
-            }
-
-            if didCopyDirectory {
-                includedPaths.insert(directory)
-            }
-        }
-    }
-
-    private func copyShellSnapshots(
-        sessionIDs: Set<String>,
-        from root: URL,
-        to dataURL: URL,
-        includedPaths: inout Set<String>
-    ) throws {
-        try checkOperationCancellation()
-        let shellDir = root.appendingPathComponent("shell_snapshots", isDirectory: true)
-        guard let enumerator = fileManager.enumerator(at: shellDir, includingPropertiesForKeys: [.isRegularFileKey]) else {
-            return
-        }
-
-        var didCopy = false
-        for case let fileURL as URL in enumerator {
-            try checkOperationCancellation()
-            guard sessionIDs.contains(where: { fileURL.lastPathComponent.contains($0) }) else {
-                continue
-            }
-            let dst = dataURL
-                .appendingPathComponent("shell_snapshots", isDirectory: true)
-                .appendingPathComponent(fileURL.lastPathComponent)
-            try copyReplacing(src: fileURL, dst: dst)
-            didCopy = true
-        }
-
-        if didCopy {
-            includedPaths.insert("shell_snapshots")
+            guard let relPath = relativePath(trusted.fileURL, under: root) else { continue }
+            try copyReplacing(src: trusted.fileURL, dst: dataURL.appendingPathComponent(relPath))
+            includedPaths.insert(relPath.split(separator: "/").first.map(String.init) ?? "sessions")
         }
     }
 
@@ -3974,6 +3917,8 @@ final class VaultModel: ObservableObject {
         _ command: VaultWorkerCommand,
         progress: (VaultWorkerProgress) throws -> Void = { _ in }
     ) throws -> VaultWorkerResponse {
+        try ensureVaultPrepared()
+
         func checkCancellation() throws {
             guard let cancellationPath = command.cancellationPath else { return }
             if FileManager.default.fileExists(atPath: cancellationPath) {
@@ -4058,6 +4003,11 @@ final class VaultModel: ObservableObject {
                 throw VaultError.invalidSnapshot
             }
             _ = try validatedRestorePaths(for: snapshot)
+            let sessionPreflight = try preflightSessionRestore(
+                snapshot: snapshot,
+                checkDatabaseConflicts: mode != .full,
+                replaceIndexes: mode == .full
+            )
             try preflightExternalAttachmentRestore(for: snapshot, sessionIDs: nil)
             let protectionMode = selectedProtectionMode(default: mode == .full ? .full : .lightweight)
             let protectionSessions: [CodexSession]
@@ -4084,7 +4034,7 @@ final class VaultModel: ObservableObject {
             )
             try report(0.45, "正在恢复快照...", "正在复制快照内容并合并 Codex 索引。")
             try checkCancellation()
-            try restore(snapshot: snapshot, mode: mode)
+            try restore(snapshot: snapshot, mode: mode, sessionPreflight: sessionPreflight)
             let attachmentNote = try attachmentRestoreNote(for: snapshot)
             try report(1.0, "恢复完成", "\(mode.successMessage) \(attachmentNote)")
             return .ok(message: "\(snapshot.name)：\(mode.successMessage) \(attachmentNote)")
@@ -4095,6 +4045,10 @@ final class VaultModel: ObservableObject {
                 throw VaultError.invalidSnapshot
             }
             _ = try validatedRestorePaths(for: snapshot)
+            let sessionPreflight = try preflightSessionRestore(
+                snapshot: snapshot,
+                sessionIDs: [session.id]
+            )
             try preflightExternalAttachmentRestore(for: snapshot, sessionIDs: [session.id])
             let protectionMode = selectedProtectionMode(default: .lightweight)
             try reportProtectionStart(
@@ -4111,7 +4065,7 @@ final class VaultModel: ObservableObject {
             )
             try report(0.55, "正在恢复会话：\(session.displayTitle)", "正在复制会话文件、附件并合并历史索引。")
             try checkCancellation()
-            try restoreSingleSession(snapshot: snapshot, session: session)
+            try restoreSingleSession(snapshot: snapshot, preflight: sessionPreflight)
             let attachmentNote = try attachmentRestoreNote(for: snapshot)
             try report(1.0, "恢复完成：\(session.displayTitle)", "会话文件、历史索引和线程记录已合并。\(attachmentNote)")
             return .ok(message: "已恢复单个会话：\(session.displayTitle)。\(attachmentNote)")
@@ -4122,9 +4076,14 @@ final class VaultModel: ObservableObject {
                 throw VaultError.invalidSnapshot
             }
             _ = try validatedRestorePaths(for: snapshot)
+            let selectedSessionIDs = Set(command.sessions.map(\.id))
+            let sessionPreflight = try preflightSessionRestore(
+                snapshot: snapshot,
+                sessionIDs: selectedSessionIDs
+            )
             try preflightExternalAttachmentRestore(
                 for: snapshot,
-                sessionIDs: Set(command.sessions.map(\.id))
+                sessionIDs: selectedSessionIDs
             )
             let protectionMode = selectedProtectionMode(default: .lightweight)
             try reportProtectionStart(
@@ -4139,17 +4098,12 @@ final class VaultModel: ObservableObject {
                 sessions: command.sessions,
                 fullCandidatePaths: autoProtectionCandidates
             )
-            let total = max(command.sessions.count, 1)
-            for (index, session) in command.sessions.enumerated() {
-                try checkCancellation()
-                let fraction = 0.20 + (0.75 * Double(index) / Double(total))
-                try report(
-                    fraction,
-                    "正在恢复 \(index + 1)/\(total)：\(session.displayTitle)",
-                    "正在复制会话文件并合并 Codex 本地索引。"
-                )
-                try restoreSingleSession(snapshot: snapshot, session: session)
-            }
+            try report(0.35, "正在批量恢复 \(command.sessions.count) 个会话...", "正在原子发布会话文件并在单个事务中合并 Codex 本地索引。")
+            try checkCancellation()
+            try restoreSessions(
+                snapshot: snapshot,
+                preflight: sessionPreflight
+            )
             let attachmentNote = try attachmentRestoreNote(for: snapshot)
             try report(1.0, "批量恢复完成", "已恢复 \(command.sessions.count) 个会话。\(attachmentNote)")
             return .ok(message: "已从 \(snapshot.name) 批量恢复 \(command.sessions.count) 个会话。\(attachmentNote)")
@@ -4257,12 +4211,18 @@ final class VaultModel: ObservableObject {
             guard !command.sessions.isEmpty else {
                 throw VaultError.commandFailed("没有可删除的会话。")
             }
+            let deletionRoot = URL(fileURLWithPath: codexRoot, isDirectory: true)
+            let deletionPlan = try SessionDeletionPlan.preflight(
+                sessionIDs: Set(command.sessions.map(\.id)),
+                codexRoot: deletionRoot
+            )
             try report(0.08, "正在创建删除前恢复点...", "只保存即将删除的会话。")
             _ = try createSessionProtectionSnapshot(
                 name: command.sessions.count == 1 ? "Pre-Delete Session Backup" : "Pre-Delete Sessions Backup",
                 reason: "pre-delete-session",
                 sessions: command.sessions
             )
+            let deletionWarning = try deletionPlan.commit()
             let total = max(command.sessions.count, 1)
             for (index, session) in command.sessions.enumerated() {
                 try checkCancellation()
@@ -4271,10 +4231,12 @@ final class VaultModel: ObservableObject {
                     "正在删除会话 \(index + 1)/\(total)：\(session.displayTitle)",
                     "正在清理会话文件、history.jsonl、session_index.jsonl 和 SQLite 线程记录。"
                 )
-                try delete(session: session)
+                try deleteSessionDatabaseRows(sessionID: session.id, root: deletionRoot)
+                try deleteAppDatabaseRows(sessionID: session.id, root: deletionRoot)
             }
-            try report(1.0, "会话删除完成", "已删除 \(command.sessions.count) 个会话。")
-            return .ok(message: "已删除 \(command.sessions.count) 个会话")
+            let warningSuffix = deletionWarning.map { " \($0)" } ?? ""
+            try report(1.0, "会话删除完成", "已删除 \(command.sessions.count) 个会话。\(warningSuffix)")
+            return .ok(message: "已删除 \(command.sessions.count) 个会话。\(warningSuffix)")
 
         case .createAutoProtectionSnapshot:
             let sessions = try loadSessions()
@@ -4292,6 +4254,7 @@ final class VaultModel: ObservableObject {
                 throw VaultError.invalidSnapshot
             }
             _ = try validatedRestorePaths(for: snapshot)
+            let sessionPreflight = try preflightSessionRestore(snapshot: snapshot)
             try preflightExternalAttachmentRestore(for: snapshot, sessionIDs: nil)
             try report(0.08, "正在创建自动找回前备份...", "正在保护当前 Codex 会话状态。")
             _ = try createSystemSnapshot(
@@ -4301,7 +4264,11 @@ final class VaultModel: ObservableObject {
             )
             try report(0.50, "正在自动找回会话...", "正在合并快照里的会话文件和索引。")
             try checkCancellation()
-            try restore(snapshot: snapshot, mode: .conversationsOnly)
+            try restore(
+                snapshot: snapshot,
+                mode: .conversationsOnly,
+                sessionPreflight: sessionPreflight
+            )
             let attachmentNote = try attachmentRestoreNote(for: snapshot)
             try report(1.0, "自动找回完成", "已从 \(snapshot.name) 合并恢复。\(attachmentNote)")
             return .ok(message: "已自动找回会话：从 \(snapshot.name) 合并恢复，保留当前账号和模型供应商配置。\(attachmentNote)")
@@ -4822,6 +4789,14 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
     private var observesWorkspaceWake = false
     private var pendingActivation = false
     private var pendingWake = false
+    private var launchedAsLoginItem = false
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        launchedAsLoginItem = NSAppleEventManager.shared()
+            .currentAppleEvent?
+            .paramDescriptor(forKeyword: keyAELaunchedAsLogInItem)?
+            .booleanValue ?? false
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !observesWorkspaceWake else { return }
@@ -4832,6 +4807,11 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
         observesWorkspaceWake = true
+        if launchedAsLoginItem {
+            DispatchQueue.main.async {
+                NSApp.hide(nil)
+            }
+        }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -4853,12 +4833,13 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model,
               model.nasSetupSnapshot.state == .seeding
-                || model.nasSetupSnapshot.state == .pending else {
+                || model.nasSetupSnapshot.state == .pending
+                || model.nasSetupSnapshot.state == .verifying else {
             return .terminateNow
         }
         let alert = NSAlert()
         alert.messageText = "NAS 备份尚未完成，仍要退出吗？"
-        alert.informativeText = "仍有会话正在建立初始备份或等待补传。退出不会创建本地会话缓存，下次连接 NAS 后会继续。"
+        alert.informativeText = "仍有会话正在建立初始备份、等待补传或执行回读校验。退出不会创建本地会话缓存，下次连接 NAS 后会继续。"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "继续等待")
         alert.addButton(withTitle: "仍然退出")
@@ -6548,6 +6529,17 @@ struct StatusBar: View {
                     if model.nasSetupSnapshot.state == .disconnected || model.nasSetupSnapshot.state == .error {
                         Button("立即重试") { model.retryNASBackup() }
                             .buttonStyle(.plain)
+                    }
+                    if model.nasSetupSnapshot.configuration != nil,
+                       !model.launchAtLoginSnapshot.enabled {
+                        Text(model.launchAtLoginSnapshot.message ?? "开机自启未启用")
+                            .foregroundStyle(Color(red: 0.76, green: 0.24, blue: 0.31))
+                        Button("修复开机自启") { model.retryLaunchAtLogin() }
+                            .buttonStyle(.plain)
+                        if model.launchAtLoginSnapshot.requiresApproval {
+                            Button("打开登录项设置") { model.openLoginItemSettings() }
+                                .buttonStyle(.plain)
+                        }
                     }
                 }
                 .lineLimit(1)

@@ -3,6 +3,7 @@ import Foundation
 public enum BackupProgressPhase: String, Codable, Sendable {
     case seeding
     case scanning
+    case verifying
 }
 
 public struct BackupProgress: Equatable, Sendable {
@@ -52,6 +53,9 @@ public final class BackupAgent: @unchecked Sendable {
     private let progressHandler: ((BackupProgress) -> Void)?
     private let statusHandler: (@Sendable (BackupStatus) -> Void)?
     private let remoteStatusWriter: (Data, URL) throws -> Void
+    private let healthCheckInterval: TimeInterval
+    private let remoteHeartbeatInterval: TimeInterval
+    private let autoStartEnabled: () -> Bool
     private let cursorStoreFactory: (URL) -> BackupCursorStore
     private let manifestStoreFactory: (URL) -> BackupManifestStore
     private let instrumentation: BackupAgentInstrumentation
@@ -69,6 +73,9 @@ public final class BackupAgent: @unchecked Sendable {
     private var pollingStartedAt: Date?
     private var lastKnownProgress: BackupProgress?
     private var cachedStatus: BackupStatus?
+    private var lastHealthCheckAt: Date?
+    private var lastRemoteHeartbeatAt: Date?
+    private var settledSourceSnapshot: [String: BackupSourceMetadata]?
     private var auditInterruptionEpoch: UInt64 = 0
     private var auditTimerGeneration: UInt64 = 0
     private var workerActive = false
@@ -88,6 +95,8 @@ public final class BackupAgent: @unchecked Sendable {
         var cursor: BackupCursor?
         var staleCursorSourcePath: String?
         var lastError: String?
+        var sourcePath: String
+        var sourceMetadata: BackupSourceMetadata
     }
 
     public convenience init(
@@ -101,7 +110,10 @@ public final class BackupAgent: @unchecked Sendable {
         fileCommitter: BackupFileCommitter = BackupFileCommitter(),
         progressHandler: ((BackupProgress) -> Void)? = nil,
         statusHandler: (@Sendable (BackupStatus) -> Void)? = nil,
-        remoteStatusWriter: ((Data, URL) throws -> Void)? = nil
+        remoteStatusWriter: ((Data, URL) throws -> Void)? = nil,
+        healthCheckInterval: TimeInterval = 300,
+        remoteHeartbeatInterval: TimeInterval = 1_800,
+        autoStartEnabled: @escaping () -> Bool = { false }
     ) {
         self.init(
             paths: paths,
@@ -115,6 +127,9 @@ public final class BackupAgent: @unchecked Sendable {
             progressHandler: progressHandler,
             statusHandler: statusHandler,
             remoteStatusWriter: remoteStatusWriter,
+            healthCheckInterval: healthCheckInterval,
+            remoteHeartbeatInterval: remoteHeartbeatInterval,
+            autoStartEnabled: autoStartEnabled,
             auditDelayProvider: nil,
             auditTimerScheduler: nil,
             sessionBackupStreamer: SessionBackupStreamer(),
@@ -139,6 +154,9 @@ public final class BackupAgent: @unchecked Sendable {
         progressHandler: ((BackupProgress) -> Void)? = nil,
         statusHandler: (@Sendable (BackupStatus) -> Void)? = nil,
         remoteStatusWriter: ((Data, URL) throws -> Void)? = nil,
+        healthCheckInterval: TimeInterval = 300,
+        remoteHeartbeatInterval: TimeInterval = 1_800,
+        autoStartEnabled: @escaping () -> Bool = { false },
         auditDelayProvider: (@Sendable (Date, Date?, UUID) -> TimeInterval)? = nil,
         auditTimerScheduler: (@Sendable (
             TimeInterval,
@@ -162,6 +180,9 @@ public final class BackupAgent: @unchecked Sendable {
         self.sessionBackupStreamer = sessionBackupStreamer
         self.progressHandler = progressHandler
         self.statusHandler = statusHandler
+        self.healthCheckInterval = max(0.001, healthCheckInterval)
+        self.remoteHeartbeatInterval = max(0.001, remoteHeartbeatInterval)
+        self.autoStartEnabled = autoStartEnabled
         self.cursorStoreFactory = cursorStoreFactory
         self.manifestStoreFactory = manifestStoreFactory
         self.instrumentation = instrumentation
@@ -180,10 +201,12 @@ public final class BackupAgent: @unchecked Sendable {
                 action()
             }
         }
-        self.cachedStatus = initialStatus ?? Self.loadPersistedStatus(at: paths.localStatusURL)
         self.remoteStatusWriter = remoteStatusWriter ?? { data, url in
             try DurableAtomicWriter().write(data, to: url, createParentDirectories: false)
         }
+        self.cachedStatus = initialStatus ?? Self.loadPersistedStatus(at: paths.localStatusURL)
+        self.lastHealthCheckAt = self.cachedStatus?.lastHeartbeatAt
+        self.lastRemoteHeartbeatAt = self.cachedStatus?.lastHeartbeatAt
     }
 
     deinit {
@@ -269,6 +292,13 @@ public final class BackupAgent: @unchecked Sendable {
             manifest.version = 2
             manifestChanged = true
         }
+        let verificationStore = BackupVerificationStore(
+            fileURL: paths.verificationURL,
+            createParentDirectories: false,
+            fileManager: fileManager
+        )
+        var verification = try verificationStore.load()
+        let originalVerification = verification
         if manifest.codexRoot != paths.codexRoot.path {
             manifest.codexRoot = paths.codexRoot.path
             manifestChanged = true
@@ -281,6 +311,7 @@ public final class BackupAgent: @unchecked Sendable {
         let sources = try discoverSessionFiles()
         let phase: BackupProgressPhase = manifestExisted ? .scanning : .seeding
         var processedSessionIDs = Set<String>()
+        var nextSettledSourceSnapshot: [String: BackupSourceMetadata] = [:]
         var updatedCursors: [BackupCursor] = []
         var staleCursorSourcePaths: [String] = []
         var scanErrors: [String] = []
@@ -311,8 +342,21 @@ public final class BackupAgent: @unchecked Sendable {
                 sessionID: sessionID,
                 scanDate: scanDate,
                 manifest: &manifest,
+                verification: &verification,
+                verificationProgress: { [weak self] in
+                    guard let self else { return }
+                    let progress = BackupProgress(
+                        totalFiles: sources.count,
+                        completedFiles: completed,
+                        pendingFiles: max(0, sources.count - completed),
+                        phase: .verifying
+                    )
+                    self.lastKnownProgress = progress
+                    self.progressHandler?(progress)
+                },
                 cursorMap: cursorMap
             )
+            nextSettledSourceSnapshot[result.sourcePath] = result.sourceMetadata
             manifestChanged = manifestChanged || result.manifestChanged
             if let cursor = result.cursor {
                 updatedCursors.append(cursor)
@@ -334,6 +378,9 @@ public final class BackupAgent: @unchecked Sendable {
             progressHandler?(progress)
         }
 
+        if verification != originalVerification {
+            try verificationStore.save(verification)
+        }
         if manifestChanged {
             manifest.updatedAt = scanDate
             try manifestStore.save(manifest)
@@ -372,6 +419,11 @@ public final class BackupAgent: @unchecked Sendable {
             includeRemote: true
         )
         try writePendingSources([])
+        if scanErrors.isEmpty {
+            stateLock.lock()
+            settledSourceSnapshot = nextSettledSourceSnapshot
+            stateLock.unlock()
+        }
     }
 
     private func interruptedPendingSources(
@@ -433,9 +485,17 @@ public final class BackupAgent: @unchecked Sendable {
     }
 
     public func requestImmediateScan(_ trigger: BackupScanTrigger) {
-        if trigger == .timer, auditIsRunning() {
+        if trigger == .timer {
             let hasPendingWork = (try? timerPreflightHasPendingWork()) ?? true
-            guard hasPendingWork else { return }
+            guard hasPendingWork else {
+                guard !backgroundWorkerIsActive() else { return }
+                do {
+                    try performIdleMaintenanceIfDue()
+                } catch {
+                    try? writeErrorStatus(error)
+                }
+                return
+            }
         }
 
         stateLock.lock()
@@ -456,15 +516,71 @@ public final class BackupAgent: @unchecked Sendable {
         }
     }
 
-    private func auditIsRunning() -> Bool {
+    private func backgroundWorkerIsActive() -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return !stopped && isAuditing
+        return !stopped && workerActive
+    }
+
+    private func performIdleMaintenanceIfDue() throws {
+        scanLock.lock()
+        defer { scanLock.unlock() }
+        let date = now()
+        stateLock.lock()
+        let healthDue = intervalIsDue(
+            previous: lastHealthCheckAt,
+            current: date,
+            interval: healthCheckInterval
+        )
+        let heartbeatDue = intervalIsDue(
+            previous: lastRemoteHeartbeatAt,
+            current: date,
+            interval: remoteHeartbeatInterval
+        )
+        stateLock.unlock()
+        guard healthDue || heartbeatDue else { return }
+
+        try targetValidator.validateTarget()
+        stateLock.lock()
+        lastHealthCheckAt = date
+        stateLock.unlock()
+        guard heartbeatDue, var status = cachedStatusSnapshot() else { return }
+
+        status.lastHeartbeatAt = date
+        status.autoStartEnabled = autoStartEnabled()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(status)
+        try remoteStatusWriter(data, paths.remoteStatusURL)
+        try DurableAtomicWriter().write(
+            data,
+            to: paths.localStatusURL,
+            permissions: 0o600,
+            parentDirectoryPermissions: 0o700,
+            createParentDirectories: true
+        )
+        stateLock.lock()
+        lastRemoteHeartbeatAt = date
+        stateLock.unlock()
+        publish(status)
+    }
+
+    private func intervalIsDue(
+        previous: Date?,
+        current: Date,
+        interval: TimeInterval
+    ) -> Bool {
+        guard let previous else { return true }
+        return current.timeIntervalSince(previous) >= interval
     }
 
     private func timerPreflightHasPendingWork() throws -> Bool {
-        let cursorStore = cursorStoreFactory(paths.cursorDatabaseURL)
-        let cursorMap = try cursorStore.loadAllReadOnly()
+        stateLock.lock()
+        let settled = settledSourceSnapshot
+        stateLock.unlock()
+        guard let settled else { return true }
+        var currentCount = 0
         var processedSessionIDs = Set<String>()
         for source in try discoverSessionFiles() {
             guard let sessionID = SessionIdentity.sessionID(from: source),
@@ -472,41 +588,15 @@ public final class BackupAgent: @unchecked Sendable {
                 continue
             }
             let sourcePath = canonicalSourcePath(source)
-            let cursor = cursorMap[sourcePath] ?? cursorMap[source.path]
             let metadata = try metadata(for: source)
-            let sourceMetadata = BackupSourceMetadata(
-                byteCount: metadata.size,
-                modifiedAt: metadata.modifiedAt
-            )
-            guard timerPreflightIsUnchanged(
-                sourcePath: sourcePath,
-                sourceMetadata: sourceMetadata,
-                cursor: cursor
-            ) else {
+            guard let previous = settled[sourcePath],
+                  previous.byteCount == metadata.size,
+                  previous.modifiedAt == metadata.modifiedAt else {
                 return true
             }
+            currentCount += 1
         }
-        return false
-    }
-
-    private func timerPreflightIsUnchanged(
-        sourcePath: String,
-        sourceMetadata: BackupSourceMetadata,
-        cursor: BackupCursor?
-    ) -> Bool {
-        guard let cursor,
-              cursor.sourcePath == sourcePath,
-              cursor.lastByteOffset >= 0,
-              cursor.lastByteOffset <= sourceMetadata.byteCount,
-              cursor.lastSourceSize == sourceMetadata.byteCount,
-              cursor.lastSourceModifiedAt == sourceMetadata.modifiedAt else {
-            return false
-        }
-        let hasUncommittedBytes = sourceMetadata.byteCount > cursor.lastByteOffset
-        if hasUncommittedBytes {
-            return !cursor.pendingPartialLine.isEmpty || cursor.lastError != nil
-        }
-        return cursor.pendingPartialLine.isEmpty && cursor.lastError == nil
+        return currentCount != settled.count
     }
 
     public func stop() {
@@ -750,6 +840,8 @@ public final class BackupAgent: @unchecked Sendable {
         sessionID: String,
         scanDate: Date,
         manifest: inout BackupManifest,
+        verification: inout BackupVerificationDocument,
+        verificationProgress: () -> Void,
         cursorMap: [String: BackupCursor]
     ) throws -> ProcessSessionFileResult {
         let sourcePath = canonicalSourcePath(sourceURL)
@@ -773,7 +865,14 @@ public final class BackupAgent: @unchecked Sendable {
             ? migratedCursor?.sourcePath
             : nil
         let sourceMetadata = try fileCommitter.inspectSource(sourceURL)
-        if scanIsStrictlyUnchanged(
+        let existingVerification = verification.sessions[sessionID]
+        let recordHasTrustedVerification = verificationMatches(
+            existingVerification,
+            record: existingRecord,
+            relativeBackupPath: relativeBackupPath,
+            chunkSize: verification.chunkSize
+        )
+        if recordHasTrustedVerification, scanIsStrictlyUnchanged(
             sourcePath: sourcePath,
             relativeBackupPath: relativeBackupPath,
             sourceMetadata: sourceMetadata,
@@ -784,7 +883,9 @@ public final class BackupAgent: @unchecked Sendable {
                 manifestChanged: false,
                 cursor: nil,
                 staleCursorSourcePath: nil,
-                lastError: currentCursor?.lastError
+                lastError: currentCursor?.lastError,
+                sourcePath: sourcePath,
+                sourceMetadata: sourceMetadata
             )
         }
 
@@ -801,10 +902,33 @@ public final class BackupAgent: @unchecked Sendable {
         let pathAgrees = baselineCursor?.backupPath == relativeBackupPath
             && existingRecord?.backupPath == relativeBackupPath
             && existingRecord?.sourcePath == sourcePath
-        let rebuild = !targetState.exists
+        var rebuild = !targetState.exists
             || !metadataAgrees
             || !pathAgrees
             || targetState.byteCount != recordedOffset
+            || !recordHasTrustedVerification
+        if !rebuild {
+            let identityMatches = baselineCursor?.sourceFileIdentity == nil
+                || baselineCursor?.sourceFileIdentity == sourceMetadata.fileIdentity
+            let anchorsMatch = if identityMatches, let existingVerification {
+                (try? BackupFileVerifier(
+                    chunkSize: verification.chunkSize
+                ).verifyAppendAnchors(
+                    source: sourceURL,
+                    previous: existingVerification,
+                    onRead: { range in
+                        instrumentation.sourceBodyRead(
+                            sourceURL,
+                            range.lowerBound,
+                            range.upperBound - range.lowerBound
+                        )
+                    }
+                )) ?? false
+            } else {
+                false
+            }
+            rebuild = !identityMatches || !anchorsMatch
+        }
 
         let finalStats: BackupFileStats
         let wroteData: Bool
@@ -814,17 +938,23 @@ public final class BackupAgent: @unchecked Sendable {
         let contentHash: String?
         let appendedLineCount: Int
         let fallbackTitle: String?
+        let verificationChunkSize = verification.chunkSize
         if rebuild {
             instrumentation.sourceBodyRead(sourceURL, 0, sourceMetadata.byteCount)
-            let streamed = try fileCommitter.rebuildCompleteLines(
-                from: sourceURL,
-                at: targetURL,
-                under: paths.backupRoot,
-                using: sessionBackupStreamer
+            let (streamed, verified) = try verifiedRebuild(
+                sourceURL: sourceURL,
+                targetURL: targetURL,
+                chunkSize: verificationChunkSize,
+                attempts: 2,
+                verificationProgress: verificationProgress
             )
-            if !targetState.exists, streamed.committedByteCount == 0 {
-                try? fileManager.removeItem(at: targetURL)
-            }
+            verification.sessions[sessionID] = BackupSessionVerification(
+                backupPath: relativeBackupPath,
+                byteCount: verified.byteCount,
+                lineCount: verified.lineCount,
+                chunkHashes: verified.chunkHashes,
+                verifiedAt: scanDate
+            )
             finalStats = BackupFileStats(
                 byteCount: streamed.committedByteCount,
                 lineCount: streamed.lineCount
@@ -842,37 +972,107 @@ public final class BackupAgent: @unchecked Sendable {
                 recordedOffset,
                 sourceMetadata.byteCount - recordedOffset
             )
-            let appended = try fileCommitter.appendCompleteLines(
-                from: sourceURL,
-                offset: recordedOffset,
-                to: targetURL,
-                under: paths.backupRoot,
-                using: sessionBackupStreamer
-            )
-            finalStats = BackupFileStats(
-                byteCount: appended.committedByteCount,
-                lineCount: appended.lineCount
-            )
-            finalOffset = appended.committedByteCount
-            pendingPartialLine = appended.pendingPartialLine
-            blockedError = appended.blockedError
-            appendedLineCount = appended.lineCount
-            wroteData = appended.appendedByteCount > 0
-            contentHash = appended.appendedByteCount > 0 ? nil : existingRecord?.contentHash
-            fallbackTitle = appended.firstTitle
+            guard let existingVerification else {
+                throw BackupFileVerificationError.invalidFile(targetURL.path)
+            }
+            do {
+                let appended = try fileCommitter.appendCompleteLines(
+                    from: sourceURL,
+                    offset: recordedOffset,
+                    to: targetURL,
+                    under: paths.backupRoot,
+                    using: sessionBackupStreamer
+                )
+                let finalLineCount = recordedLineCount + appended.lineCount
+                let updatedVerification: BackupSessionVerification
+                if appended.appendedByteCount > 0 {
+                    verificationProgress()
+                    updatedVerification = try BackupFileVerifier(
+                        chunkSize: verificationChunkSize
+                    ).verifyChangedChunks(
+                        source: sourceURL,
+                        target: targetURL,
+                        previous: existingVerification,
+                        backupPath: relativeBackupPath,
+                        committedByteCount: appended.committedByteCount,
+                        lineCount: finalLineCount,
+                        verifiedAt: scanDate
+                    )
+                } else {
+                    updatedVerification = existingVerification
+                }
+                guard let sourceMetadataAfterAppend = try? fileCommitter.inspectSource(sourceURL),
+                      sourceMetadataMatches(sourceMetadataAfterAppend, sourceMetadata) else {
+                    throw BackupAgentScanError.sourceChangedDuringAppend(sourceURL.path)
+                }
+                verification.sessions[sessionID] = updatedVerification
+                finalStats = BackupFileStats(
+                    byteCount: appended.committedByteCount,
+                    lineCount: appended.lineCount
+                )
+                finalOffset = appended.committedByteCount
+                pendingPartialLine = appended.pendingPartialLine
+                blockedError = appended.blockedError
+                appendedLineCount = appended.lineCount
+                wroteData = appended.appendedByteCount > 0
+                contentHash = appended.appendedByteCount > 0 ? nil : existingRecord?.contentHash
+                fallbackTitle = appended.firstTitle
+            } catch BackupAgentScanError.sourceChangedDuringAppend(let path) {
+                try fileCommitter.truncateTarget(
+                    targetURL,
+                    to: recordedOffset,
+                    under: paths.backupRoot
+                )
+                throw BackupAgentScanError.sourceChangedDuringAppend(path)
+            } catch {
+                guard let sourceMetadataAfterFailure = try? fileCommitter.inspectSource(sourceURL),
+                      sourceMetadataMatches(sourceMetadataAfterFailure, sourceMetadata) else {
+                    try fileCommitter.truncateTarget(
+                        targetURL,
+                        to: recordedOffset,
+                        under: paths.backupRoot
+                    )
+                    throw BackupAgentScanError.sourceChangedDuringAppend(sourceURL.path)
+                }
+                try fileCommitter.truncateTarget(
+                    targetURL,
+                    to: recordedOffset,
+                    under: paths.backupRoot
+                )
+                instrumentation.sourceBodyRead(sourceURL, 0, sourceMetadata.byteCount)
+                let (streamed, verified) = try verifiedRebuild(
+                    sourceURL: sourceURL,
+                    targetURL: targetURL,
+                    chunkSize: verificationChunkSize,
+                    attempts: 1,
+                    verificationProgress: verificationProgress
+                )
+                verification.sessions[sessionID] = BackupSessionVerification(
+                    backupPath: relativeBackupPath,
+                    byteCount: verified.byteCount,
+                    lineCount: verified.lineCount,
+                    chunkHashes: verified.chunkHashes,
+                    verifiedAt: scanDate
+                )
+                finalStats = BackupFileStats(
+                    byteCount: streamed.committedByteCount,
+                    lineCount: streamed.lineCount
+                )
+                finalOffset = streamed.committedByteCount
+                pendingPartialLine = streamed.pendingPartialLine
+                blockedError = streamed.blockedError
+                appendedLineCount = streamed.lineCount - recordedLineCount
+                wroteData = true
+                contentHash = streamed.contentHash
+                fallbackTitle = streamed.firstTitle
+            }
 
             if finalOffset > recordedOffset {
-                let verifiedByteCount = finalOffset - recordedOffset
-                instrumentation.sourceBodyRead(sourceURL, recordedOffset, verifiedByteCount)
-                guard try sessionBackupStreamer.rangesMatch(
-                    source: sourceURL,
-                    sourceOffset: recordedOffset,
-                    target: targetURL,
-                    targetOffset: recordedOffset,
-                    length: verifiedByteCount
-                ) else {
-                    throw BackupAgentScanError.rangeVerificationFailed(targetURL.path)
-                }
+                instrumentation.sourceBodyRead(
+                    sourceURL,
+                    recordedOffset,
+                    finalOffset - recordedOffset
+                )
             }
         }
 
@@ -911,13 +1111,16 @@ public final class BackupAgent: @unchecked Sendable {
             pendingPartialLine: pendingPartialLine,
             status: Self.activeStatus,
             lastError: blockedError,
-            updatedAt: scanDate.timeIntervalSince1970
+            updatedAt: scanDate.timeIntervalSince1970,
+            sourceFileIdentity: sourceMetadata.fileIdentity
         )
         return ProcessSessionFileResult(
             manifestChanged: manifestChanged,
             cursor: cursorNeedsUpsert(currentCursor: currentCursor, updatedCursor: updatedCursor) ? updatedCursor : nil,
             staleCursorSourcePath: staleCursorSourcePath,
-            lastError: blockedError
+            lastError: blockedError,
+            sourcePath: sourcePath,
+            sourceMetadata: sourceMetadata
         )
     }
 
@@ -982,7 +1185,9 @@ public final class BackupAgent: @unchecked Sendable {
               cursor.lastByteOffset >= 0,
               cursor.lastByteOffset <= sourceMetadata.byteCount,
               cursor.lastSourceSize == sourceMetadata.byteCount,
-              cursor.lastSourceModifiedAt == sourceMetadata.modifiedAt else {
+              cursor.lastSourceModifiedAt == sourceMetadata.modifiedAt,
+              cursor.sourceFileIdentity == nil
+                || cursor.sourceFileIdentity == sourceMetadata.fileIdentity else {
             return false
         }
 
@@ -993,16 +1198,110 @@ public final class BackupAgent: @unchecked Sendable {
         return cursor.pendingPartialLine.isEmpty && cursor.lastError == nil
     }
 
+    private func verificationMatches(
+        _ verification: BackupSessionVerification?,
+        record: BackupSessionRecord?,
+        relativeBackupPath: String,
+        chunkSize: Int
+    ) -> Bool {
+        guard let verification, let record,
+              chunkSize > 0,
+              verification.backupPath == relativeBackupPath,
+              verification.backupPath == record.backupPath,
+              verification.byteCount == record.bytesBackedUp,
+              verification.lineCount == record.lineCount,
+              verification.byteCount >= 0,
+              verification.lineCount >= 0 else {
+            return false
+        }
+        let expectedChunks = Int(
+            (verification.byteCount + Int64(chunkSize) - 1) / Int64(chunkSize)
+        )
+        return verification.chunkHashes.count == expectedChunks
+            && verification.chunkHashes.allSatisfy(Self.isSHA256)
+    }
+
+    private func verifiedRebuild(
+        sourceURL: URL,
+        targetURL: URL,
+        chunkSize: Int,
+        attempts: Int,
+        verificationProgress: () -> Void
+    ) throws -> (StreamedBackupResult, BackupFileVerificationResult) {
+        guard attempts > 0 else {
+            throw BackupFileVerificationError.invalidFile(targetURL.path)
+        }
+        var lastError: Error?
+        for attempt in 0..<attempts {
+            do {
+                var verification: BackupFileVerificationResult?
+                verificationProgress()
+                let streamed = try fileCommitter.rebuildCompleteLines(
+                    from: sourceURL,
+                    at: targetURL,
+                    under: paths.backupRoot,
+                    using: sessionBackupStreamer,
+                    verifyTemporary: { temporaryURL, expected in
+                        verification = try BackupFileVerifier(chunkSize: chunkSize).verifyFull(
+                            temporaryURL,
+                            expectedByteCount: expected.committedByteCount,
+                            expectedLineCount: expected.lineCount,
+                            expectedContentHash: expected.contentHash
+                        )
+                    }
+                )
+                guard let verification else {
+                    throw BackupFileVerificationError.invalidFile(targetURL.path)
+                }
+                return (streamed, verification)
+            } catch {
+                lastError = error
+                if attempt + 1 == attempts {
+                    guard error is BackupFileVerificationError else { throw error }
+                    let reason = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                    throw BackupAgentScanError.backupUploadOrVerificationFailed(
+                        path: targetURL.path,
+                        reason: reason
+                    )
+                }
+            }
+        }
+        let finalError = lastError ?? BackupFileVerificationError.invalidFile(targetURL.path)
+        guard finalError is BackupFileVerificationError else { throw finalError }
+        let reason = (finalError as? LocalizedError)?.errorDescription
+            ?? finalError.localizedDescription
+        throw BackupAgentScanError.backupUploadOrVerificationFailed(
+            path: targetURL.path,
+            reason: reason
+        )
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64 && value.unicodeScalars.allSatisfy { scalar in
+            (48...57).contains(scalar.value) || (65...70).contains(scalar.value) || (97...102).contains(scalar.value)
+        }
+    }
+
     private func canonicalSourcePath(_ sourceURL: URL) -> String {
         sourceURL.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     private func ensureLocalStateDirectoriesExist() throws {
-        try fileManager.createDirectory(at: paths.stateRoot, withIntermediateDirectories: true)
+        try ensurePrivateLocalDirectory(paths.stateRoot)
+        try ensurePrivateLocalDirectory(paths.logURL.deletingLastPathComponent())
+    }
+
+    private func ensurePrivateLocalDirectory(_ directory: URL) throws {
+        if (try? fileManager.destinationOfSymbolicLink(atPath: directory.path)) != nil {
+            throw CocoaError(.fileWriteNoPermission)
+        }
         try fileManager.createDirectory(
-            at: paths.logURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
         )
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
     }
 
     private func discoverSessionFiles() throws -> [URL] {
@@ -1030,11 +1329,8 @@ public final class BackupAgent: @unchecked Sendable {
     }
 
     private func metadata(for sourceURL: URL) throws -> (size: Int64, modifiedAt: TimeInterval) {
-        let attributes = try fileManager.attributesOfItem(atPath: sourceURL.path)
-        return (
-            (attributes[.size] as? NSNumber)?.int64Value ?? 0,
-            (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        )
+        let metadata = try fileCommitter.inspectSource(sourceURL)
+        return (metadata.byteCount, metadata.modifiedAt)
     }
 
     private func cursorNeedsUpsert(currentCursor: BackupCursor?, updatedCursor: BackupCursor) -> Bool {
@@ -1045,10 +1341,20 @@ public final class BackupAgent: @unchecked Sendable {
             || currentCursor.lastByteOffset != updatedCursor.lastByteOffset
             || currentCursor.lastSourceSize != updatedCursor.lastSourceSize
             || currentCursor.lastSourceModifiedAt != updatedCursor.lastSourceModifiedAt
+            || currentCursor.sourceFileIdentity != updatedCursor.sourceFileIdentity
             || currentCursor.lineCount != updatedCursor.lineCount
             || currentCursor.pendingPartialLine != updatedCursor.pendingPartialLine
             || currentCursor.status != updatedCursor.status
             || currentCursor.lastError != updatedCursor.lastError
+    }
+
+    private func sourceMetadataMatches(
+        _ current: BackupSourceMetadata,
+        _ scanStart: BackupSourceMetadata
+    ) -> Bool {
+        current.fileIdentity == scanStart.fileIdentity
+            && current.byteCount == scanStart.byteCount
+            && current.modifiedAt == scanStart.modifiedAt
     }
 
     private func writeStatus(
@@ -1075,7 +1381,7 @@ public final class BackupAgent: @unchecked Sendable {
             sessionCount: records.count,
             lineCount: records.reduce(0) { $0 + $1.lineCount },
             bytesBackedUp: records.reduce(Int64(0)) { $0 + $1.bytesBackedUp },
-            autoStartEnabled: false,
+            autoStartEnabled: autoStartEnabled(),
             lastError: lastError,
             lastAuditAt: auditState?.lastCompletedAt ?? existingStatus?.lastAuditAt,
             lastAuditResult: auditState?.lastResult ?? existingStatus?.lastAuditResult,
@@ -1088,8 +1394,18 @@ public final class BackupAgent: @unchecked Sendable {
         let data = try encoder.encode(snapshot)
         if includeRemote {
             try remoteStatusWriter(data, paths.remoteStatusURL)
+            stateLock.lock()
+            lastHealthCheckAt = date
+            lastRemoteHeartbeatAt = date
+            stateLock.unlock()
         }
-        try DurableAtomicWriter().write(data, to: paths.localStatusURL, createParentDirectories: true)
+        try DurableAtomicWriter().write(
+            data,
+            to: paths.localStatusURL,
+            permissions: 0o600,
+            parentDirectoryPermissions: 0o700,
+            createParentDirectories: true
+        )
         publish(snapshot)
     }
 
@@ -1192,7 +1508,13 @@ public final class BackupAgent: @unchecked Sendable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(records)
-        try DurableAtomicWriter().write(data, to: paths.pendingSourcesURL, createParentDirectories: true)
+        try DurableAtomicWriter().write(
+            data,
+            to: paths.pendingSourcesURL,
+            permissions: 0o600,
+            parentDirectoryPermissions: 0o700,
+            createParentDirectories: true
+        )
     }
 
     private func loadPendingSources() throws -> [PendingSourceRecord] {
@@ -1245,11 +1567,17 @@ public final class BackupAgent: @unchecked Sendable {
 
 private enum BackupAgentScanError: LocalizedError {
     case rangeVerificationFailed(String)
+    case backupUploadOrVerificationFailed(path: String, reason: String)
+    case sourceChangedDuringAppend(String)
 
     var errorDescription: String? {
         switch self {
         case let .rangeVerificationFailed(path):
             return "NAS append range verification failed: \(path)"
+        case let .backupUploadOrVerificationFailed(path, reason):
+            return "NAS 备份上传或回读校验失败：\(path)。原因：\(reason)"
+        case let .sourceChangedDuringAppend(path):
+            return "Source changed during NAS append and will be retried: \(path)"
         }
     }
 }

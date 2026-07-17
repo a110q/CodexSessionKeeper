@@ -31,6 +31,7 @@ func explicitNASLayoutSeparatesRemoteContentFromLocalControlState() {
 
     #expect(paths.cursorDatabaseURL.path == stateRoot.appendingPathComponent("cursors.sqlite").path)
     #expect(paths.auditStateURL.path == stateRoot.appendingPathComponent("integrity-audit.json").path)
+    #expect(paths.verificationURL.path == backupRoot.appendingPathComponent("verification.json").path)
     #expect(paths.localStatusURL.path == stateRoot.appendingPathComponent("status.json").path)
     #expect(paths.logURL.path == stateRoot.appendingPathComponent("logs/backup-agent.log").path)
     #expect(paths.manifestURL.path == backupRoot.appendingPathComponent("manifest.json").path)

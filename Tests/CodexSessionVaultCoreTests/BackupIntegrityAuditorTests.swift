@@ -65,6 +65,16 @@ struct BackupIntegrityAuditorTests {
         #expect(try fixture.nasTargetData() == committed)
         #expect(try fixture.loadManifest().sessions[fixture.sessionID]?.contentHash == sha256(committed))
         #expect(try fixture.loadAuditState().lastCompletedAt == fixture.dueDate)
+        let verification = try BackupVerificationStore(
+            fileURL: fixture.paths.verificationURL,
+            createParentDirectories: false
+        ).load()
+        let entry = try #require(verification.sessions[fixture.sessionID])
+        #expect(entry.byteCount == Int64(committed.count))
+        #expect(entry.lineCount == fixture.cursors[fixture.source.path]?.lineCount)
+        #expect(!entry.chunkHashes.isEmpty)
+        #expect(entry.verifiedAt == fixture.dueDate)
+        #expect(try integrityAuditMode(fixture.paths.auditStateURL) == 0o600)
     }
 
     @Test
@@ -182,6 +192,101 @@ struct BackupIntegrityAuditorTests {
             #expect(outcome == .completed(checked: 1, repaired: 1))
             #expect(try fixture.nasTargetData() == committed)
         }
+    }
+
+    @Test
+    func repairBatchesSmallReadChunksIntoOneMiBWrites() throws {
+        let line = Data("{\"role\":\"user\",\"content\":\"\(String(repeating: "x", count: 960))\"}\n".utf8)
+        var committed = Data()
+        for _ in 0..<1_500 {
+            committed.append(line)
+        }
+        var corrupted = committed
+        corrupted[0] ^= 0x01
+        let writes = RepairWriteObservations()
+        let fixture = try IntegrityAuditFixture(
+            committedLocalPrefix: committed,
+            nasData: corrupted,
+            chunkSize: 4_096,
+            instrumentation: IntegrityAuditInstrumentation(didWriteChunk: writes.append)
+        )
+        defer { fixture.cleanup() }
+
+        let outcome = try fixture.auditor.runIfDue(
+            now: fixture.dueDate,
+            deviceID: fixture.deviceID,
+            cursors: fixture.cursors,
+            interruptionRequested: { false }
+        )
+        let sizes = writes.sizes
+        let expectedWriteCount = Int(ceil(Double(committed.count) / Double(BufferedBackupWriter.defaultCapacity)))
+
+        #expect(outcome == .completed(checked: 1, repaired: 1))
+        #expect(sizes.count == expectedWriteCount)
+        #expect(sizes.allSatisfy { $0 <= BufferedBackupWriter.defaultCapacity })
+        #expect(try fixture.nasTargetData() == committed)
+    }
+
+    @Test
+    func repairReadbackFailureRetriesOnceBeforeReplacingFormalTarget() throws {
+        let committed = IntegrityAuditFixture.multiChunkJSONL()
+        var corrupted = committed
+        corrupted[0] ^= 0x01
+        let fault = RepairReadbackFault()
+        let fixture = try IntegrityAuditFixture(
+            committedLocalPrefix: committed,
+            nasData: corrupted,
+            instrumentation: IntegrityAuditInstrumentation(
+                didStreamChunk: fault.observe
+            )
+        )
+        defer { fixture.cleanup() }
+
+        let outcome = try fixture.auditor.runIfDue(
+            now: fixture.dueDate,
+            deviceID: fixture.deviceID,
+            cursors: fixture.cursors,
+            interruptionRequested: { false }
+        )
+
+        #expect(outcome == .completed(checked: 1, repaired: 1))
+        #expect(fault.repairWriteAttempts == 2)
+        #expect(try fixture.nasTargetData() == committed)
+    }
+
+    @Test
+    func twoRepairReadbackFailuresPreserveFormalBackupAndMetadata() throws {
+        let committed = IntegrityAuditFixture.multiChunkJSONL()
+        var corrupted = committed
+        corrupted[0] ^= 0x01
+        let fault = RepairReadbackFault(failures: 2)
+        let fixture = try IntegrityAuditFixture(
+            committedLocalPrefix: committed,
+            nasData: corrupted,
+            instrumentation: IntegrityAuditInstrumentation(
+                didStreamChunk: fault.observe
+            )
+        )
+        defer { fixture.cleanup() }
+        let manifestBefore = try fixture.loadManifest()
+        let cursorBefore = try fixture.loadCursor()
+        let stateBefore = try fixture.loadAuditState()
+
+        #expect(throws: (any Error).self) {
+            _ = try fixture.auditor.runIfDue(
+                now: fixture.dueDate,
+                deviceID: fixture.deviceID,
+                cursors: fixture.cursors,
+                interruptionRequested: { false }
+            )
+        }
+
+        #expect(fault.repairWriteAttempts == 2)
+        #expect(try fixture.nasTargetData() == corrupted)
+        #expect(try fixture.loadManifest() == manifestBefore)
+        #expect(try fixture.loadCursor() == cursorBefore)
+        #expect(try fixture.loadAuditState() == stateBefore)
+        #expect(FileManager.default.fileExists(atPath: fixture.paths.verificationURL.path) == false)
     }
 
     @Test
@@ -372,6 +477,7 @@ struct BackupIntegrityAuditorTests {
 
         #expect(try fixture.nasTargetData() == fixture.committedLocalPrefix)
         #expect(try fixture.pendingRepairJournalPhase() == "prepared")
+        #expect(try integrityAuditMode(fixture.pendingRepairJournalURL) == 0o600)
         #expect(try fixture.loadManifest() == manifestBefore)
         #expect(try fixture.loadAuditState() == stateBefore)
 
@@ -803,6 +909,11 @@ struct BackupIntegrityAuditorTests {
     }
 }
 
+private func integrityAuditMode(_ url: URL) throws -> Int {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    return ((attributes[.posixPermissions] as? NSNumber)?.intValue ?? -1) & 0o777
+}
+
 enum UnsafeLocalSourceCase: String, CaseIterable, Sendable {
     case missing
     case symlinked
@@ -849,6 +960,54 @@ private final class StreamPhaseObservations: @unchecked Sendable {
     }
 }
 
+private final class RepairWriteObservations: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Int] = []
+
+    var sizes: [Int] {
+        lock.withLock { storage }
+    }
+
+    func append(phase: IntegrityAuditStreamPhase, url: URL, length: Int) {
+        guard phase == .repairTemporary, !url.path.isEmpty else { return }
+        lock.withLock { storage.append(length) }
+    }
+}
+
+private final class RepairReadbackFault: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remainingFailures: Int
+    private var attempts = 0
+
+    init(failures: Int = 1) {
+        remainingFailures = failures
+    }
+
+    var repairWriteAttempts: Int {
+        lock.withLock { attempts }
+    }
+
+    func observe(phase: IntegrityAuditStreamPhase, url: URL, offset: Int64, length: Int) {
+        guard offset == 0, length > 0 else { return }
+        if phase == .repairTemporary {
+            lock.withLock { attempts += 1 }
+            return
+        }
+        guard phase == .repairTemporaryVerification else { return }
+        let shouldInject = lock.withLock { () -> Bool in
+            guard remainingFailures > 0 else { return false }
+            remainingFailures -= 1
+            return true
+        }
+        guard shouldInject else { return }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        try? handle.seek(toOffset: UInt64(1_048_576 + 17))
+        try? handle.write(contentsOf: Data([0]))
+        try? handle.synchronize()
+    }
+}
+
 private final class IntegrityAuditFixture {
     let root: URL
     let paths: BackupPaths
@@ -880,6 +1039,7 @@ private final class IntegrityAuditFixture {
         corrupted: Bool = false,
         name: String = UUID().uuidString,
         cursorsEnabled: Bool = true,
+        chunkSize: Int = 1_048_576,
         instrumentation: IntegrityAuditInstrumentation = IntegrityAuditInstrumentation()
     ) throws {
         root = FileManager.default.temporaryDirectory
@@ -946,7 +1106,7 @@ private final class IntegrityAuditFixture {
         try BackupManifestStore(manifestURL: paths.manifestURL, createParentDirectories: false).save(manifest)
         auditor = BackupIntegrityAuditor(
             paths: paths,
-            chunkSize: 1_048_576,
+            chunkSize: chunkSize,
             instrumentation: instrumentation
         )
         try writeAuditState(IntegrityAuditState(
