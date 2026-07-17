@@ -8,9 +8,9 @@
 
 | 位置 | 状态 |
 | --- | --- |
-| 当前源码 | `v1.0.14`，包含公司 NAS 会话增量备份、首次配置和旧设备恢复。 |
+| 当前源码 | `v1.0.14`，包含公司 NAS 会话增量备份、校验恢复、后台常驻和空闲降载。 |
 | GitHub Releases | 最新公开包为 `v1.0.13`，修复 Codex 更新后创建快照、恢复快照、删除会话等操作失败的问题。 |
-| 本地构建 | 可从当前源码生成 `v1.0.14` macOS App 和 Windows 免安装目录；在 Release 发布前不要把公开 `v1.0.13` 误认为已包含 NAS 功能。 |
+| 本地构建 | 可生成 macOS DMG、Windows 每用户 NSIS 安装包和 Windows 免安装目录；当前安装包未签名，只用于公司内部测试。 |
 
 下载稳定版：
 
@@ -45,6 +45,7 @@ Windows 版本是免安装便携版。不要只拷贝单独的 exe 文件，Elec
 - 批量操作：支持批量删除会话、批量删除快照、批量恢复快照内会话。
 - 自动找回：默认关闭，用户手动开启后，启动时才检测是否需要从最新保护点找回会话。
 - 进度提示：恢复、删除、创建快照等慢操作会显示居中进度、原因说明和取消入口。
+- 后台常驻：完成 NAS 配置后自动申请开机启动；Windows 关闭窗口后进入托盘，macOS 登录启动时不主动弹窗。
 
 ## 界面改进
 
@@ -97,7 +98,7 @@ codex会话备份/<部门>/<姓名>/devices/<设备>/incremental-backups/
   status.json
 ```
 
-正常情况下，新增的完整会话记录会在 30 秒内被发现；软件启动、首次激活、电脑唤醒以及确认 NAS 恢复连接后会立即补扫。每台设备每 24 小时错峰执行一次完整性审计。发现 NAS 会话与本机已验证的完整会话内容不一致时，软件只使用本机已验证内容自动修复；被替换的 NAS 内容先保存在应用自有的 `repair-quarantine/`，保留 30 天，并且每个会话最多保留 3 份。
+正常情况下，新增的完整会话记录会在 30 秒内被发现。无变化时这一步只比较内存快照和本地文件元数据，不读取游标数据库或 NAS；每 5 分钟执行一次只读 NAS 健康检查，每 30 分钟最多写一次状态心跳。完整写入探针只在首次配置、软件启动、重连或手动重试时执行。软件启动、首次激活、电脑唤醒以及确认 NAS 恢复连接后会立即补扫。每台设备每 24 小时错峰执行一次完整性审计。发现 NAS 会话与本机已验证的完整会话内容不一致时，软件只使用本机已验证内容自动修复；被替换的 NAS 内容先保存在应用自有的 `repair-quarantine/`，保留 30 天，并且每个会话最多保留 3 份。
 
 NAS 只接收会话 JSONL、manifest 和备份状态。账号凭据、账号状态或登录态、本机快照、Codex 配置以及正在使用的 `state_5.sqlite` 数据库都不会上传。本机只保留游标、待补传元数据和错误状态，不保留另一份会话内容作为离线缓存。NAS 断开时，源会话仍留在 `~/.codex`，重新连接后会继续补传；如果 NAS 离线期间源会话也被删除，本工具无法凭空恢复该段尚未上传的内容，这是当前明确接受的限制。
 
@@ -139,15 +140,27 @@ macOS App：
 
 ```bash
 ./scripts/build_app.sh
+./scripts/build_macos_dmg.sh
 ```
 
 生成：
 
 ```text
 dist/codex_会话管理.app
+dist/codex_session_keeper_macos_v1.0.14_internal-test-unsigned.dmg
 ```
 
-Windows Electron 免安装版：
+Windows 每用户安装包（不要求管理员权限）：
+
+```bash
+cd windows/codex_session_manager_electron
+npm ci
+npm run dist:win
+```
+
+生成到 `dist/win10-installer/`，文件名含 `internal-test-unsigned`。卸载时会清理本软件创建的开机启动项。
+
+Windows Electron 免安装版仍可构建：
 
 ```bash
 ./scripts/build_windows_exe.sh
@@ -161,6 +174,18 @@ Windows Electron 免安装版：
 ```
 
 首次构建 Windows 版本会自动安装 Electron 依赖并下载运行时，耗时取决于网络。
+
+内部 P0 验收：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\acceptance\run_p0_windows.ps1
+```
+
+```bash
+./scripts/acceptance/run_p0_macos.sh
+```
+
+Windows 验收只会在选中员工的 `devices/p0-acceptance-<UUID>/` 下创建隔离数据，清理前必须核对自有 marker。输出固定为 `p0-acceptance-report.json`、`resource-samples.csv` 和中文 `summary.txt`，不会记录会话正文。自动化结果不能替代双端开机启动、后台常驻、真实 NAS 重连和 24 小时资源验收；这些门槛未全部记录为通过前，不得标记为正式发布就绪。
 
 ## 发布新版本
 
