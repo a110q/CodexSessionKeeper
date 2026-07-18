@@ -160,6 +160,8 @@ The first successful activation scans the current Codex `sessions` and `archived
 
 Each new target file is written to a unique temporary file in the same NAS directory, flushed, verified, and atomically renamed into place. The manifest becomes visible only after the files it describes have been committed.
 
+Conversation titles are best-effort display metadata, not backup content. To keep metadata extraction bounded, the agent parses a JSONL record for a title only when that record is at most 256 KiB. Larger records are still copied, hashed, verified, and recoverable byte-for-byte; they are skipped only for title extraction, so a later eligible user record may supply the title and the session ID remains the fallback.
+
 ### Incremental append
 
 For each session, the committed NAS target represents a verified byte prefix of the source JSONL. The agent writes only bytes added after the last committed source offset.

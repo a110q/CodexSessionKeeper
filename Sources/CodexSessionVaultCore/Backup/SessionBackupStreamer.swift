@@ -84,6 +84,8 @@ struct BufferedBackupWriter {
 
 public struct SessionBackupStreamer: Sendable {
     private static let maximumChunkSize = 1_048_576
+    // Titles are display metadata. Never materialize an arbitrarily large JSON record solely to derive one.
+    static let maximumTitleRecordBytes = 256 * 1_024
     private static let newlineByte: UInt8 = 0x0A
     private static let newline = Data([newlineByte])
 
@@ -160,61 +162,67 @@ public struct SessionBackupStreamer: Sendable {
             var bufferedWriter = BufferedBackupWriter {
                 try destinationHandle.write(contentsOf: $0)
             }
-            readLoop: while remaining.map({ $0 > 0 }) ?? true {
-                let requestedCount = remaining.map { Int(min($0, Int64(chunkSize))) } ?? chunkSize
-                guard requestedCount > 0,
-                      let chunk = try sourceHandle.read(upToCount: requestedCount),
-                      !chunk.isEmpty else {
-                    break
-                }
-                if remaining != nil {
-                    remaining! -= Int64(chunk.count)
-                }
-
-                var segmentStart = chunk.startIndex
-                for newlineIndex in chunk.indices where chunk[newlineIndex] == Self.newlineByte {
-                    if segmentStart < newlineIndex {
-                        pendingLine.append(contentsOf: chunk[segmentStart..<newlineIndex])
+            while remaining.map({ $0 > 0 }) ?? true {
+                let shouldContinue = try autoreleasepool { () throws -> Bool in
+                    let requestedCount = remaining.map { Int(min($0, Int64(chunkSize))) } ?? chunkSize
+                    guard requestedCount > 0,
+                          let chunk = try sourceHandle.read(upToCount: requestedCount),
+                          !chunk.isEmpty else {
+                        return false
                     }
-                    guard pendingLine.count <= effectiveMaxLineBytes else {
-                        blockedError = Self.blockedErrorMessage(
-                            for: source,
-                            maxLineBytes: effectiveMaxLineBytes,
-                            lineOffset: lineOffset
-                        )
-                        pendingLine.removeAll(keepingCapacity: false)
-                        break readLoop
-                    }
-                    if firstTitle == nil {
-                        firstTitle = Self.title(from: pendingLine)
+                    if remaining != nil {
+                        remaining! -= Int64(chunk.count)
                     }
 
-                    if !pendingLine.isEmpty {
-                        try bufferedWriter.append(pendingLine)
-                        digest.update(data: pendingLine)
-                        committedByteCount += Int64(pendingLine.count)
-                    }
-                    try bufferedWriter.append(byte: Self.newlineByte)
-                    digest.update(data: Self.newline)
-                    committedByteCount += 1
-                    lineCount += 1
-                    pendingLine.removeAll(keepingCapacity: true)
-                    lineOffset = committedByteCount
-                    segmentStart = chunk.index(after: newlineIndex)
-                }
+                    var segmentStart = chunk.startIndex
+                    for newlineIndex in chunk.indices where chunk[newlineIndex] == Self.newlineByte {
+                        if segmentStart < newlineIndex {
+                            pendingLine.append(contentsOf: chunk[segmentStart..<newlineIndex])
+                        }
+                        guard pendingLine.count <= effectiveMaxLineBytes else {
+                            blockedError = Self.blockedErrorMessage(
+                                for: source,
+                                maxLineBytes: effectiveMaxLineBytes,
+                                lineOffset: lineOffset
+                            )
+                            pendingLine.removeAll(keepingCapacity: false)
+                            return false
+                        }
+                        if firstTitle == nil {
+                            firstTitle = Self.title(from: pendingLine)
+                        }
 
-                if segmentStart < chunk.endIndex {
-                    pendingLine.append(contentsOf: chunk[segmentStart..<chunk.endIndex])
-                    guard pendingLine.count <= effectiveMaxLineBytes else {
-                        blockedError = Self.blockedErrorMessage(
-                            for: source,
-                            maxLineBytes: effectiveMaxLineBytes,
-                            lineOffset: lineOffset
-                        )
-                        pendingLine.removeAll(keepingCapacity: false)
-                        break
+                        if !pendingLine.isEmpty {
+                            try bufferedWriter.append(pendingLine)
+                            digest.update(data: pendingLine)
+                            committedByteCount += Int64(pendingLine.count)
+                        }
+                        try bufferedWriter.append(byte: Self.newlineByte)
+                        digest.update(data: Self.newline)
+                        committedByteCount += 1
+                        lineCount += 1
+                        let oversizedLine = pendingLine.count > chunkSize
+                        pendingLine.removeAll(keepingCapacity: !oversizedLine)
+                        if oversizedLine { BackupMemoryPressureRelief.relieve() }
+                        lineOffset = committedByteCount
+                        segmentStart = chunk.index(after: newlineIndex)
                     }
+
+                    if segmentStart < chunk.endIndex {
+                        pendingLine.append(contentsOf: chunk[segmentStart..<chunk.endIndex])
+                        guard pendingLine.count <= effectiveMaxLineBytes else {
+                            blockedError = Self.blockedErrorMessage(
+                                for: source,
+                                maxLineBytes: effectiveMaxLineBytes,
+                                lineOffset: lineOffset
+                            )
+                            pendingLine.removeAll(keepingCapacity: false)
+                            return false
+                        }
+                    }
+                    return true
                 }
+                if !shouldContinue { break }
             }
             try bufferedWriter.flush()
         }
@@ -262,51 +270,57 @@ public struct SessionBackupStreamer: Sendable {
             try destinationHandle.write(contentsOf: $0)
         }
 
-        readLoop: while true {
-            guard let chunk = try sourceHandle.read(upToCount: chunkSize), !chunk.isEmpty else {
-                break
-            }
-            var segmentStart = chunk.startIndex
-            for newlineIndex in chunk.indices where chunk[newlineIndex] == Self.newlineByte {
-                if segmentStart < newlineIndex {
-                    pendingLine.append(contentsOf: chunk[segmentStart..<newlineIndex])
+        while true {
+            let shouldContinue = try autoreleasepool { () throws -> Bool in
+                guard let chunk = try sourceHandle.read(upToCount: chunkSize), !chunk.isEmpty else {
+                    return false
                 }
-                guard pendingLine.count <= effectiveMaxLineBytes else {
-                    blockedError = Self.blockedErrorMessage(
-                        for: source,
-                        maxLineBytes: effectiveMaxLineBytes,
-                        lineOffset: sourceOffset + appendedByteCount
-                    )
-                    pendingLine.removeAll(keepingCapacity: false)
-                    break readLoop
-                }
-                if firstTitle == nil {
-                    firstTitle = Self.title(from: pendingLine)
+                var segmentStart = chunk.startIndex
+                for newlineIndex in chunk.indices where chunk[newlineIndex] == Self.newlineByte {
+                    if segmentStart < newlineIndex {
+                        pendingLine.append(contentsOf: chunk[segmentStart..<newlineIndex])
+                    }
+                    guard pendingLine.count <= effectiveMaxLineBytes else {
+                        blockedError = Self.blockedErrorMessage(
+                            for: source,
+                            maxLineBytes: effectiveMaxLineBytes,
+                            lineOffset: sourceOffset + appendedByteCount
+                        )
+                        pendingLine.removeAll(keepingCapacity: false)
+                        return false
+                    }
+                    if firstTitle == nil {
+                        firstTitle = Self.title(from: pendingLine)
+                    }
+
+                    if !pendingLine.isEmpty {
+                        try bufferedWriter.append(pendingLine)
+                        appendedByteCount += Int64(pendingLine.count)
+                    }
+                    try bufferedWriter.append(byte: Self.newlineByte)
+                    appendedByteCount += 1
+                    lineCount += 1
+                    let oversizedLine = pendingLine.count > chunkSize
+                    pendingLine.removeAll(keepingCapacity: !oversizedLine)
+                    if oversizedLine { BackupMemoryPressureRelief.relieve() }
+                    segmentStart = chunk.index(after: newlineIndex)
                 }
 
-                if !pendingLine.isEmpty {
-                    try bufferedWriter.append(pendingLine)
-                    appendedByteCount += Int64(pendingLine.count)
+                if segmentStart < chunk.endIndex {
+                    pendingLine.append(contentsOf: chunk[segmentStart..<chunk.endIndex])
+                    guard pendingLine.count <= effectiveMaxLineBytes else {
+                        blockedError = Self.blockedErrorMessage(
+                            for: source,
+                            maxLineBytes: effectiveMaxLineBytes,
+                            lineOffset: sourceOffset + appendedByteCount
+                        )
+                        pendingLine.removeAll(keepingCapacity: false)
+                        return false
+                    }
                 }
-                try bufferedWriter.append(byte: Self.newlineByte)
-                appendedByteCount += 1
-                lineCount += 1
-                pendingLine.removeAll(keepingCapacity: true)
-                segmentStart = chunk.index(after: newlineIndex)
+                return true
             }
-
-            if segmentStart < chunk.endIndex {
-                pendingLine.append(contentsOf: chunk[segmentStart..<chunk.endIndex])
-                guard pendingLine.count <= effectiveMaxLineBytes else {
-                    blockedError = Self.blockedErrorMessage(
-                        for: source,
-                        maxLineBytes: effectiveMaxLineBytes,
-                        lineOffset: sourceOffset + appendedByteCount
-                    )
-                    pendingLine.removeAll(keepingCapacity: false)
-                    break
-                }
-            }
+            if !shouldContinue { break }
         }
 
         try bufferedWriter.flush()
@@ -364,8 +378,8 @@ public struct SessionBackupStreamer: Sendable {
     }
 
     private static func title(from line: Data) -> String? {
-        guard let text = String(data: line, encoding: .utf8) else { return nil }
-        return SessionIdentity.title(fromJSONLine: text)
+        guard line.count <= maximumTitleRecordBytes else { return nil }
+        return SessionIdentity.title(fromJSONData: line)
     }
 
     private func cursorPartialLine(_ pendingLine: Data, blockedError: String?) -> Data {

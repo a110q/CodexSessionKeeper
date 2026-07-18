@@ -443,41 +443,96 @@ function killTree(child) {
   }
 }
 
+function swapGrowthBytes(baselineSwappedBytes, peakSwappedBytes) {
+  return Math.max(0, peakSwappedBytes - baselineSwappedBytes);
+}
+
 async function runGuarded(command, args, options = {}) {
+  const stageDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'large-jsonl-stage-'));
+  const stagePath = path.join(stageDirectory, 'stage.log');
+  const baselineAckPath = path.join(stageDirectory, 'baseline-captured');
   const child = spawn(command, args, {
     cwd: options.cwd || REPOSITORY_ROOT,
-    env: { ...process.env, ...options.env },
+    env: {
+      ...process.env,
+      ...options.env,
+      CODEX_LARGE_JSONL_STAGE_FILE: stagePath,
+      CODEX_LARGE_JSONL_BASELINE_ACK_FILE: baselineAckPath,
+    },
     detached: process.platform !== 'win32',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
   let stderr = '';
-  child.stdout.on('data', (chunk) => { stdout += chunk; process.stdout.write(chunk); });
-  child.stderr.on('data', (chunk) => { stderr += chunk; process.stderr.write(chunk); });
+  let currentStage = 'startup';
+  function observeStages(chunk) {
+    for (const match of String(chunk).matchAll(/LARGE_JSONL_ACCEPTANCE_STAGE=([^\r\n]+)/g)) {
+      currentStage = match[1];
+    }
+  }
+  child.stdout.on('data', (chunk) => { stdout += chunk; observeStages(chunk); process.stdout.write(chunk); });
+  child.stderr.on('data', (chunk) => { stderr += chunk; observeStages(chunk); process.stderr.write(chunk); });
   let peakRssBytes = 0;
   let peakProcessCount = 0;
   let peakPhysFootprintBytes = 0;
   let peakSwappedBytes = 0;
+  let baselineSwappedBytes = null;
   let footprintSamples = 0;
+  const stageMemory = {};
   let sampling = false;
   let aborted = null;
   const sample = async () => {
     if (sampling || child.exitCode != null) return;
     sampling = true;
     try {
+      try {
+        observeStages(await fsp.readFile(stagePath, 'utf8'));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      const sampledStage = currentStage;
       const rows = process.platform === 'win32' ? windowsProcessRows() : unixProcessRows();
       const summary = summarizeProcessMemory(rows, child.pid);
       peakRssBytes = Math.max(peakRssBytes, summary.aggregateRssBytes);
       peakProcessCount = Math.max(peakProcessCount, summary.processCount);
+      stageMemory[sampledStage] ||= {
+        peakRssBytes: 0,
+        peakPhysFootprintBytes: 0,
+        peakSwappedBytes: 0,
+        samples: 0,
+      };
+      stageMemory[sampledStage].peakRssBytes = Math.max(
+        stageMemory[sampledStage].peakRssBytes,
+        summary.aggregateRssBytes,
+      );
       if (summary.aggregateRssBytes >= HARD_ABORT_BYTES) aborted = `aggregate RSS reached ${summary.aggregateRssBytes}`;
       if (process.platform === 'darwin') {
         const footprint = await macFootprint([...descendantProcessIds(rows, child.pid)]);
         if (footprint) {
           footprintSamples += 1;
           peakPhysFootprintBytes = Math.max(peakPhysFootprintBytes, footprint.physFootprintBytes);
-          peakSwappedBytes = Math.max(peakSwappedBytes, footprint.swappedBytes);
+          if (sampledStage === 'startup-ready' && baselineSwappedBytes == null) {
+            baselineSwappedBytes = footprint.swappedBytes;
+            peakSwappedBytes = footprint.swappedBytes;
+            await fsp.writeFile(baselineAckPath, String(baselineSwappedBytes), { flag: 'wx' });
+          }
+          if (baselineSwappedBytes != null) {
+            peakSwappedBytes = Math.max(peakSwappedBytes, footprint.swappedBytes);
+          }
+          stageMemory[sampledStage].samples += 1;
+          stageMemory[sampledStage].peakPhysFootprintBytes = Math.max(
+            stageMemory[sampledStage].peakPhysFootprintBytes,
+            footprint.physFootprintBytes,
+          );
+          stageMemory[sampledStage].peakSwappedBytes = Math.max(
+            stageMemory[sampledStage].peakSwappedBytes,
+            footprint.swappedBytes,
+          );
           if (footprint.physFootprintBytes >= HARD_ABORT_BYTES) aborted = `phys_footprint reached ${footprint.physFootprintBytes}`;
         }
+      } else if (sampledStage === 'startup-ready' && baselineSwappedBytes == null) {
+        baselineSwappedBytes = 0;
+        await fsp.writeFile(baselineAckPath, '0', { flag: 'wx' });
       }
       if (aborted) killTree(child);
     } finally {
@@ -489,12 +544,30 @@ async function runGuarded(command, args, options = {}) {
   const exit = await new Promise((resolve) => child.once('close', (code, signal) => resolve({ code, signal })));
   clearInterval(timer);
   while (sampling) await new Promise((resolve) => setTimeout(resolve, 20));
+  await fsp.rm(stageDirectory, { recursive: true, force: true });
   if (aborted) throw new Error(`1 GiB resource guard aborted child: ${aborted}`);
   if (exit.code !== 0) throw new Error(`guarded command failed (${exit.code ?? exit.signal}): ${stderr.slice(-2000)}`);
+  const swapGrowth = baselineSwappedBytes == null
+    ? null
+    : swapGrowthBytes(baselineSwappedBytes, peakSwappedBytes);
+  const memory = {
+    peakRssBytes,
+    peakProcessCount,
+    peakPhysFootprintBytes,
+    baselineSwappedBytes,
+    peakSwappedBytes,
+    swapGrowthBytes: swapGrowth,
+    footprintSamples,
+    stages: stageMemory,
+  };
   if (process.platform === 'darwin') {
     assert.ok(footprintSamples > 0, 'no macOS phys_footprint samples were captured');
-    assert.ok(peakPhysFootprintBytes < MAC_LIMIT_BYTES, `phys_footprint ${peakPhysFootprintBytes} exceeded 600 MiB`);
-    assert.equal(peakSwappedBytes, 0, `guarded process tree used ${peakSwappedBytes} bytes of swap`);
+    assert.notEqual(baselineSwappedBytes, null, 'no startup-ready swap baseline was captured');
+    assert.ok(
+      peakPhysFootprintBytes < MAC_LIMIT_BYTES,
+      `phys_footprint exceeded 600 MiB: ${JSON.stringify(memory)}`,
+    );
+    assert.equal(swapGrowth, 0, `guarded process tree swap grew after startup-ready: ${JSON.stringify(memory)}`);
   } else if (process.platform === 'win32') {
     assert.ok(peakRssBytes < WINDOWS_LIMIT_BYTES, `working set ${peakRssBytes} exceeded 650 MiB`);
   }
@@ -502,7 +575,7 @@ async function runGuarded(command, args, options = {}) {
   assert.ok(markerLine, 'guarded worker did not emit an acceptance result');
   return {
     worker: JSON.parse(markerLine.slice(RESULT_MARKER.length)),
-    memory: { peakRssBytes, peakProcessCount, peakPhysFootprintBytes, peakSwappedBytes, footprintSamples },
+    memory,
   };
 }
 
@@ -528,17 +601,25 @@ async function main() {
     ]);
   } else if (platform === 'swift') {
     const isReal = mode === 'real-source';
+    const isLifecycle = mode === 'bounded-lifecycle';
     const filter = isReal
       ? 'knownSourceVerifiedPrefixResumesWithoutMutation'
-      : 'legitimateLargeCompactedLineRepairsAndRecoversByteForByte';
+      : isLifecycle
+        ? 'boundedNinetySixMiBLifecycleStaysFileSizeIndependent'
+        : 'legitimateLargeCompactedLineRepairsAndRecoversByteForByte';
     report = await runGuarded('swift', [
-      'test', '-c', 'release', '--skip-build',
+      'test', '-c', 'release', '--skip-build', '--disable-xctest', '--enable-swift-testing',
       '--filter', filter,
     ], {
       env: isReal ? {
         CODEX_RUN_REAL_LARGE_JSONL_ACCEPTANCE: '1',
         CODEX_REAL_LARGE_JSONL_SOURCE: process.env.CODEX_REAL_LARGE_JSONL_SOURCE,
-      } : { CODEX_RUN_LARGE_JSONL_ACCEPTANCE: '1' },
+      } : isLifecycle
+        ? {
+          CODEX_RUN_LARGE_JSONL_LIFECYCLE: '1',
+          CODEX_LIFECYCLE_TOTAL_MIB: process.env.CODEX_LIFECYCLE_TOTAL_MIB,
+        }
+        : { CODEX_RUN_LARGE_JSONL_ACCEPTANCE: '1' },
     });
   } else {
     throw new Error(`Unsupported platform: ${platform}`);
@@ -546,7 +627,7 @@ async function main() {
   process.stdout.write(`${JSON.stringify({ ...report, observedPlatform: process.platform }, null, 2)}\n`);
 }
 
-module.exports = { compactedLineLayout, descendantProcessIds, summarizeProcessMemory };
+module.exports = { compactedLineLayout, descendantProcessIds, summarizeProcessMemory, swapGrowthBytes };
 
 if (require.main === module) {
   main().catch((error) => {

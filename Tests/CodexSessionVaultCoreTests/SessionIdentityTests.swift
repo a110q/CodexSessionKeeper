@@ -95,6 +95,13 @@ func titleReturnsNilForAssistantRoleInvalidJSONAndWhitespaceOnlyText() {
 }
 
 @Test
+func titlePreservesEscapedUserRoleFallback() {
+    let escapedUserRole = #"{"role":"\u0075ser","content":"Escaped role"}"#
+
+    #expect(SessionIdentity.title(fromJSONLine: escapedUserRole) == "Escaped role")
+}
+
+@Test
 func titleTruncatesNormalizedTextTo80Characters() throws {
     let longText = String(repeating: "a", count: 100)
     let line = #"{"role":"user","content":""# + longText + #""}"#

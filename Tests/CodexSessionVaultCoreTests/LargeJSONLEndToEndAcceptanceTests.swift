@@ -21,6 +21,28 @@ struct LargeJSONLEndToEndAcceptanceTests {
         let sourcePath = try #require(ProcessInfo.processInfo.environment["CODEX_REAL_LARGE_JSONL_SOURCE"])
         try LargeJSONLAcceptanceSupport.runReal(source: URL(fileURLWithPath: sourcePath))
     }
+
+    @Test
+    func boundedNinetySixMiBLifecycleStaysFileSizeIndependent() throws {
+        guard ProcessInfo.processInfo.environment["CODEX_RUN_LARGE_JSONL_LIFECYCLE"] == "1" else {
+            return
+        }
+        try LargeJSONLAcceptanceSupport.runBoundedLifecycle()
+    }
+
+    @Test
+    func lifecycleFixtureSizeDefaultsAndAcceptsDocumentedRange() throws {
+        #expect(try LargeJSONLAcceptanceSupport.validatedLifecycleTotalMiB(nil) == 96)
+        #expect(try LargeJSONLAcceptanceSupport.validatedLifecycleTotalMiB("36") == 36)
+        #expect(try LargeJSONLAcceptanceSupport.validatedLifecycleTotalMiB("128") == 128)
+    }
+
+    @Test(arguments: ["", "not-a-number", "35", "129", "999999999999999999999999"])
+    func lifecycleFixtureSizeRejectsInvalidOrUnsafeValues(_ value: String) {
+        #expect(throws: (any Error).self) {
+            try LargeJSONLAcceptanceSupport.validatedLifecycleTotalMiB(value)
+        }
+    }
 }
 
 private enum LargeJSONLAcceptanceSupport {
@@ -31,8 +53,12 @@ private enum LargeJSONLAcceptanceSupport {
     static let verifiedPrefixBytes: Int64 = 188_399_559
     static let expectedRealBytes: Int64 = 319_942_731
     static let nextRecordOffset: Int64 = 224_294_722
+    static let minimumLifecycleTotalMiB = 36
+    static let maximumLifecycleTotalMiB = 128
 
     static func runSynthetic() throws {
+        try waitForStartupBaselineCapture()
+        emitStage("fixture-start")
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("large-jsonl-swift-\(UUID().uuidString)", isDirectory: true)
         defer {
@@ -45,6 +71,7 @@ private enum LargeJSONLAcceptanceSupport {
         )
         let following = Data(#"{"timestamp":"2026-07-18T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"following-record-retained"}]}}"#.utf8) + Data([0x0A])
         try writeFixture(to: source, following: following)
+        emitStage("fixture-written")
 
         let paths = BackupPaths(
             homeDirectory: root,
@@ -63,6 +90,7 @@ private enum LargeJSONLAcceptanceSupport {
             instrumentation: BackupAgentInstrumentation()
         )
         try legacyAgent.performOneShotScan()
+        emitStage("legacy-scan-complete")
 
         let cursorStore = BackupCursorStore(databaseURL: paths.cursorDatabaseURL)
         try cursorStore.open()
@@ -72,6 +100,7 @@ private enum LargeJSONLAcceptanceSupport {
         try require(blocked.lastError?.contains("at offset 0") == true, "legacy line block offset missing")
 
         try BackupAgent(paths: paths, now: { now.addingTimeInterval(1) }).performOneShotScan()
+        emitStage("repair-scan-complete")
 
         let manifest = try BackupManifestStore(manifestURL: paths.manifestURL).loadOrCreate(
             codexRoot: paths.codexRoot.path,
@@ -98,6 +127,7 @@ private enum LargeJSONLAcceptanceSupport {
         try require(record.bytesBackedUp == sourceVerified.byteCount, "manifest byte count mismatch")
         try require(record.lineCount == 2, "manifest line count mismatch")
         try require(sidecar.backupPath == record.backupPath, "manifest and sidecar backup paths differ")
+        emitStage("backup-compared")
 
         let repaired = try require(try cursorStore.cursor(sourcePath: source.path), "repaired cursor missing")
         try require(repaired.lastByteOffset == sourceVerified.byteCount, "repaired cursor offset mismatch")
@@ -109,6 +139,7 @@ private enum LargeJSONLAcceptanceSupport {
         let restorer = IncrementalRecoveryRestorer(paths: paths)
         let plan = try restorer.preflight(sessionIDs: [sessionID], currentSessionIDs: [])
         let restored = try restorer.restore(plan, to: recoveryRoot)
+        emitStage("recovery-complete")
         try require(restored.restoredSessionIDs == [sessionID], "incremental recovery did not restore session")
         let recovered = recoveryRoot.appendingPathComponent("sessions/recovered/\(sessionID).jsonl")
         let recoveredVerified = try BackupFileVerifier().verifyFull(
@@ -121,6 +152,7 @@ private enum LargeJSONLAcceptanceSupport {
         try require(recoveredVerified == sourceVerified, "recovered verification differs from source")
         try require(try filesEqual(source, recovered), "recovered file differs byte-for-byte")
         try require(try tail(of: recovered, count: following.count) == following, "recovered following record missing")
+        emitStage("recovery-compared")
 
         let report: [String: Any] = [
             "platform": "swift",
@@ -139,6 +171,7 @@ private enum LargeJSONLAcceptanceSupport {
     }
 
     static func runReal(source: URL) throws {
+        try waitForStartupBaselineCapture()
         let originalBefore = try fileMetadata(source)
         try require(originalBefore.size == expectedRealBytes, "known source size changed")
         try require(try byte(at: verifiedPrefixBytes - 1, in: source) == 0x0A, "verified prefix is not a line boundary")
@@ -264,6 +297,162 @@ private enum LargeJSONLAcceptanceSupport {
         print(resultMarker + String(decoding: data, as: UTF8.self))
     }
 
+    static func runBoundedLifecycle() throws {
+        let totalMiB = try validatedLifecycleTotalMiB(
+            ProcessInfo.processInfo.environment["CODEX_LIFECYCLE_TOTAL_MIB"]
+        )
+        try waitForStartupBaselineCapture()
+        emitStage("fixture-start")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("large-jsonl-lifecycle-swift-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent(".codex/sessions/\(sessionID).jsonl")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard FileManager.default.createFile(atPath: source.path, contents: nil) else {
+            throw AcceptanceError.failed("unable to create lifecycle fixture")
+        }
+        let output = try FileHandle(forWritingTo: source)
+        let compactedPrefix = Data(#"{"timestamp":"2026-07-18T00:00:00Z","type":"compacted","payload":{"message":""#.utf8)
+        let compactedSuffix = Data(#""}}"#.utf8) + Data([0x0A])
+        try output.write(contentsOf: compactedPrefix)
+        let compactedFill = Data(repeating: 0x78, count: 1_024 * 1_024)
+        var compactedRemaining = compactedLineBytes - compactedPrefix.count - compactedSuffix.count + 1
+        while compactedRemaining > 0 {
+            let count = min(compactedRemaining, compactedFill.count)
+            try output.write(contentsOf: compactedFill.prefix(count))
+            compactedRemaining -= count
+        }
+        try output.write(contentsOf: compactedSuffix)
+
+        let expectedBytes = totalMiB * 1_024 * 1_024
+        try require(expectedBytes > compactedLineBytes + 1, "lifecycle fixture must exceed compacted line")
+        let normalPrefix = Data(#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":""#.utf8)
+        let normalSuffix = Data(#""}}"#.utf8) + Data([0x0A])
+        func fixedLine(byteCount: Int) -> Data {
+            normalPrefix + Data(repeating: 0x79, count: byteCount - normalPrefix.count - normalSuffix.count) + normalSuffix
+        }
+        let normalLine = fixedLine(byteCount: 1_024)
+        var normalBlock = Data()
+        normalBlock.reserveCapacity(1_024 * 1_024)
+        for _ in 0..<1_024 { normalBlock.append(normalLine) }
+        var remaining = expectedBytes - (compactedLineBytes + 1)
+        var normalLineCount = 0
+        while remaining >= normalBlock.count {
+            try output.write(contentsOf: normalBlock)
+            remaining -= normalBlock.count
+            normalLineCount += 1_024
+        }
+        while remaining >= normalLine.count {
+            try output.write(contentsOf: normalLine)
+            remaining -= normalLine.count
+            normalLineCount += 1
+        }
+        if remaining > 0 {
+            try output.write(contentsOf: fixedLine(byteCount: remaining))
+            normalLineCount += 1
+        }
+        let lineCount = 1 + normalLineCount
+        try output.synchronize()
+        try output.close()
+        emitStage("fixture-written")
+
+        let paths = BackupPaths(
+            homeDirectory: root,
+            codexRoot: root.appendingPathComponent(".codex", isDirectory: true),
+            backupRoot: root.appendingPathComponent("backup", isDirectory: true),
+            stateRoot: root.appendingPathComponent("state", isDirectory: true)
+        )
+        try FileManager.default.createDirectory(at: paths.backupRoot, withIntermediateDirectories: true)
+        try BackupAgent(paths: paths).performOneShotScan()
+        emitStage("backup-complete")
+        let manifest = try BackupManifestStore(manifestURL: paths.manifestURL).loadOrCreate(
+            codexRoot: paths.codexRoot.path,
+            backupRoot: paths.backupRoot.path
+        )
+        let record = try require(manifest.sessions[sessionID], "lifecycle manifest missing")
+        let backup = paths.backupRoot.appendingPathComponent(record.backupPath)
+        let verified = try BackupFileVerifier().verifyFull(
+            backup,
+            expectedByteCount: Int64(expectedBytes),
+            expectedLineCount: lineCount
+        )
+        emitStage("backup-verified")
+        try require(try filesEqual(source, backup), "lifecycle backup differs")
+        emitStage("backup-compared")
+
+        let recoveryRoot = root.appendingPathComponent("recovered-codex", isDirectory: true)
+        try FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        let restorer = IncrementalRecoveryRestorer(paths: paths)
+        let plan = try restorer.preflight(sessionIDs: [sessionID], currentSessionIDs: [])
+        emitStage("preflight-complete")
+        let result = try restorer.restore(plan, to: recoveryRoot)
+        emitStage("recovery-complete")
+        try require(result.restoredSessionIDs == [sessionID], "lifecycle recovery missing")
+        let recovered = recoveryRoot.appendingPathComponent("sessions/recovered/\(sessionID).jsonl")
+        try require(try filesEqual(source, recovered), "lifecycle recovery differs")
+        emitStage("recovery-compared")
+
+        let report: [String: Any] = [
+            "platform": "swift",
+            "mode": "bounded-lifecycle",
+            "totalMiB": totalMiB,
+            "exactCompactedLineBytes": compactedLineBytes,
+            "byteCount": verified.byteCount,
+            "lineCount": verified.lineCount,
+            "sha256": verified.contentHash,
+            "chunkCount": verified.chunkHashes.count
+        ]
+        let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+        print(resultMarker + String(decoding: data, as: UTF8.self))
+    }
+
+    static func validatedLifecycleTotalMiB(_ rawValue: String?) throws -> Int {
+        guard let rawValue else { return 96 }
+        guard let value = Int(rawValue),
+              (minimumLifecycleTotalMiB...maximumLifecycleTotalMiB).contains(value) else {
+            throw AcceptanceError.failed(
+                "CODEX_LIFECYCLE_TOTAL_MIB must be an integer from \(minimumLifecycleTotalMiB) through \(maximumLifecycleTotalMiB)"
+            )
+        }
+        return value
+    }
+
+    private static func emitStage(_ stage: String) {
+        let marker = Data("LARGE_JSONL_ACCEPTANCE_STAGE=\(stage)\n".utf8)
+        FileHandle.standardError.write(marker)
+        guard let stagePath = ProcessInfo.processInfo.environment["CODEX_LARGE_JSONL_STAGE_FILE"] else {
+            return
+        }
+        if !FileManager.default.fileExists(atPath: stagePath) {
+            FileManager.default.createFile(atPath: stagePath, contents: nil)
+        }
+        guard let stageFile = FileHandle(forWritingAtPath: stagePath) else { return }
+        defer { try? stageFile.close() }
+        do {
+            try stageFile.seekToEnd()
+            try stageFile.write(contentsOf: marker)
+            try stageFile.synchronize()
+        } catch {
+            // The stderr marker remains available if the diagnostic side channel fails.
+        }
+    }
+
+    private static func waitForStartupBaselineCapture() throws {
+        emitStage("startup-ready")
+        guard let acknowledgmentPath = ProcessInfo.processInfo.environment[
+            "CODEX_LARGE_JSONL_BASELINE_ACK_FILE"
+        ] else {
+            return
+        }
+        let deadline = Date().addingTimeInterval(10)
+        while !FileManager.default.fileExists(atPath: acknowledgmentPath) {
+            guard Date() < deadline else {
+                throw AcceptanceError.failed("resource guard did not capture startup-ready baseline")
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+
     private static func legacyAgent(paths: BackupPaths, now: Date) -> BackupAgent {
         BackupAgent(
             paths: paths,
@@ -314,10 +503,13 @@ private enum LargeJSONLAcceptanceSupport {
         if append { _ = try output.seekToEnd() } else { try output.seek(toOffset: 0) }
         var remaining = count
         while remaining > 0 {
-            let chunk = try input.read(upToCount: Int(min(4 * 1_024 * 1_024, remaining))) ?? Data()
-            try require(!chunk.isEmpty, "known source ended during isolated copy")
-            try output.write(contentsOf: chunk)
-            remaining -= Int64(chunk.count)
+            let copied = try autoreleasepool { () throws -> Int in
+                let chunk = try input.read(upToCount: Int(min(4 * 1_024 * 1_024, remaining))) ?? Data()
+                try require(!chunk.isEmpty, "known source ended during isolated copy")
+                try output.write(contentsOf: chunk)
+                return chunk.count
+            }
+            remaining -= Int64(copied)
         }
         try output.synchronize()
     }
@@ -343,10 +535,13 @@ private enum LargeJSONLAcceptanceSupport {
         let right = try FileHandle(forReadingFrom: rhs)
         defer { try? left.close(); try? right.close() }
         while true {
-            let leftChunk = try left.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
-            let rightChunk = try right.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
-            if leftChunk != rightChunk { return false }
-            if leftChunk.isEmpty { return true }
+            let comparison = try autoreleasepool { () throws -> (matches: Bool, reachedEnd: Bool) in
+                let leftChunk = try left.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
+                let rightChunk = try right.read(upToCount: 4 * 1_024 * 1_024) ?? Data()
+                return (leftChunk == rightChunk, leftChunk.isEmpty)
+            }
+            if !comparison.matches { return false }
+            if comparison.reachedEnd { return true }
         }
     }
 

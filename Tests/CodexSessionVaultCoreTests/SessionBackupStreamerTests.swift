@@ -184,6 +184,55 @@ struct SessionBackupStreamerTests {
     }
 
     @Test
+    func titleFallbackSkipsRecordsAboveDocumentedByteBudget() throws {
+        let prefix = Data(#"{"role":"user","content":"oversized-title-"#.utf8)
+        let suffix = Data(#""}"#.utf8)
+        var oversizedUser = prefix
+        oversizedUser.append(Data(
+            repeating: 0x78,
+            count: SessionBackupStreamer.maximumTitleRecordBytes - prefix.count - suffix.count + 1
+        ))
+        oversizedUser.append(suffix)
+        oversizedUser.append(0x0A)
+        let ordinaryTitle = Data(#"{"role":"\u0075ser","content":"bounded escaped title"}"#.utf8) + Data([0x0A])
+        let fixture = try StreamerFixture(source: oversizedUser + ordinaryTitle, chunkSize: chunkSize)
+        defer { fixture.cleanup() }
+
+        let result = try fixture.streamer.rebuildCompleteLines(
+            source: fixture.source,
+            through: nil,
+            destination: fixture.target
+        )
+
+        #expect(result.firstTitle == "bounded escaped title")
+    }
+
+    @Test
+    func titleFallbackSkipsHugeCompactedRecordContainingUserMarkersAndEscapes() throws {
+        let prefix = Data(#"{"type":"compacted","payload":{"message":"literal user and escaped \\n "#.utf8)
+        let suffix = Data(#""}}"#.utf8)
+        var compacted = prefix
+        compacted.append(Data(
+            repeating: 0x78,
+            count: SessionBackupStreamer.maximumTitleRecordBytes - prefix.count - suffix.count + 1
+        ))
+        compacted.append(suffix)
+        compacted.append(0x0A)
+        let ordinaryTitle = Data(#"{"type":"user_message","payload":{"message":"ordinary title"}}"#.utf8)
+            + Data([0x0A])
+        let fixture = try StreamerFixture(source: compacted + ordinaryTitle, chunkSize: chunkSize)
+        defer { fixture.cleanup() }
+
+        let result = try fixture.streamer.rebuildCompleteLines(
+            source: fixture.source,
+            through: nil,
+            destination: fixture.target
+        )
+
+        #expect(result.firstTitle == "ordinary title")
+    }
+
+    @Test
     func failedStreamingReplacementPreservesExistingDestination() throws {
         let fixture = try StreamerFixture(source: Data(), chunkSize: chunkSize)
         defer { fixture.cleanup() }

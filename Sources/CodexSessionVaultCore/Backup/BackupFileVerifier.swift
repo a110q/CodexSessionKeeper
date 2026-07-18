@@ -1,5 +1,16 @@
 import CryptoKit
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
+
+enum BackupMemoryPressureRelief {
+    static func relieve() {
+        #if canImport(Darwin)
+        malloc_zone_pressure_relief(nil, 0)
+        #endif
+    }
+}
 
 public struct BackupFileVerificationResult: Equatable, Sendable {
     public let byteCount: Int64
@@ -270,9 +281,11 @@ private struct JSONLValidator {
             if segmentStart < newlineIndex {
                 pending.append(contentsOf: data[segmentStart..<newlineIndex])
             }
+            let oversizedLine = pending.count > BackupVerificationDocument.defaultChunkSize
             try validatePendingLine()
             lineCount += 1
-            pending.removeAll(keepingCapacity: true)
+            pending.removeAll(keepingCapacity: !oversizedLine)
+            if oversizedLine { BackupMemoryPressureRelief.relieve() }
             segmentStart = data.index(after: newlineIndex)
         }
         if segmentStart < data.endIndex {

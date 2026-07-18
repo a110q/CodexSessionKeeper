@@ -311,9 +311,17 @@ public final class IncrementalRecoveryRestorer {
                 )
             },
             writer: { destinationHandle in
-                while let chunk = try sourceHandle.read(upToCount: expected.chunkSize), !chunk.isEmpty {
-                    try destinationHandle.write(contentsOf: chunk)
+                while true {
+                    let copiedChunk = try autoreleasepool { () throws -> Bool in
+                        guard let chunk = try sourceHandle.read(upToCount: expected.chunkSize), !chunk.isEmpty else {
+                            return false
+                        }
+                        try destinationHandle.write(contentsOf: chunk)
+                        return true
+                    }
+                    if !copiedChunk { break }
                 }
+                BackupMemoryPressureRelief.relieve()
             }
         )
     }

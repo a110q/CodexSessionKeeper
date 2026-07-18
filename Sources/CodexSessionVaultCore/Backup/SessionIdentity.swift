@@ -21,9 +21,13 @@ public enum SessionIdentity {
     }
 
     public static func title(fromJSONLine line: String) -> String? {
-        autoreleasepool {
-            guard let data = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data),
+        guard let data = line.data(using: .utf8) else { return nil }
+        return title(fromJSONData: data)
+    }
+
+    static func title(fromJSONData data: Data) -> String? {
+        return autoreleasepool { () -> String? in
+            guard let json = try? JSONSerialization.jsonObject(with: data),
                   let object = json as? [String: Any]
             else {
                 return nil
