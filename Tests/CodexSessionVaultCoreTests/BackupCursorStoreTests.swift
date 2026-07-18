@@ -196,6 +196,19 @@ func cursorStoreMigratesLegacySchemaWithoutLosingRows() throws {
             'NAS volume unavailable',
             1700000001
         );
+        INSERT INTO backup_cursors VALUES (
+            '/tmp/case-variant.jsonl',
+            'case-variant-session',
+            'sessions/case-variant.jsonl',
+            5,
+            9,
+            1700000000,
+            1,
+            '',
+            'active',
+            'session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset 5: /tmp/case-variant.jsonl',
+            1700000001
+        );
         """,
         databaseURL: databaseURL
     )
@@ -209,6 +222,7 @@ func cursorStoreMigratesLegacySchemaWithoutLosingRows() throws {
     #expect(migrated.sourceFileIdentity == nil)
     #expect(migrated.blockedLineLimitBytes == 33_554_432)
     #expect(try store.cursor(sourcePath: "/tmp/unrelated.jsonl")?.blockedLineLimitBytes == nil)
+    #expect(try store.cursor(sourcePath: "/tmp/case-variant.jsonl")?.blockedLineLimitBytes == nil)
 
     migrated.sourceFileIdentity = "42:99"
     migrated.blockedLineLimitBytes = 67_108_864

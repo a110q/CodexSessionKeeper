@@ -92,6 +92,30 @@ struct SessionJSONLValidatorTests {
     }
 
     @Test
+    func discoveryAcceptsExactMaximumFirstLineAndRejectsMaximumPlusOneAcrossChunks() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let sessions = fixture.root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let exactID = "11111111-2222-3333-4444-555555555555"
+        let oversizedID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        try fixture.writeRollout(
+            sessionID: exactID,
+            lineBytes: SessionJSONLPolicy.maximumLineBytes,
+            to: sessions.appendingPathComponent("exact.jsonl")
+        )
+        try fixture.writeRollout(
+            sessionID: oversizedID,
+            lineBytes: SessionJSONLPolicy.maximumLineBytes + 1,
+            to: sessions.appendingPathComponent("oversized.jsonl")
+        )
+
+        let discovered = try TrustedSessionFileResolver.discover(under: fixture.root)
+
+        #expect(discovered.map(\.sessionID) == [exactID])
+    }
+
+    @Test
     func buildsOneTrustedIndexForAnEmployeeScaleSessionCatalog() throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
@@ -249,6 +273,27 @@ struct SessionJSONLValidatorTests {
                 data.append(0x0A)
             }
             try data.write(to: url)
+        }
+
+        func writeRollout(sessionID: String, lineBytes: Int, to url: URL) throws {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let prefix = Data(#"{"payload":{"id":""#.utf8)
+            let middle = Data(sessionID.utf8)
+            let paddingPrefix = Data(#"","padding":""#.utf8)
+            let suffix = Data(#""},"type":"session_meta"}"#.utf8)
+            let fixedBytes = prefix.count + middle.count + paddingPrefix.count + suffix.count
+            #expect(lineBytes >= fixedBytes)
+            var line = Data(capacity: lineBytes + 1)
+            line.append(prefix)
+            line.append(middle)
+            line.append(paddingPrefix)
+            line.append(Data(repeating: 0x78, count: lineBytes - fixedBytes))
+            line.append(suffix)
+            line.append(0x0A)
+            try line.write(to: url)
         }
 
         func cleanup() {

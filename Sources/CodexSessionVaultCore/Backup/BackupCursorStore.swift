@@ -128,7 +128,11 @@ public final class BackupCursorStore {
                     UPDATE backup_cursors
                     SET blocked_line_limit_bytes = 33554432
                     WHERE blocked_line_limit_bytes IS NULL
-                      AND last_error LIKE 'Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset %';
+                      AND substr(
+                          last_error,
+                          1,
+                          length('Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset ')
+                      ) COLLATE BINARY = 'Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset ';
                     """)
                 }
                 if !migrations.isEmpty {

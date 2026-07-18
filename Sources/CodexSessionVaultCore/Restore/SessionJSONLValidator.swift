@@ -359,6 +359,9 @@ public enum TrustedSessionFileResolver {
         while let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
             if let newline = chunk.firstIndex(of: 0x0A) {
                 line.append(chunk.prefix(upTo: newline))
+                guard line.count <= SessionJSONLScanner.maximumLineBytes else {
+                    throw untrusted(fileURL, "首行超过 \(SessionJSONLScanner.maximumLineBytes) bytes")
+                }
                 break
             }
             line.append(chunk)

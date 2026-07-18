@@ -110,6 +110,7 @@ public final class BackupAgent: @unchecked Sendable {
         var cursor: BackupCursor?
         var staleCursorSourcePath: String?
         var lastError: String?
+        var isLineLimitBlocked: Bool
         var sourcePath: String
         var sourceMetadata: BackupSourceMetadata
     }
@@ -376,7 +377,9 @@ public final class BackupAgent: @unchecked Sendable {
                     cursorMap: cursorMap
                 )
             }
-            nextSettledSourceSnapshot[result.sourcePath] = result.sourceMetadata
+            if result.lastError == nil || result.isLineLimitBlocked {
+                nextSettledSourceSnapshot[result.sourcePath] = result.sourceMetadata
+            }
             manifestChanged = manifestChanged || result.manifestChanged
             if let cursor = result.cursor {
                 updatedCursors.append(cursor)
@@ -386,6 +389,8 @@ public final class BackupAgent: @unchecked Sendable {
             }
             if let lastError = result.lastError {
                 scanErrors.append(lastError)
+            }
+            if result.isLineLimitBlocked {
                 failed += 1
             }
             completed += 1
@@ -906,6 +911,7 @@ public final class BackupAgent: @unchecked Sendable {
                 cursor: nil,
                 staleCursorSourcePath: nil,
                 lastError: currentCursor?.lastError,
+                isLineLimitBlocked: currentCursor?.blockedLineLimitBytes != nil,
                 sourcePath: sourcePath,
                 sourceMetadata: sourceMetadata
             )
@@ -935,8 +941,13 @@ public final class BackupAgent: @unchecked Sendable {
             || targetState.byteCount != recordedOffset
             || !recordHasTrustedVerification
         if !rebuild {
-            let identityMatches = baselineCursor?.sourceFileIdentity == nil
-                || baselineCursor?.sourceFileIdentity == sourceMetadata.fileIdentity
+            let identityMatches = if shouldRetryBlockedLine(cursor: baselineCursor) {
+                baselineCursor?.sourceFileIdentity != nil
+                    && baselineCursor?.sourceFileIdentity == sourceMetadata.fileIdentity
+            } else {
+                baselineCursor?.sourceFileIdentity == nil
+                    || baselineCursor?.sourceFileIdentity == sourceMetadata.fileIdentity
+            }
             let anchorsMatch = if identityMatches, let existingVerification {
                 (try? BackupFileVerifier(
                     chunkSize: verification.chunkSize,
@@ -1126,6 +1137,7 @@ public final class BackupAgent: @unchecked Sendable {
             cursor: cursorNeedsUpsert(currentCursor: currentCursor, updatedCursor: updatedCursor) ? updatedCursor : nil,
             staleCursorSourcePath: staleCursorSourcePath,
             lastError: blockedError,
+            isLineLimitBlocked: blockedError != nil,
             sourcePath: sourcePath,
             sourceMetadata: sourceMetadata
         )

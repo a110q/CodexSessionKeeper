@@ -1907,6 +1907,35 @@ func lowerPolicyBlockWithIdentityMismatchForcesAtomicRebuild() throws {
 }
 
 @Test
+func lowerPolicyBlockWithoutStoredIdentityForcesAtomicRebuild() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd"
+    let prefix = #"{"role":"user","content":"ok"}"# + "\n"
+    let largeLine = #"{"role":"assistant","content":""# + String(repeating: "x", count: 70) + #""}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: prefix + largeLine)
+    try fixture.makeAgent(
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 64)
+    ).performOneShotScan()
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let store = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try store.open()
+    var blocked = try #require(try store.cursor(sourcePath: record.sourcePath))
+    blocked.sourceFileIdentity = nil
+    try store.upsert(blocked)
+    fixture.resetSpies()
+
+    try fixture.makeAgent(
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 128)
+    ).performOneShotScan()
+
+    let sourceSize = Int64(try Data(contentsOf: source).count)
+    #expect(fixture.sourceBodyReadRanges.contains(0..<sourceSize))
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    #expect(try Data(contentsOf: target) == Data(contentsOf: source))
+}
+
+@Test
 func lowerPolicyBlockWithAnchorMismatchForcesAtomicRebuild() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }
@@ -1999,6 +2028,46 @@ func blockedSessionsIncrementFailureProgressWithoutChangingProcessedCount() thro
     #expect(final.failedFiles == 1)
     #expect(final.pendingFiles == 0)
     #expect(try fixture.loadStatus().status == .error)
+}
+
+@Test
+func unrelatedCursorErrorDoesNotSettleOrIncrementLineBlockFailures() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "34343434-3434-3434-3434-343434343434"
+    let source = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: #"{"role":"user","content":"ok"}"# + "\n"
+    )
+    try fixture.makeAgent().performOneShotScan()
+    try fixture.append("partial", to: source)
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let store = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try store.open()
+    var cursor = try #require(try store.cursor(sourcePath: record.sourcePath))
+    let currentMetadata = try BackupFileCommitter().inspectSource(source)
+    cursor.lastSourceSize = currentMetadata.byteCount
+    cursor.lastSourceModifiedAt = currentMetadata.modifiedAt
+    cursor.sourceFileIdentity = currentMetadata.fileIdentity
+    cursor.lastError = "NAS readback unavailable"
+    cursor.blockedLineLimitBytes = nil
+    try store.upsert(cursor)
+    let validations = LockedInvocationCounter()
+    var progressEvents: [BackupProgress] = []
+    let agent = fixture.makeAgent(
+        targetValidator: BackupTargetValidator { validations.increment() },
+        progressHandler: { progressEvents.append($0) }
+    )
+    defer { agent.stop() }
+
+    try agent.performOneShotScan()
+
+    #expect(progressEvents.last?.failedFiles == 0)
+    #expect(try fixture.loadStatus().status == .error)
+    validations.reset()
+    agent.requestImmediateScan(.timer)
+    #expect(validations.wait(for: 1, timeout: 0.5))
+    #expect(agent.stopAndAwaitQuiescence(timeout: 5))
 }
 
 }
