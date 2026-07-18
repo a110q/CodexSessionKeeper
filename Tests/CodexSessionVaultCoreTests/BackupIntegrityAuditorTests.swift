@@ -6,6 +6,41 @@ import Testing
 @Suite(.serialized)
 struct BackupIntegrityAuditorTests {
     @Test
+    func memoryRegressionRepairReleasesJSONObjectsPerLine() throws {
+        guard ProcessMemoryTestSupport.isEnabled else { return }
+        let line = ProcessMemoryTestSupport.nestedJSONLine()
+        let lineCount = 8_192
+        let committed = ProcessMemoryTestSupport.repeatedLineData(line, count: lineCount)
+        let fixture = try IntegrityAuditFixture(
+            committedLocalPrefix: committed,
+            corrupted: true,
+            name: "memory-regression",
+            chunkSize: 1_048_576
+        )
+        defer { fixture.cleanup() }
+        ProcessMemoryTestSupport.releaseUnusedMallocPages()
+        let before = try ProcessMemoryTestSupport.physicalFootprintBytes()
+
+        let outcome = try fixture.auditor.runIfDue(
+            now: fixture.dueDate,
+            deviceID: fixture.deviceID,
+            cursors: fixture.cursors,
+            interruptionRequested: { false }
+        )
+
+        ProcessMemoryTestSupport.releaseUnusedMallocPages()
+        let after = try ProcessMemoryTestSupport.physicalFootprintBytes()
+        let growth = ProcessMemoryTestSupport.growth(from: before, to: after)
+        print("memory regression audit repair growth: \(growth / ProcessMemoryTestSupport.mebibyte) MiB")
+        #expect(outcome == .completed(checked: 1, repaired: 1))
+        #expect(try fixture.nasTargetData() == committed)
+        #expect(
+            growth <= 64 * ProcessMemoryTestSupport.mebibyte,
+            "audit-repair footprint grew by \(growth / ProcessMemoryTestSupport.mebibyte) MiB"
+        )
+    }
+
+    @Test
     func deterministicScheduleMatchesCrossPlatformFixture() throws {
         let deviceID = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
 

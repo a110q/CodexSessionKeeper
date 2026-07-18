@@ -337,25 +337,27 @@ public final class BackupAgent: @unchecked Sendable {
                   processedSessionIDs.insert(sessionID).inserted else {
                 continue
             }
-            let result = try processSessionFile(
-                sourceURL,
-                sessionID: sessionID,
-                scanDate: scanDate,
-                manifest: &manifest,
-                verification: &verification,
-                verificationProgress: { [weak self] in
-                    guard let self else { return }
-                    let progress = BackupProgress(
-                        totalFiles: sources.count,
-                        completedFiles: completed,
-                        pendingFiles: max(0, sources.count - completed),
-                        phase: .verifying
-                    )
-                    self.lastKnownProgress = progress
-                    self.progressHandler?(progress)
-                },
-                cursorMap: cursorMap
-            )
+            let result = try autoreleasepool {
+                try processSessionFile(
+                    sourceURL,
+                    sessionID: sessionID,
+                    scanDate: scanDate,
+                    manifest: &manifest,
+                    verification: &verification,
+                    verificationProgress: { [weak self] in
+                        guard let self else { return }
+                        let progress = BackupProgress(
+                            totalFiles: sources.count,
+                            completedFiles: completed,
+                            pendingFiles: max(0, sources.count - completed),
+                            phase: .verifying
+                        )
+                        self.lastKnownProgress = progress
+                        self.progressHandler?(progress)
+                    },
+                    cursorMap: cursorMap
+                )
+            }
             nextSettledSourceSnapshot[result.sourcePath] = result.sourceMetadata
             manifestChanged = manifestChanged || result.manifestChanged
             if let cursor = result.cursor {

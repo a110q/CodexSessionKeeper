@@ -6,6 +6,79 @@ import Testing
 @Suite(.serialized)
 struct BackupVerificationTests {
     @Test
+    func memoryRegressionFullVerificationReleasesJSONObjectsPerLine() throws {
+        guard ProcessMemoryTestSupport.isEnabled else { return }
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let fileURL = root.appendingPathComponent("many-records.jsonl")
+        let line = ProcessMemoryTestSupport.nestedJSONLine()
+        let lineCount = 16_384
+        try ProcessMemoryTestSupport.writeRepeatedLine(line, count: lineCount, to: fileURL)
+        ProcessMemoryTestSupport.releaseUnusedMallocPages()
+        let before = try ProcessMemoryTestSupport.physicalFootprintBytes()
+
+        let result = try BackupFileVerifier().verifyFull(fileURL)
+
+        ProcessMemoryTestSupport.releaseUnusedMallocPages()
+        let after = try ProcessMemoryTestSupport.physicalFootprintBytes()
+        let growth = ProcessMemoryTestSupport.growth(from: before, to: after)
+        let allowedGrowth = 64 * ProcessMemoryTestSupport.mebibyte
+        print("memory regression verifier growth: \(growth / ProcessMemoryTestSupport.mebibyte) MiB")
+        #expect(result.lineCount == lineCount)
+        #expect(result.byteCount == Int64(line.count * lineCount))
+        #expect(
+            after <= before + allowedGrowth,
+            "physical footprint grew by \(growth / ProcessMemoryTestSupport.mebibyte) MiB"
+        )
+    }
+
+    @Test
+    func memoryRegressionChangedChunkVerificationReleasesBuffersPerChunk() throws {
+        guard ProcessMemoryTestSupport.isEnabled else { return }
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("source.jsonl")
+        let target = root.appendingPathComponent("target.jsonl")
+        let line = ProcessMemoryTestSupport.nestedJSONLine()
+        let lineCount = 16_384
+        try ProcessMemoryTestSupport.writeRepeatedLine(line, count: lineCount, to: source)
+        try ProcessMemoryTestSupport.writeRepeatedLine(line, count: lineCount, to: target)
+        let byteCount = Int64(line.count * lineCount)
+        let previous = BackupSessionVerification(
+            backupPath: "sessions/session.jsonl",
+            byteCount: 0,
+            lineCount: 0,
+            chunkHashes: [],
+            verifiedAt: Date(timeIntervalSince1970: 1)
+        )
+        ProcessMemoryTestSupport.releaseUnusedMallocPages()
+        let before = try ProcessMemoryTestSupport.physicalFootprintBytes()
+
+        let result = try BackupFileVerifier().verifyChangedChunks(
+            source: source,
+            target: target,
+            previous: previous,
+            backupPath: previous.backupPath,
+            committedByteCount: byteCount,
+            lineCount: lineCount,
+            verifiedAt: Date(timeIntervalSince1970: 2)
+        )
+
+        ProcessMemoryTestSupport.releaseUnusedMallocPages()
+        let after = try ProcessMemoryTestSupport.physicalFootprintBytes()
+        let growth = ProcessMemoryTestSupport.growth(from: before, to: after)
+        print("memory regression changed chunks growth: \(growth / ProcessMemoryTestSupport.mebibyte) MiB")
+        #expect(result.byteCount == byteCount)
+        #expect(result.lineCount == lineCount)
+        #expect(
+            growth <= 64 * ProcessMemoryTestSupport.mebibyte,
+            "changed-chunk footprint grew by \(growth / ProcessMemoryTestSupport.mebibyte) MiB"
+        )
+    }
+
+    @Test
     func storeRoundTripsVerificationDocument() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

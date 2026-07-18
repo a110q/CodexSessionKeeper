@@ -6,6 +6,55 @@ import Testing
 struct BackupAgentTests {
 
 @Test
+func memoryRegressionInitialScanStaysBoundedAcrossManySessions() throws {
+    guard ProcessMemoryTestSupport.isEnabled else { return }
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let line = ProcessMemoryTestSupport.nestedJSONLine()
+    let linesPerSession = 256
+    let sessionData = ProcessMemoryTestSupport.repeatedLineData(line, count: linesPerSession)
+    let sessionContents = String(decoding: sessionData, as: UTF8.self)
+    let sessionCount = 64
+    for index in 0..<sessionCount {
+        let sessionID = String(format: "10000000-0000-0000-0000-%012d", index)
+        try fixture.writeSession(named: "\(sessionID).jsonl", contents: sessionContents)
+    }
+    ProcessMemoryTestSupport.releaseUnusedMallocPages()
+    let baseline = try ProcessMemoryTestSupport.physicalFootprintBytes()
+    var samples: [UInt64] = []
+    let agent = fixture.makeAgent(progressHandler: { progress in
+        guard progress.phase == .verifying,
+              let footprint = try? ProcessMemoryTestSupport.physicalFootprintBytes() else {
+            return
+        }
+        samples.append(footprint)
+    })
+
+    try agent.performOneShotScan()
+
+    ProcessMemoryTestSupport.releaseUnusedMallocPages()
+    let final = try ProcessMemoryTestSupport.physicalFootprintBytes()
+    let quartileCount = max(1, samples.count / 4)
+    let firstMedian = try #require(ProcessMemoryTestSupport.median(Array(samples.prefix(quartileCount))))
+    let lastMedian = try #require(ProcessMemoryTestSupport.median(Array(samples.suffix(quartileCount))))
+    let trendGrowth = ProcessMemoryTestSupport.growth(from: firstMedian, to: lastMedian)
+    let totalGrowth = ProcessMemoryTestSupport.growth(from: baseline, to: final)
+    print(
+        "memory regression initial scan: trend \(trendGrowth / ProcessMemoryTestSupport.mebibyte) MiB, "
+            + "total \(totalGrowth / ProcessMemoryTestSupport.mebibyte) MiB"
+    )
+    #expect(samples.count == sessionCount)
+    #expect(
+        trendGrowth <= 64 * ProcessMemoryTestSupport.mebibyte,
+        "first-backup footprint trend grew by \(trendGrowth / ProcessMemoryTestSupport.mebibyte) MiB"
+    )
+    #expect(
+        totalGrowth <= 256 * ProcessMemoryTestSupport.mebibyte,
+        "first-backup footprint grew by \(totalGrowth / ProcessMemoryTestSupport.mebibyte) MiB"
+    )
+}
+
+@Test
 func initialScanBacksUpCompleteLinesAndUpdatesManifest() throws {
     let fixture = try BackupAgentFixture()
     defer { fixture.cleanup() }

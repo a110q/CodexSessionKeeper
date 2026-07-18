@@ -460,15 +460,26 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         while offset < file.cursor.lastByteOffset {
             guard !interruptionRequested() else { return .interrupted }
             let count = Int(min(Int64(chunkSize), file.cursor.lastByteOffset - offset))
-            let sourceData = try sourceHandle.read(upToCount: count) ?? Data()
-            let targetData = try targetHandle.read(upToCount: count) ?? Data()
-            instrumentation.didReadChunk(file.source, offset, sourceData.count)
-            instrumentation.didStreamChunk(.comparison, file.source, offset, sourceData.count)
-            guard !interruptionRequested() else { return .interrupted }
-            guard sourceData.count == count, targetData.count == count else { return .mismatch }
-            guard sourceData == targetData else { return .mismatch }
-            digest.update(data: sourceData)
-            offset += Int64(sourceData.count)
+            var iterationResult: ComparisonResult?
+            try autoreleasepool {
+                let sourceData = try sourceHandle.read(upToCount: count) ?? Data()
+                let targetData = try targetHandle.read(upToCount: count) ?? Data()
+                instrumentation.didReadChunk(file.source, offset, sourceData.count)
+                instrumentation.didStreamChunk(.comparison, file.source, offset, sourceData.count)
+                guard !interruptionRequested() else {
+                    iterationResult = .interrupted
+                    return
+                }
+                guard sourceData.count == count,
+                      targetData.count == count,
+                      sourceData == targetData else {
+                    iterationResult = .mismatch
+                    return
+                }
+                digest.update(data: sourceData)
+                offset += Int64(sourceData.count)
+            }
+            if let iterationResult { return iterationResult }
         }
         guard !interruptionRequested() else { return .interrupted }
         return .equal(hash: Self.hexDigest(digest.finalize()))
@@ -911,18 +922,20 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             }
             var offset: Int64 = 0
             while remaining > 0 {
-                try requireNotInterrupted(interruptionRequested)
-                let count = Int(min(Int64(chunkSize), remaining))
-                guard let chunk = try sourceHandle.read(upToCount: count), chunk.count == count else {
-                    throw IntegrityAuditError.invalidCommittedSource(source.path)
+                try autoreleasepool {
+                    try requireNotInterrupted(interruptionRequested)
+                    let count = Int(min(Int64(chunkSize), remaining))
+                    guard let chunk = try sourceHandle.read(upToCount: count), chunk.count == count else {
+                        throw IntegrityAuditError.invalidCommittedSource(source.path)
+                    }
+                    try validateJSONLChunk(chunk, pendingLine: &pendingLine, source: source)
+                    try bufferedWriter.append(chunk)
+                    digest.update(data: chunk)
+                    instrumentation.didStreamChunk(.repairTemporary, source, offset, chunk.count)
+                    remaining -= Int64(chunk.count)
+                    offset += Int64(chunk.count)
+                    try requireNotInterrupted(interruptionRequested)
                 }
-                try validateJSONLChunk(chunk, pendingLine: &pendingLine, source: source)
-                try bufferedWriter.append(chunk)
-                digest.update(data: chunk)
-                instrumentation.didStreamChunk(.repairTemporary, source, offset, chunk.count)
-                remaining -= Int64(chunk.count)
-                offset += Int64(chunk.count)
-                try requireNotInterrupted(interruptionRequested)
             }
             guard pendingLine.isEmpty else {
                 throw IntegrityAuditError.invalidCommittedSource(source.path)
@@ -974,9 +987,16 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             if lineStart < newlineIndex {
                 pendingLine.append(contentsOf: chunk[lineStart..<newlineIndex])
             }
-            guard pendingLine.count <= SessionTailer.defaultMaxLineBytes,
-                  let object = try? JSONSerialization.jsonObject(with: pendingLine),
-                  object is [String: Any] else {
+            guard pendingLine.count <= SessionTailer.defaultMaxLineBytes else {
+                throw IntegrityAuditError.invalidCommittedSource(source.path)
+            }
+            let isValidJSONObject = autoreleasepool {
+                guard let object = try? JSONSerialization.jsonObject(with: pendingLine) else {
+                    return false
+                }
+                return object is [String: Any]
+            }
+            guard isValidJSONObject else {
                 throw IntegrityAuditError.invalidCommittedSource(source.path)
             }
             pendingLine.removeAll(keepingCapacity: true)
@@ -1018,17 +1038,19 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         ) { handle in
             var offset: Int64 = 0
             while remaining > 0 {
-                try requireNotInterrupted(interruptionRequested)
-                let count = Int(min(Int64(chunkSize), remaining))
-                guard let chunk = try sourceHandle.read(upToCount: count), chunk.count == count else {
-                    throw IntegrityAuditError.verificationFailed(target.path)
+                try autoreleasepool {
+                    try requireNotInterrupted(interruptionRequested)
+                    let count = Int(min(Int64(chunkSize), remaining))
+                    guard let chunk = try sourceHandle.read(upToCount: count), chunk.count == count else {
+                        throw IntegrityAuditError.verificationFailed(target.path)
+                    }
+                    try handle.write(contentsOf: chunk)
+                    digest.update(data: chunk)
+                    instrumentation.didStreamChunk(.quarantineCopy, target, offset, chunk.count)
+                    remaining -= Int64(chunk.count)
+                    offset += Int64(chunk.count)
+                    try requireNotInterrupted(interruptionRequested)
                 }
-                try handle.write(contentsOf: chunk)
-                digest.update(data: chunk)
-                instrumentation.didStreamChunk(.quarantineCopy, target, offset, chunk.count)
-                remaining -= Int64(chunk.count)
-                offset += Int64(chunk.count)
-                try requireNotInterrupted(interruptionRequested)
             }
         }
         let hash = Self.hexDigest(digest.finalize())
@@ -1055,12 +1077,14 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
             createParentDirectories: false
         ) { handle in
             while remaining > 0 {
-                let count = Int(min(Int64(chunkSize), remaining))
-                guard let chunk = try sourceHandle.read(upToCount: count), chunk.count == count else {
-                    throw IntegrityAuditError.restoreFailed(target.path)
+                try autoreleasepool {
+                    let count = Int(min(Int64(chunkSize), remaining))
+                    guard let chunk = try sourceHandle.read(upToCount: count), chunk.count == count else {
+                        throw IntegrityAuditError.restoreFailed(target.path)
+                    }
+                    try handle.write(contentsOf: chunk)
+                    remaining -= Int64(chunk.count)
                 }
-                try handle.write(contentsOf: chunk)
-                remaining -= Int64(chunk.count)
             }
         }
         try verifyFile(target, expectedByteCount: quarantine.byteCount, expectedHash: quarantine.hash)
@@ -1107,16 +1131,18 @@ public struct BackupIntegrityAuditor: @unchecked Sendable {
         var remaining = byteCount
         var offset: Int64 = 0
         while remaining > 0 {
-            try requireNotInterrupted(interruptionRequested)
-            let count = Int(min(Int64(chunkSize), remaining))
-            guard let chunk = try handle.read(upToCount: count), chunk.count == count else {
-                throw IntegrityAuditError.verificationFailed(url.path)
+            try autoreleasepool {
+                try requireNotInterrupted(interruptionRequested)
+                let count = Int(min(Int64(chunkSize), remaining))
+                guard let chunk = try handle.read(upToCount: count), chunk.count == count else {
+                    throw IntegrityAuditError.verificationFailed(url.path)
+                }
+                digest.update(data: chunk)
+                if let phase { instrumentation.didStreamChunk(phase, url, offset, chunk.count) }
+                remaining -= Int64(chunk.count)
+                offset += Int64(chunk.count)
+                try requireNotInterrupted(interruptionRequested)
             }
-            digest.update(data: chunk)
-            if let phase { instrumentation.didStreamChunk(phase, url, offset, chunk.count) }
-            remaining -= Int64(chunk.count)
-            offset += Int64(chunk.count)
-            try requireNotInterrupted(interruptionRequested)
         }
         return Self.hexDigest(digest.finalize())
     }

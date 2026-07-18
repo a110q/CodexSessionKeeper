@@ -75,15 +75,20 @@ public struct BackupFileVerifier: Sendable {
         var jsonl = JSONLValidator(maxLineBytes: maxLineBytes)
         var remaining = size
         while remaining > 0 {
-            let count = Int(min(Int64(chunkSize), remaining))
-            let chunk = try readExactly(handle, count: count)
-            guard chunk.count == count else {
-                throw BackupFileVerificationError.byteCountMismatch(expected: size, actual: size - remaining + Int64(chunk.count))
+            try autoreleasepool {
+                let count = Int(min(Int64(chunkSize), remaining))
+                let chunk = try readExactly(handle, count: count)
+                guard chunk.count == count else {
+                    throw BackupFileVerificationError.byteCountMismatch(
+                        expected: size,
+                        actual: size - remaining + Int64(chunk.count)
+                    )
+                }
+                digest.update(data: chunk)
+                chunkHashes.append(Self.sha256(chunk))
+                try jsonl.consume(chunk)
+                remaining -= Int64(chunk.count)
             }
-            digest.update(data: chunk)
-            chunkHashes.append(Self.sha256(chunk))
-            try jsonl.consume(chunk)
-            remaining -= Int64(chunk.count)
         }
         try jsonl.finish(byteCount: size)
         let contentHash = Self.hexDigest(digest.finalize())
@@ -153,19 +158,23 @@ public struct BackupFileVerifier: Sendable {
         var position = startOffset
         var appendedJSONL = JSONLValidator(maxLineBytes: maxLineBytes)
         while position < committedByteCount {
-            let count = Int(min(chunkSize64, committedByteCount - position))
-            let sourceChunk = try readExactly(sourceHandle, count: count)
-            let targetChunk = try readExactly(targetHandle, count: count)
-            guard sourceChunk.count == count, targetChunk.count == count, sourceChunk == targetChunk else {
-                throw BackupFileVerificationError.chunkHashMismatch(hashes.count)
+            try autoreleasepool {
+                let count = Int(min(chunkSize64, committedByteCount - position))
+                let sourceChunk = try readExactly(sourceHandle, count: count)
+                let targetChunk = try readExactly(targetHandle, count: count)
+                guard sourceChunk.count == count,
+                      targetChunk.count == count,
+                      sourceChunk == targetChunk else {
+                    throw BackupFileVerificationError.chunkHashMismatch(hashes.count)
+                }
+                hashes.append(Self.sha256(targetChunk))
+                let appendedStart = max(previous.byteCount, position)
+                if appendedStart < position + Int64(count) {
+                    let lower = Int(appendedStart - position)
+                    try appendedJSONL.consume(targetChunk.subdata(in: lower..<targetChunk.count))
+                }
+                position += Int64(count)
             }
-            hashes.append(Self.sha256(targetChunk))
-            let appendedStart = max(previous.byteCount, position)
-            if appendedStart < position + Int64(count) {
-                let lower = Int(appendedStart - position)
-                try appendedJSONL.consume(targetChunk.subdata(in: lower..<targetChunk.count))
-            }
-            position += Int64(count)
         }
         try appendedJSONL.finish(byteCount: committedByteCount - previous.byteCount)
         let actualLineCount = previous.lineCount + appendedJSONL.lineCount
@@ -286,7 +295,9 @@ private struct JSONLValidator {
         }
         guard !pending.isEmpty else { return }
         do {
-            _ = try JSONSerialization.jsonObject(with: pending, options: [.fragmentsAllowed])
+            try autoreleasepool {
+                _ = try JSONSerialization.jsonObject(with: pending, options: [.fragmentsAllowed])
+            }
         } catch {
             throw BackupFileVerificationError.invalidJSONL(lineCount + 1)
         }
