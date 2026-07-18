@@ -5,6 +5,7 @@ const fsp = require('node:fs/promises');
 const { TextDecoder } = require('node:util');
 
 const { DEFAULT_VERIFICATION_CHUNK_SIZE } = require('./verification-store');
+const { createBoundedLineAccumulator } = require('./jsonl-line-accumulator');
 const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
 const DEFAULT_MAX_LINE_BYTES = MAX_JSONL_LINE_BYTES;
@@ -15,8 +16,7 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-async function readExactly(handle, count, position) {
-  const buffer = Buffer.allocUnsafe(count);
+async function readExactly(handle, buffer, count, position) {
   let offset = 0;
   while (offset < count) {
     const { bytesRead } = await handle.read(buffer, offset, count - offset, position + offset);
@@ -27,45 +27,43 @@ async function readExactly(handle, count, position) {
 }
 
 function createJSONLValidator(maxLineBytes) {
-  let pending = [];
-  let pendingLength = 0;
+  const pending = createBoundedLineAccumulator(maxLineBytes);
   let lineCount = 0;
   const decoder = new TextDecoder('utf-8', { fatal: true });
-  function validateLine() {
-    if (pendingLength > maxLineBytes) throw new BackupFileVerificationError(`JSONL line exceeds ${maxLineBytes} bytes.`);
-    if (pendingLength > 0) {
+  function validateLine(line) {
+    if (line.length > maxLineBytes) throw new BackupFileVerificationError(`JSONL line exceeds ${maxLineBytes} bytes.`);
+    if (line.length > 0) {
       try {
-        JSON.parse(decoder.decode(Buffer.concat(pending, pendingLength)));
+        JSON.parse(decoder.decode(line));
       } catch {
         throw new BackupFileVerificationError(`Invalid JSONL at line ${lineCount + 1}.`);
       }
     }
-    pending = [];
-    pendingLength = 0;
     lineCount += 1;
   }
   return {
     consume(data) {
       let start = 0;
-      for (let index = 0; index < data.length; index += 1) {
-        if (data[index] !== 0x0A) continue;
-        if (start < index) {
-          const segment = data.subarray(start, index);
-          pending.push(segment);
-          pendingLength += segment.length;
+      for (let index = data.indexOf(0x0A); index >= 0; index = data.indexOf(0x0A, start)) {
+        const segment = data.subarray(start, index);
+        const lineLength = pending.length + segment.length;
+        if (lineLength > maxLineBytes) throw new BackupFileVerificationError(`JSONL line exceeds ${maxLineBytes} bytes.`);
+        let line = segment;
+        if (pending.length > 0) {
+          pending.append(segment);
+          line = pending.view();
         }
-        validateLine();
+        validateLine(line);
+        pending.reset();
         start = index + 1;
       }
       if (start < data.length) {
         const segment = data.subarray(start);
-        pending.push(segment);
-        pendingLength += segment.length;
-        if (pendingLength > maxLineBytes) throw new BackupFileVerificationError(`JSONL line exceeds ${maxLineBytes} bytes.`);
+        if (!pending.append(segment)) throw new BackupFileVerificationError(`JSONL line exceeds ${maxLineBytes} bytes.`);
       }
     },
     finish(byteCount) {
-      if (byteCount > 0 && pendingLength > 0) throw new BackupFileVerificationError('Backup has an incomplete JSONL tail.');
+      if (byteCount > 0 && pending.length > 0) throw new BackupFileVerificationError('Backup has an incomplete JSONL tail.');
       return lineCount;
     },
   };
@@ -85,15 +83,18 @@ async function verifyFullBackupFile({
   if (expectedByteCount !== null && stats.size !== expectedByteCount) {
     throw new BackupFileVerificationError(`Backup length mismatch: expected ${expectedByteCount}, got ${stats.size}.`);
   }
-  const handle = await fsp.open(filePath, 'r');
   const digest = crypto.createHash('sha256');
   const chunkHashes = [];
   const jsonl = createJSONLValidator(maxLineBytes);
+  const scratch = stats.size > 0
+    ? Buffer.allocUnsafe(Math.min(chunkSize, stats.size))
+    : null;
+  const handle = await fsp.open(filePath, 'r');
   try {
     let position = 0;
     while (position < stats.size) {
       const count = Math.min(chunkSize, stats.size - position);
-      const chunk = await readExactly(handle, count, position);
+      const chunk = await readExactly(handle, scratch, count, position);
       if (chunk.length !== count) throw new BackupFileVerificationError('Backup changed while verifying.');
       digest.update(chunk);
       chunkHashes.push(sha256(chunk));
@@ -148,12 +149,13 @@ async function verifyAppendSourceAnchors({
 
   const lastIndex = previous.chunkHashes.length - 1;
   const anchorIndexes = [...new Set([0, Math.floor(lastIndex / 2), lastIndex])];
+  const scratch = Buffer.allocUnsafe(Math.min(chunkSize, previous.byteCount));
   const source = await fsp.open(sourcePath, 'r');
   try {
     for (const chunkIndex of anchorIndexes) {
       const position = chunkIndex * chunkSize;
       const count = Math.min(chunkSize, previous.byteCount - position);
-      const chunk = await readExactly(source, count, position);
+      const chunk = await readExactly(source, scratch, count, position);
       onRead?.({ chunkIndex, byteCount: chunk.length, position });
       if (chunk.length !== count
         || sha256(chunk) !== String(previous.chunkHashes[chunkIndex]).toLowerCase()) {
@@ -195,6 +197,9 @@ async function verifyChangedBackupChunks({
   const startOffset = firstChangedChunk * chunkSize;
   const chunkHashes = previous.chunkHashes.slice(0, firstChangedChunk);
   const jsonl = createJSONLValidator(maxLineBytes);
+  const scratchSize = Math.min(chunkSize, committedByteCount - startOffset);
+  const sourceScratch = scratchSize > 0 ? Buffer.allocUnsafe(scratchSize) : null;
+  const targetScratch = scratchSize > 0 ? Buffer.allocUnsafe(scratchSize) : null;
   const source = await fsp.open(sourcePath, 'r');
   const target = await fsp.open(targetPath, 'r');
   try {
@@ -202,8 +207,8 @@ async function verifyChangedBackupChunks({
     while (position < committedByteCount) {
       const count = Math.min(chunkSize, committedByteCount - position);
       const [sourceChunk, targetChunk] = await Promise.all([
-        readExactly(source, count, position),
-        readExactly(target, count, position),
+        readExactly(source, sourceScratch, count, position),
+        readExactly(target, targetScratch, count, position),
       ]);
       if (sourceChunk.length !== count || targetChunk.length !== count || !sourceChunk.equals(targetChunk)) {
         throw new BackupFileVerificationError(`Backup chunk mismatch at chunk ${chunkHashes.length + 1}.`);

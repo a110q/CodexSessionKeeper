@@ -29,6 +29,43 @@ async function fixture(t) {
   return root;
 }
 
+async function withTrackedReadBuffers(filePaths, operation) {
+  const trackedPaths = new Set(filePaths.map((filePath) => path.resolve(filePath)));
+  const originalOpen = fs.open;
+  const readsByPath = new Map([...trackedPaths].map((filePath) => [filePath, []]));
+  fs.open = async function (openedPath, ...args) {
+    const handle = await originalOpen.call(fs, openedPath, ...args);
+    const resolvedPath = path.resolve(String(openedPath));
+    if (trackedPaths.has(resolvedPath)) {
+      const originalRead = handle.read.bind(handle);
+      handle.read = async (buffer, offset, length, position) => {
+        readsByPath.get(resolvedPath).push(buffer);
+        return originalRead(buffer, offset, length, position);
+      };
+    }
+    return handle;
+  };
+  try {
+    return { result: await operation(), readsByPath };
+  } finally {
+    fs.open = originalOpen;
+  }
+}
+
+async function withTrackedBufferConcats(operation) {
+  const originalConcat = Buffer.concat;
+  let concatCalls = 0;
+  Buffer.concat = function (...args) {
+    concatCalls += 1;
+    return originalConcat.apply(Buffer, args);
+  };
+  try {
+    return { result: await operation(), concatCalls };
+  } finally {
+    Buffer.concat = originalConcat;
+  }
+}
+
 test('verification store round trips and missing store loads an empty document', async (t) => {
   const root = await fixture(t);
   const filePath = path.join(root, 'verification.json');
@@ -74,6 +111,59 @@ test('full verification checks JSONL, length, full hash, and fixed chunks', asyn
     contentHash: sha256(data),
     chunkHashes: [sha256(data.subarray(0, 8)), sha256(data.subarray(8, 16))],
   });
+});
+
+test('full verification reuses one scratch buffer across every chunk read', async (t) => {
+  const root = await fixture(t);
+  const filePath = path.join(root, 'bounded-full.jsonl');
+  const data = Buffer.from(Array.from(
+    { length: 40 },
+    (_, index) => `${JSON.stringify({ index, value: 'spans chunks' })}\n`,
+  ).join(''));
+  await fs.writeFile(filePath, data);
+
+  const { result, readsByPath } = await withTrackedReadBuffers([filePath], () => verifyFullBackupFile({
+    filePath,
+    chunkSize: 7,
+    maxLineBytes: 128,
+  }));
+  const reads = readsByPath.get(path.resolve(filePath));
+
+  assert.equal(result.lineCount, 40);
+  assert.ok(reads.length > 20);
+  assert.equal(new Set(reads).size, 1);
+});
+
+test('full verification uses one spanning-line accumulator without a full-line concat', async (t) => {
+  const root = await fixture(t);
+  const filePath = path.join(root, 'single-accumulator.jsonl');
+  const data = Buffer.from(`${JSON.stringify({ value: 'x'.repeat(80) })}\n`);
+  await fs.writeFile(filePath, data);
+
+  const { result, concatCalls } = await withTrackedBufferConcats(() => verifyFullBackupFile({
+    filePath,
+    chunkSize: 7,
+    maxLineBytes: data.length - 1,
+  }));
+
+  assert.equal(result.lineCount, 1);
+  assert.equal(concatCalls, 0);
+});
+
+test('full verification accepts exact maxLineBytes and rejects max plus one', async (t) => {
+  const root = await fixture(t);
+  const filePath = path.join(root, 'exact-line-limit.jsonl');
+  const exactLine = Buffer.from('"123456"');
+  await fs.writeFile(filePath, Buffer.concat([exactLine, Buffer.from('\n')]));
+
+  const exact = await verifyFullBackupFile({ filePath, chunkSize: 3, maxLineBytes: exactLine.length });
+  assert.equal(exact.lineCount, 1);
+
+  await fs.writeFile(filePath, Buffer.concat([Buffer.from('"1234567"'), Buffer.from('\n')]));
+  await assert.rejects(
+    verifyFullBackupFile({ filePath, chunkSize: 3, maxLineBytes: exactLine.length }),
+    /exceeds 8 bytes/,
+  );
 });
 
 test('full verification rejects same-size corruption and malformed JSONL', async (t) => {
@@ -144,6 +234,50 @@ test('changed verification rehashes affected chunks and rejects mismatches', asy
     }),
     BackupFileVerificationError,
   );
+});
+
+test('changed verification reuses exactly one source and one target scratch buffer', async (t) => {
+  const root = await fixture(t);
+  const sourcePath = path.join(root, 'bounded-source.jsonl');
+  const targetPath = path.join(root, 'bounded-target.jsonl');
+  const original = Buffer.from('{"a":1}\n');
+  const appended = Buffer.from(Array.from(
+    { length: 40 },
+    (_, index) => `${JSON.stringify({ index, value: 'changed chunks' })}\n`,
+  ).join(''));
+  const complete = Buffer.concat([original, appended]);
+  await fs.writeFile(sourcePath, complete);
+  await fs.writeFile(targetPath, complete);
+  const previous = {
+    backupPath: 'sessions/bounded.jsonl',
+    byteCount: original.length,
+    lineCount: 1,
+    chunkHashes: [sha256(original)],
+    verifiedAt: '2026-07-15T00:00:00.000Z',
+  };
+
+  const { result, readsByPath } = await withTrackedReadBuffers(
+    [sourcePath, targetPath],
+    () => verifyChangedBackupChunks({
+      sourcePath,
+      targetPath,
+      previous,
+      backupPath: previous.backupPath,
+      committedByteCount: complete.length,
+      lineCount: 41,
+      verifiedAt: '2026-07-15T00:01:00.000Z',
+      chunkSize: original.length,
+      maxLineBytes: 128,
+    }),
+  );
+  const sourceReads = readsByPath.get(path.resolve(sourcePath));
+  const targetReads = readsByPath.get(path.resolve(targetPath));
+
+  assert.equal(result.lineCount, 41);
+  assert.ok(sourceReads.length > 20);
+  assert.equal(new Set(sourceReads).size, 1);
+  assert.equal(new Set(targetReads).size, 1);
+  assert.equal(new Set([...sourceReads, ...targetReads]).size, 2);
 });
 
 test('empty and exact four MiB boundary files produce canonical chunks', async (t) => {

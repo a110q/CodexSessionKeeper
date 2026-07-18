@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fsp = require('node:fs/promises');
 
 const { durableReplaceWithWriter } = require('./durable-write');
+const { createBoundedLineAccumulator } = require('./jsonl-line-accumulator');
 const { titleFromJsonLine } = require('./session-identity');
 const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
@@ -13,6 +14,9 @@ const MAXIMUM_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_WRITE_BUFFER_SIZE = 1024 * 1024;
 const DEFAULT_MAX_LINE_BYTES = MAX_JSONL_LINE_BYTES;
 const MAX_PENDING_PARTIAL_BYTES = 64 * 1024;
+const MAX_TITLE_RECORD_BYTES = 64 * 1024;
+const MAX_TITLE_SCAN_BYTES = 256 * 1024;
+const MAX_TITLE_SCAN_RECORDS = 256;
 const NEWLINE = Buffer.from([NEWLINE_BYTE]);
 
 function normalizedChunkSize(chunkSize) {
@@ -23,6 +27,29 @@ function normalizedChunkSize(chunkSize) {
 function normalizedLineLimit(maxLineBytes) {
   const parsed = Number(maxLineBytes ?? DEFAULT_MAX_LINE_BYTES);
   return Math.max(0, Number.isFinite(parsed) ? Math.floor(parsed) : DEFAULT_MAX_LINE_BYTES);
+}
+
+function createTitleScanner() {
+  let title = null;
+  let parsedBytes = 0;
+  let recordCount = 0;
+  let exhausted = false;
+  return {
+    consider(line) {
+      if (title !== null || exhausted || recordCount >= MAX_TITLE_SCAN_RECORDS) return;
+      recordCount += 1;
+      if (line.length > MAX_TITLE_RECORD_BYTES) return;
+      if (parsedBytes + line.length > MAX_TITLE_SCAN_BYTES) {
+        exhausted = true;
+        return;
+      }
+      parsedBytes += line.length;
+      title = titleFromJsonLine(line.toString('utf8'));
+    },
+    get title() {
+      return title;
+    },
+  };
 }
 
 async function writeAll(handle, buffer, position = null) {
@@ -95,10 +122,10 @@ async function scanCompleteRecords({
   let remaining = maximumByteCount;
   let committedByteCount = 0;
   let lineCount = 0;
-  let pendingChunks = [];
-  let pendingLength = 0;
+  const pending = createBoundedLineAccumulator(lineLimit);
   let blockedError = null;
-  let firstTitle = null;
+  let scannerBuffer = null;
+  const titleScanner = createTitleScanner();
 
   readLoop: while (remaining === null || remaining > 0) {
     if (interruptionRequested()) throw interruptedError();
@@ -106,10 +133,10 @@ async function scanCompleteRecords({
       ? boundedChunkSize
       : Math.min(boundedChunkSize, remaining);
     if (requested <= 0) break;
-    const buffer = Buffer.allocUnsafe(requested);
-    const { bytesRead } = await sourceHandle.read(buffer, 0, requested, position);
+    scannerBuffer ||= Buffer.allocUnsafe(boundedChunkSize);
+    const { bytesRead } = await sourceHandle.read(scannerBuffer, 0, requested, position);
     if (bytesRead === 0) break;
-    const chunk = buffer.subarray(0, bytesRead);
+    const chunk = scannerBuffer.subarray(0, bytesRead);
     await onChunk?.(position, bytesRead);
     if (interruptionRequested()) throw interruptedError();
     position += bytesRead;
@@ -118,49 +145,41 @@ async function scanCompleteRecords({
     let segmentStart = 0;
     for (let index = 0; index < chunk.length; index += 1) {
       if (chunk[index] !== NEWLINE_BYTE) continue;
-      if (segmentStart < index) {
-        const segment = chunk.subarray(segmentStart, index);
-        pendingChunks.push(segment);
-        pendingLength += segment.length;
-      }
-      if (pendingLength > lineLimit) {
+      const segment = chunk.subarray(segmentStart, index);
+      const lineLength = pending.length + segment.length;
+      if (lineLength > lineLimit) {
         blockedError = blockedErrorMessage(sourcePath, lineLimit, startOffset + committedByteCount);
-        pendingChunks = [];
-        pendingLength = 0;
+        pending.reset();
         break readLoop;
       }
 
-      const line = pendingLength === 0
-        ? Buffer.alloc(0)
-        : Buffer.concat(pendingChunks, pendingLength);
-      if (firstTitle === null) {
-        firstTitle = titleFromJsonLine(line.toString('utf8'));
+      let line = segment;
+      if (pending.length > 0) {
+        pending.append(segment);
+        line = pending.view();
       }
+      titleScanner.consider(line);
       await onRecord(line);
       committedByteCount += line.length + 1;
       lineCount += 1;
-      pendingChunks = [];
-      pendingLength = 0;
+      pending.reset();
       segmentStart = index + 1;
     }
 
     if (segmentStart < chunk.length) {
       const segment = chunk.subarray(segmentStart);
-      pendingChunks.push(segment);
-      pendingLength += segment.length;
-      if (pendingLength > lineLimit) {
+      if (!pending.append(segment)) {
         blockedError = blockedErrorMessage(sourcePath, lineLimit, startOffset + committedByteCount);
-        pendingChunks = [];
-        pendingLength = 0;
+        pending.reset();
         break;
       }
     }
   }
 
   let pendingPartialLine = '';
-  if (!blockedError && pendingLength > 0) {
-    if (pendingLength <= MAX_PENDING_PARTIAL_BYTES) {
-      pendingPartialLine = Buffer.concat(pendingChunks, pendingLength).toString('utf8');
+  if (!blockedError && pending.length > 0) {
+    if (pending.length <= MAX_PENDING_PARTIAL_BYTES) {
+      pendingPartialLine = pending.view().toString('utf8');
     } else {
       pendingPartialLine = '\0';
     }
@@ -171,7 +190,7 @@ async function scanCompleteRecords({
     lineCount,
     pendingPartialLine,
     blockedError,
-    firstTitle,
+    firstTitle: titleScanner.title,
   };
 }
 

@@ -1,6 +1,10 @@
 const fs = require('node:fs');
 const { ensureRecoveredThreadsInStateDatabase } = require('./live-state-database');
+const { createBoundedLineAccumulator } = require('./jsonl-line-accumulator');
 const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
+
+const MAX_RECOVERED_METADATA_LINES = 400;
+const MAX_RECOVERED_PREVIEW_CHARS = 4096;
 
 function collapseWhitespace(value) {
   return String(value || '').split(/\s+/).filter(Boolean).join(' ');
@@ -16,20 +20,40 @@ function parseDateMs(value) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function textContent(value) {
-  if (typeof value === 'string') return value;
-  if (Array.isArray(value)) {
-    return value.map((item) => item && (item.text || item.content || '')).filter(Boolean).join(' ');
-  }
+function firstUserMessageContent(object) {
+  if (object.role === 'user') return object.content;
+  const payload = object.payload || {};
+  if (payload.type === 'user_message') return payload.message || payload.content;
+  if (payload.role === 'user') return payload.content;
   return '';
 }
 
-function firstUserMessage(object) {
-  if (object.role === 'user') return textContent(object.content);
-  const payload = object.payload || {};
-  if (payload.type === 'user_message') return textContent(payload.message || payload.content);
-  if (payload.role === 'user') return textContent(payload.content);
-  return '';
+function independentString(value) {
+  const codeUnits = new Uint16Array(value.length);
+  for (let index = 0; index < value.length; index += 1) codeUnits[index] = value.charCodeAt(index);
+  return String.fromCharCode(...codeUnits);
+}
+
+function boundedCollapsedText(value, maximumChars) {
+  const parts = typeof value === 'string'
+    ? [value]
+    : Array.isArray(value)
+      ? value.map((item) => item && (item.text || item.content || '')).filter(Boolean)
+      : [];
+  let output = '';
+  partsLoop: for (const part of parts) {
+    const text = String(part);
+    const words = /\S+/g;
+    let match;
+    while ((match = words.exec(text)) !== null) {
+      if (output.length > 0) output += ' ';
+      const remaining = maximumChars - output.length;
+      if (remaining <= 0) break partsLoop;
+      output += match[0].slice(0, remaining);
+      if (output.length === maximumChars) break partsLoop;
+    }
+  }
+  return independentString(output);
 }
 
 async function extractRecoveredThreadMetadata(
@@ -38,10 +62,6 @@ async function extractRecoveredThreadMetadata(
   codexRoot,
   { maxLineBytes = MAX_JSONL_LINE_BYTES, readBufferBytes = 1024 * 1024 } = {},
 ) {
-  const lines = await firstRecoveredJsonlLines(recoveredPath, 400, {
-    maxLineBytes,
-    readBufferBytes,
-  });
   let firstTimestamp = null;
   let lastTimestamp = null;
   let userMessage = '';
@@ -55,7 +75,10 @@ async function extractRecoveredThreadMetadata(
   let cliVersion = '';
   let memoryMode = '';
 
-  for (const line of lines) {
+  for await (const line of recoveredJsonlLines(recoveredPath, MAX_RECOVERED_METADATA_LINES, {
+    maxLineBytes,
+    readBufferBytes,
+  })) {
     let object;
     try {
       object = JSON.parse(line);
@@ -77,7 +100,9 @@ async function extractRecoveredThreadMetadata(
     reasoningEffort ||= object.reasoning_effort || payload.reasoning_effort || '';
     cliVersion ||= object.cli_version || payload.cli_version || '';
     memoryMode ||= object.memory_mode || payload.memory_mode || '';
-    if (!userMessage) userMessage = collapseWhitespace(firstUserMessage(object));
+    if (!userMessage) {
+      userMessage = boundedCollapsedText(firstUserMessageContent(object), MAX_RECOVERED_PREVIEW_CHARS);
+    }
   }
 
   const createdMs = firstTimestamp ?? parseDateMs(record.firstSeenAt) ?? 0;
@@ -120,7 +145,7 @@ async function extractRecoveredThreadMetadata(
   };
 }
 
-async function firstRecoveredJsonlLines(
+async function* recoveredJsonlLines(
   filePath,
   limit = 400,
   { maxLineBytes = MAX_JSONL_LINE_BYTES, readBufferBytes = 1024 * 1024 } = {},
@@ -131,14 +156,13 @@ async function firstRecoveredJsonlLines(
   const bufferSize = Number.isSafeInteger(readBufferBytes) && readBufferBytes > 0
     ? readBufferBytes
     : 1024 * 1024;
-  const handle = await fs.promises.open(filePath, 'r');
-  const lines = [];
-  let pending = [];
-  let pendingLength = 0;
-  let position = 0;
   const buffer = Buffer.allocUnsafe(bufferSize);
+  const handle = await fs.promises.open(filePath, 'r');
+  let lineCount = 0;
+  const pending = createBoundedLineAccumulator(lineLimit);
+  let position = 0;
   try {
-    while (lines.length < limit) {
+    while (lineCount < limit) {
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
       if (bytesRead === 0) break;
       const chunk = buffer.subarray(0, bytesRead);
@@ -146,35 +170,39 @@ async function firstRecoveredJsonlLines(
       let start = 0;
       for (let index = 0; index < chunk.length; index += 1) {
         if (chunk[index] !== 0x0A) continue;
-        if (start < index) {
-          const segment = Buffer.from(chunk.subarray(start, index));
-          pending.push(segment);
-          pendingLength += segment.length;
-        }
-        if (pendingLength > lineLimit) {
+        const segment = chunk.subarray(start, index);
+        const lineLength = pending.length + segment.length;
+        if (lineLength > lineLimit) {
           throw new Error(`Recovered JSONL line exceeds ${lineLimit} bytes.`);
         }
-        if (pendingLength > 0) {
-          lines.push(Buffer.concat(pending, pendingLength).toString('utf8'));
+        let line = '';
+        if (lineLength > 0) {
+          if (pending.length > 0) {
+            pending.append(segment);
+            line = pending.view().toString('utf8');
+          } else {
+            line = segment.toString('utf8');
+          }
         }
-        pending = [];
-        pendingLength = 0;
-        if (lines.length === limit) return lines;
+        pending.reset();
         start = index + 1;
+        if (lineLength > 0) {
+          lineCount += 1;
+          yield line;
+          if (lineCount === limit) return;
+        }
       }
       if (start < chunk.length) {
-        const segment = Buffer.from(chunk.subarray(start));
-        pending.push(segment);
-        pendingLength += segment.length;
-        if (pendingLength > lineLimit) {
+        if (!pending.append(chunk.subarray(start))) {
           throw new Error(`Recovered JSONL line exceeds ${lineLimit} bytes.`);
         }
       }
     }
-    if (pendingLength > 0 && lines.length < limit) {
-      lines.push(Buffer.concat(pending, pendingLength).toString('utf8'));
+    if (pending.length > 0 && lineCount < limit) {
+      const line = pending.view().toString('utf8');
+      pending.reset();
+      yield line;
     }
-    return lines;
   } finally {
     await handle.close();
   }

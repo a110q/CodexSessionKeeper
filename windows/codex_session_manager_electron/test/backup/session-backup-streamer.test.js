@@ -11,6 +11,7 @@ const { durableReplaceWithWriter } = require('../../src/backup/durable-write');
 const {
   appendCompleteLines,
   rebuildCompleteLines,
+  rebuildSessionCompleteLines,
   rangesMatch,
 } = require('../../src/backup/session-backup-streamer');
 
@@ -32,19 +33,21 @@ function sha256(contents) {
 async function withTrackedReadSizes(filePath, operation) {
   const originalOpen = fs.open;
   const readSizes = [];
+  const readBuffers = [];
   fs.open = async function (openedPath, ...args) {
     const handle = await originalOpen.call(fs, openedPath, ...args);
     if (path.resolve(String(openedPath)) === path.resolve(filePath)) {
       const originalRead = handle.read.bind(handle);
       handle.read = async (buffer, offset, length, position) => {
         readSizes.push(length);
+        readBuffers.push(buffer);
         return originalRead(buffer, offset, length, position);
       };
     }
     return handle;
   };
   try {
-    return { result: await operation(), readSizes };
+    return { result: await operation(), readSizes, readBuffers };
   } finally {
     fs.open = originalOpen;
   }
@@ -77,6 +80,34 @@ async function withTrackedWriteSizes(targetPath, operation) {
   }
 }
 
+async function withTrackedBufferConcats(operation) {
+  const originalConcat = Buffer.concat;
+  let concatCalls = 0;
+  Buffer.concat = function (...args) {
+    concatCalls += 1;
+    return originalConcat.apply(Buffer, args);
+  };
+  try {
+    return { result: await operation(), concatCalls };
+  } finally {
+    Buffer.concat = originalConcat;
+  }
+}
+
+async function withTrackedUnsafeAllocations(operation) {
+  const originalAllocUnsafe = Buffer.allocUnsafe;
+  const allocationSizes = [];
+  Buffer.allocUnsafe = function (size, ...args) {
+    allocationSizes.push(size);
+    return originalAllocUnsafe.call(Buffer, size, ...args);
+  };
+  try {
+    return { result: await operation(), allocationSizes };
+  } finally {
+    Buffer.allocUnsafe = originalAllocUnsafe;
+  }
+}
+
 function manySmallRecords(minimumBytes) {
   const record = '{"type":"event_msg","payload":{"type":"user_message","message":"buffer me"}}\n';
   return Buffer.from(record.repeat(Math.ceil(minimumBytes / Buffer.byteLength(record))));
@@ -102,6 +133,146 @@ test('rebuild streams several chunks, excludes a partial record, and hashes comm
   });
   assert.ok(readSizes.length > 3);
   assert.ok(readSizes.every((size) => size <= chunkSize));
+});
+
+test('rebuild reuses one scanner buffer independent of chunk count', async (t) => {
+  const source = Buffer.from(Array.from(
+    { length: 80 },
+    (_, index) => `${JSON.stringify({ index, value: 'crosses reads' })}\n`,
+  ).join(''));
+  const { sourcePath, targetPath } = await makeFixture(t, source);
+
+  const { readBuffers } = await withTrackedReadSizes(sourcePath, () => rebuildCompleteLines({
+    sourcePath,
+    targetPath,
+    chunkSize: 7,
+  }));
+
+  assert.ok(readBuffers.length > 40);
+  assert.equal(new Set(readBuffers).size, 1);
+  assert.deepEqual(await fs.readFile(targetPath), source);
+});
+
+test('rebuild uses one spanning-line accumulator without a full-line concat', async (t) => {
+  const source = Buffer.from(`${JSON.stringify({ value: 'x'.repeat(80) })}\n`);
+  const { sourcePath, targetPath } = await makeFixture(t, source);
+
+  const { result, concatCalls } = await withTrackedBufferConcats(() => rebuildCompleteLines({
+    sourcePath,
+    targetPath,
+    chunkSize: 7,
+    maxLineBytes: source.length - 1,
+  }));
+
+  assert.equal(result.lineCount, 1);
+  assert.equal(concatCalls, 0);
+  assert.deepEqual(await fs.readFile(targetPath), source);
+});
+
+test('a short partial tail does not reserve the full 64 MiB line budget', async (t) => {
+  const { sourcePath, targetPath } = await makeFixture(t, Buffer.from('partial'));
+  const maximumLineBytes = 64 * 1024 * 1024;
+
+  const { result, allocationSizes } = await withTrackedUnsafeAllocations(() => rebuildSessionCompleteLines({
+    sourcePath,
+    targetPath,
+    chunkSize: 3,
+    maxLineBytes: maximumLineBytes,
+  }));
+
+  assert.equal(result.pendingPartialLine, 'partial');
+  assert.equal(allocationSizes.includes(maximumLineBytes), false);
+});
+
+test('rebuild accepts exact maxLineBytes and blocks max plus one', async (t) => {
+  const exactLine = Buffer.from('"123456"');
+  const exact = await makeFixture(t, Buffer.concat([exactLine, Buffer.from('\n')]));
+  const exactResult = await rebuildSessionCompleteLines({
+    sourcePath: exact.sourcePath,
+    targetPath: exact.targetPath,
+    chunkSize: 3,
+    maxLineBytes: exactLine.length,
+  });
+  assert.equal(exactResult.lineCount, 1);
+  assert.equal(exactResult.blockedError, null);
+
+  const overRoot = path.join(exact.root, 'over');
+  await fs.mkdir(overRoot);
+  const overSource = path.join(overRoot, 'source.jsonl');
+  const overTarget = path.join(overRoot, 'target.jsonl');
+  await fs.writeFile(overSource, '"1234567"\n');
+  const overResult = await rebuildSessionCompleteLines({
+    sourcePath: overSource,
+    targetPath: overTarget,
+    chunkSize: 3,
+    maxLineBytes: exactLine.length,
+  });
+  assert.equal(overResult.lineCount, 0);
+  assert.match(overResult.blockedError, /maximum JSONL line size of 8 bytes/);
+  assert.equal((await fs.stat(overTarget)).size, 0);
+});
+
+test('title scan skips oversized records without changing streamed backup bytes', async (t) => {
+  const oversized = Buffer.from(`${JSON.stringify({
+    role: 'user',
+    content: `oversized title ${'x'.repeat(128 * 1024)}`,
+  })}\n`);
+  const { sourcePath, targetPath } = await makeFixture(t, oversized);
+
+  const result = await rebuildSessionCompleteLines({
+    sourcePath,
+    targetPath,
+    chunkSize: 4096,
+  });
+
+  assert.equal(result.firstTitle, null);
+  assert.equal(result.lineCount, 1);
+  assert.deepEqual(await fs.readFile(targetPath), oversized);
+});
+
+test('title scan remains bounded by record count and parsed bytes', async (t) => {
+  const manyRecords = Buffer.from([
+    ...Array.from({ length: 300 }, (_, index) => JSON.stringify({ role: 'assistant', content: `record ${index}` })),
+    JSON.stringify({ role: 'user', content: 'past record budget' }),
+    '',
+  ].join('\n'));
+  const parsedByteBudget = Buffer.from([
+    ...Array.from({ length: 5 }, () => JSON.stringify({ role: 'assistant', content: 'x'.repeat(60 * 1024) })),
+    JSON.stringify({ role: 'user', content: 'past byte budget' }),
+    '',
+  ].join('\n'));
+  const first = await makeFixture(t, manyRecords);
+  const secondRoot = path.join(first.root, 'second');
+  await fs.mkdir(secondRoot);
+  const second = {
+    sourcePath: path.join(secondRoot, 'source.jsonl'),
+    targetPath: path.join(secondRoot, 'target.jsonl'),
+  };
+  await fs.writeFile(second.sourcePath, parsedByteBudget);
+
+  const [recordLimited, byteLimited] = await Promise.all([
+    rebuildSessionCompleteLines({ sourcePath: first.sourcePath, targetPath: first.targetPath }),
+    rebuildSessionCompleteLines({ sourcePath: second.sourcePath, targetPath: second.targetPath }),
+  ]);
+
+  assert.equal(recordLimited.firstTitle, null);
+  assert.equal(byteLimited.firstTitle, null);
+  assert.deepEqual(await fs.readFile(first.targetPath), manyRecords);
+  assert.deepEqual(await fs.readFile(second.targetPath), parsedByteBudget);
+});
+
+test('an oversized non-title record does not consume the parsed-byte title budget', async (t) => {
+  const source = Buffer.from([
+    JSON.stringify({ role: 'assistant', content: 'x'.repeat(128 * 1024) }),
+    JSON.stringify({ role: 'user', content: 'small title after oversized assistant' }),
+    '',
+  ].join('\n'));
+  const { sourcePath, targetPath } = await makeFixture(t, source);
+
+  const result = await rebuildSessionCompleteLines({ sourcePath, targetPath, chunkSize: 4096 });
+
+  assert.equal(result.firstTitle, 'small title after oversized assistant');
+  assert.deepEqual(await fs.readFile(targetPath), source);
 });
 
 test('rebuild batches many small records into one MiB writes', async (t) => {
