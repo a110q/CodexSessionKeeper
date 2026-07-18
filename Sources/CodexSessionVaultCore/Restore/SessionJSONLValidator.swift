@@ -415,7 +415,7 @@ public enum TrustedSessionFileResolver {
     }
 }
 
-fileprivate enum SessionJSONLScanner {
+enum SessionJSONLScanner {
     static let maximumLineBytes = 32 * 1024 * 1024
 
     struct Result {

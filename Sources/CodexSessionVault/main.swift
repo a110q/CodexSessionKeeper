@@ -395,6 +395,7 @@ final class VaultModel: ObservableObject {
     private let appVersion = "1.0.14"
     private var didRunLaunchAutoRestore = false
     private var conversationLoadID = UUID()
+    private var conversationLoadTask: Task<Void, Never>?
     private var sessionSearchTask: Task<Void, Never>?
     private var nasRuntime: NASBackupRuntime!
     private var nasConfigurationService: NASConfigurationService!
@@ -463,6 +464,7 @@ final class VaultModel: ObservableObject {
     }
 
     deinit {
+        conversationLoadTask?.cancel()
         sessionSearchTask?.cancel()
         nasStatusTask?.cancel()
     }
@@ -1344,6 +1346,7 @@ final class VaultModel: ObservableObject {
     }
 
     func openConversationViewer(for session: CodexSession) {
+        conversationLoadTask?.cancel()
         selectedSessionID = session.id
         conversationViewerSession = session
         conversationMessages = []
@@ -1354,28 +1357,64 @@ final class VaultModel: ObservableObject {
 
         let loadID = UUID()
         conversationLoadID = loadID
-        let rolloutPath = session.rolloutPath
+        let sessionID = session.id
+        let preferredPath = session.rolloutPath
+        let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
         let title = session.displayTitle
 
-        Task.detached(priority: .userInitiated) {
+        conversationLoadTask = Task.detached(priority: .userInitiated) { [weak self] in
             do {
-                let messages = try ConversationLogParser.loadMessages(rolloutPath: rolloutPath)
-                await MainActor.run {
-                    guard self.conversationLoadID == loadID else { return }
+                let trustedFiles = try TrustedSessionFileResolver.resolve(
+                    sessionIDs: [sessionID],
+                    under: root
+                )
+                guard let trusted = trustedFiles.first(where: { $0.fileURL.path == preferredPath })
+                        ?? trustedFiles.first else {
+                    throw VaultError.commandFailed("会话文件不存在或身份校验失败。")
+                }
+                let messages = try ConversationLogParser.loadMessages(from: trusted).map {
+                    ConversationMessage(
+                        id: $0.id,
+                        role: $0.role,
+                        phase: $0.phase,
+                        timestamp: $0.timestamp,
+                        text: $0.text
+                    )
+                }
+                await MainActor.run { [weak self] in
+                    guard let self, self.conversationLoadID == loadID else { return }
                     self.conversationMessages = messages
                     self.isConversationLoading = false
+                    self.conversationLoadTask = nil
                     self.status = "已打开对话记录：\(title)"
                 }
+            } catch is CancellationError {
+                await MainActor.run { [weak self] in
+                    guard let self, self.conversationLoadID == loadID else { return }
+                    self.isConversationLoading = false
+                    self.conversationLoadTask = nil
+                }
             } catch {
-                await MainActor.run {
-                    guard self.conversationLoadID == loadID else { return }
+                await MainActor.run { [weak self] in
+                    guard let self, self.conversationLoadID == loadID else { return }
                     self.conversationViewerError = error.localizedDescription
                     self.isConversationLoading = false
+                    self.conversationLoadTask = nil
                     self.lastError = error.localizedDescription
                     self.status = "打开对话记录失败"
                 }
             }
         }
+    }
+
+    func dismissConversationViewer() {
+        conversationLoadID = UUID()
+        conversationLoadTask?.cancel()
+        conversationLoadTask = nil
+        conversationMessages.removeAll(keepingCapacity: false)
+        conversationViewerSession = nil
+        conversationViewerError = nil
+        isConversationLoading = false
     }
 
     private func restoreSelected(mode: RestoreMode) {
@@ -2977,141 +3016,6 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    private func loadConversationMessages(for session: CodexSession) throws -> [ConversationMessage] {
-        let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
-        guard let url = try TrustedSessionFileResolver.resolve(
-            sessionIDs: [session.id],
-            under: root
-        ).first?.fileURL else {
-            throw VaultError.commandFailed("会话文件不存在或身份校验失败。")
-        }
-
-        let lines = try readLineData(url)
-        var eventMessages: [ConversationMessage] = []
-        var responseMessages: [ConversationMessage] = []
-
-        for (index, line) in lines.enumerated() {
-            guard !line.isWhitespaceOrEmpty,
-                  let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                  let type = object["type"] as? String,
-                  let payload = object["payload"] as? [String: Any] else {
-                continue
-            }
-
-            let timestamp = parseCodexTimestamp(object["timestamp"] as? String)
-
-            if type == "event_msg",
-               let eventType = payload["type"] as? String,
-               let message = conversationEventMessage(
-                eventType: eventType,
-                payload: payload,
-                lineIndex: index,
-                timestamp: timestamp
-               ) {
-                eventMessages.append(message)
-            } else if type == "response_item",
-                      let response = conversationResponseMessage(
-                        payload: payload,
-                        lineIndex: index,
-                        timestamp: timestamp
-                      ) {
-                responseMessages.append(response)
-            }
-        }
-
-        return eventMessages.isEmpty ? responseMessages : eventMessages
-    }
-
-    private func conversationEventMessage(
-        eventType: String,
-        payload: [String: Any],
-        lineIndex: Int,
-        timestamp: Date?
-    ) -> ConversationMessage? {
-        let role: String
-        switch eventType {
-        case "user_message":
-            role = "用户"
-        case "agent_message":
-            role = "助手"
-        default:
-            return nil
-        }
-
-        let text = cleanConversationText(payload["message"] as? String ?? extractConversationText(from: payload["content"]))
-        guard !text.isEmpty else { return nil }
-
-        return ConversationMessage(
-            id: "event-\(lineIndex)",
-            role: role,
-            phase: payload["phase"] as? String,
-            timestamp: timestamp,
-            text: text
-        )
-    }
-
-    private func conversationResponseMessage(
-        payload: [String: Any],
-        lineIndex: Int,
-        timestamp: Date?
-    ) -> ConversationMessage? {
-        guard payload["type"] as? String == "message",
-              let rawRole = payload["role"] as? String,
-              ["user", "assistant"].contains(rawRole) else {
-            return nil
-        }
-
-        let text = cleanConversationText(extractConversationText(from: payload["content"]))
-        guard !text.isEmpty else { return nil }
-
-        return ConversationMessage(
-            id: "response-\(lineIndex)",
-            role: conversationRoleLabel(rawRole),
-            phase: payload["phase"] as? String,
-            timestamp: timestamp,
-            text: text
-        )
-    }
-
-    private func extractConversationText(from value: Any?) -> String {
-        if let text = value as? String {
-            return text
-        }
-
-        if let parts = value as? [Any] {
-            return parts
-                .map { extractConversationText(from: $0) }
-                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                .joined(separator: "\n")
-        }
-
-        if let object = value as? [String: Any] {
-            for key in ["text", "message", "content", "input", "output"] {
-                let text = extractConversationText(from: object[key])
-                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return text
-                }
-            }
-        }
-
-        return ""
-    }
-
-    private func cleanConversationText(_ text: String) -> String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func conversationRoleLabel(_ role: String) -> String {
-        switch role.lowercased() {
-        case "user":
-            return "用户"
-        case "assistant":
-            return "助手"
-        default:
-            return role
-        }
-    }
-
     private func parseCodexTimestamp(_ value: String?) -> Date? {
         guard let value else { return nil }
 
@@ -4428,148 +4332,6 @@ private enum VaultWorkerProcess {
     }
 }
 
-private enum ConversationLogParser {
-    static func loadMessages(rolloutPath: String) throws -> [ConversationMessage] {
-        guard !rolloutPath.isEmpty else {
-            throw VaultError.commandFailed("这个会话没有记录文件路径。")
-        }
-
-        let url = URL(fileURLWithPath: rolloutPath)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw VaultError.commandFailed("会话文件不存在：\(rolloutPath)")
-        }
-
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        let text = String(decoding: data, as: UTF8.self)
-        var eventMessages: [ConversationMessage] = []
-        var responseMessages: [ConversationMessage] = []
-        eventMessages.reserveCapacity(256)
-        responseMessages.reserveCapacity(128)
-
-        for (index, line) in text.split(separator: "\n", omittingEmptySubsequences: true).enumerated() {
-            if isEventMessageLine(line),
-               let message = parseEventMessage(line, lineIndex: index) {
-                eventMessages.append(message)
-                continue
-            }
-
-            if eventMessages.isEmpty,
-               isResponseMessageLine(line),
-               let message = parseResponseMessage(line, lineIndex: index) {
-                responseMessages.append(message)
-            }
-        }
-
-        return eventMessages.isEmpty ? responseMessages : eventMessages
-    }
-
-    private static func isEventMessageLine(_ line: Substring) -> Bool {
-        line.contains(#""event_msg""#)
-            && (line.contains(#""user_message""#) || line.contains(#""agent_message""#))
-    }
-
-    private static func isResponseMessageLine(_ line: Substring) -> Bool {
-        line.contains(#""response_item""#)
-            && line.contains(#""message""#)
-            && (line.contains(#""user""#) || line.contains(#""assistant""#))
-    }
-
-    private static func parseEventMessage(_ line: Substring, lineIndex: Int) -> ConversationMessage? {
-        guard let object = jsonObject(from: line),
-              let payload = object["payload"] as? [String: Any],
-              let eventType = payload["type"] as? String else {
-            return nil
-        }
-
-        let role: String
-        switch eventType {
-        case "user_message":
-            role = "用户"
-        case "agent_message":
-            role = "助手"
-        default:
-            return nil
-        }
-
-        let text = cleanText(payload["message"] as? String ?? extractText(from: payload["content"]))
-        guard !text.isEmpty else { return nil }
-
-        return ConversationMessage(
-            id: "event-\(lineIndex)",
-            role: role,
-            phase: payload["phase"] as? String,
-            timestamp: parseTimestamp(object["timestamp"] as? String),
-            text: text
-        )
-    }
-
-    private static func parseResponseMessage(_ line: Substring, lineIndex: Int) -> ConversationMessage? {
-        guard let object = jsonObject(from: line),
-              let payload = object["payload"] as? [String: Any],
-              payload["type"] as? String == "message",
-              let rawRole = payload["role"] as? String,
-              ["user", "assistant"].contains(rawRole) else {
-            return nil
-        }
-
-        let text = cleanText(extractText(from: payload["content"]))
-        guard !text.isEmpty else { return nil }
-
-        return ConversationMessage(
-            id: "response-\(lineIndex)",
-            role: rawRole == "user" ? "用户" : "助手",
-            phase: payload["phase"] as? String,
-            timestamp: parseTimestamp(object["timestamp"] as? String),
-            text: text
-        )
-    }
-
-    private static func jsonObject(from line: Substring) -> [String: Any]? {
-        let lineData = Data(line.utf8)
-        return try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
-    }
-
-    private static func extractText(from value: Any?) -> String {
-        if let text = value as? String {
-            return text
-        }
-
-        if let parts = value as? [Any] {
-            return parts
-                .map { extractText(from: $0) }
-                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                .joined(separator: "\n")
-        }
-
-        if let object = value as? [String: Any] {
-            for key in ["text", "message", "content", "input", "output"] {
-                let text = extractText(from: object[key])
-                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return text
-                }
-            }
-        }
-
-        return ""
-    }
-
-    private static func cleanText(_ text: String) -> String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func parseTimestamp(_ value: String?) -> Date? {
-        guard let value else { return nil }
-
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) {
-            return date
-        }
-
-        return ISO8601DateFormatter().date(from: value)
-    }
-}
-
 @main
 struct CodexSessionVaultApp: App {
     @NSApplicationDelegateAdaptor(AppTerminationDelegate.self) private var appDelegate
@@ -4717,7 +4479,10 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.18), value: model.isBusy)
-        .sheet(isPresented: $model.isConversationViewerPresented) {
+        .sheet(
+            isPresented: $model.isConversationViewerPresented,
+            onDismiss: { model.dismissConversationViewer() }
+        ) {
             if let session = model.conversationViewerSession {
                 ConversationViewer(session: session, messages: model.conversationMessages)
                     .environmentObject(model)

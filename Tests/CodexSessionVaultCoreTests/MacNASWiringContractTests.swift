@@ -172,6 +172,21 @@ struct MacNASWiringContractTests {
         #expect(protection.contains("copyRolloutFiles(") == false)
     }
 
+    @Test
+    func conversationViewerRevalidatesTheSessionFileAndReleasesMessagesWhenDismissed() throws {
+        let source = try macAppSource()
+        let open = try modelFunctionSource("openConversationViewer(for session: CodexSession)", in: source)
+
+        #expect(open.contains("TrustedSessionFileResolver.resolve("))
+        #expect(open.contains("ConversationLogParser.loadMessages(from: trusted)"))
+        #expect(open.contains("let rolloutPath = session.rolloutPath") == false)
+        #expect(source.contains("func dismissConversationViewer()"))
+        let dismiss = try modelFunctionSource("dismissConversationViewer()", in: source)
+        #expect(dismiss.contains("conversationLoadTask?.cancel()"))
+        #expect(dismiss.contains("conversationMessages.removeAll(keepingCapacity: false)"))
+        #expect(source.contains("onDismiss: { model.dismissConversationViewer() }"))
+    }
+
     private func macAppSource() throws -> String {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         return try String(
