@@ -110,3 +110,27 @@ test('main process persists onboarding through existing state and status channel
   assert.ok(activation.includes('reconcileOnboarding(nasSetupState())'));
   assert.equal(source.includes("handleTrustedIpc('set-onboarding"), false);
 });
+
+test('renderer loads guidance before app code and exposes help controls', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../src/index.html'), 'utf8');
+  const renderer = fs.readFileSync(path.join(__dirname, '../src/renderer.js'), 'utf8');
+  const activationStart = renderer.indexOf('async function activateNasBackup()');
+  const activationEnd = renderer.indexOf('async function retryNasBackup()', activationStart);
+  const activation = renderer.slice(activationStart, activationEnd);
+
+  assert.ok(html.indexOf('./user-guidance.js') >= 0);
+  assert.ok(html.indexOf('./user-guidance.js') < html.indexOf('./renderer.js'));
+  assert.match(html, /id="employeeHelpBtn"/);
+  assert.match(html, /id="employeeHelpModal"/);
+  assert.match(html, /连接公司 NAS/);
+  assert.match(html, /选择部门和姓名/);
+  assert.match(html, /完成首次备份/);
+  assert.match(html, /<details id="nasSetupError"/);
+  assert.match(renderer, /EmployeeGuidance\.onboardingDecision/);
+  assert.match(renderer, /function renderEmployeeHelp\(\)/);
+  assert.match(renderer, /const visible = decision\.presentSetup \|\| state\.nasReconfiguring/);
+  assert.match(renderer, /state\.nasReconfiguring\s*\?\s*validDepartment && validEmployee/);
+  assert.ok(activation.indexOf('onboardingInProgress: true') >= 0);
+  assert.ok(activation.indexOf('onboardingInProgress: true')
+    < activation.indexOf('window.codexManager.activateNasBackup('));
+});

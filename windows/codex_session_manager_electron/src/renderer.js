@@ -1,4 +1,5 @@
 const state = {
+  appVersion: '',
   section: 'sessions',
   sessions: [],
   snapshots: [],
@@ -33,7 +34,11 @@ const state = {
   checkedBackupRestoreIds: new Set(),
   selectedBackupRestoreId: null,
   backupRestoreLoading: false,
-  settings: { autoRestoreOnLaunch: false },
+  settings: {
+    autoRestoreOnLaunch: false,
+    onboardingVersion: 0,
+    onboardingInProgress: false,
+  },
   autoRestorePromptedSnapshotId: null,
   sessionPreviewId: null,
   sessionPreviewMessages: [],
@@ -78,14 +83,27 @@ const els = {
   retryLaunchAtLoginBtn: $('#retryLaunchAtLoginBtn'),
   openLoginItemSettingsBtn: $('#openLoginItemSettingsBtn'),
   nasSetupModal: $('#nasSetupModal'),
+  nasSetupTitle: $('#nasSetupTitle'),
   nasDetectionBadge: $('#nasDetectionBadge'),
   nasSetupError: $('#nasSetupError'),
+  nasSetupErrorDetail: $('#nasSetupErrorDetail'),
+  nasOnboardingStatus: $('#nasOnboardingStatus'),
+  nasOnboardingDetail: $('#nasOnboardingDetail'),
+  nasOnboardingCounts: $('#nasOnboardingCounts'),
   nasDepartment: $('#nasDepartment'),
   nasEmployee: $('#nasEmployee'),
   nasTargetPreview: $('#nasTargetPreview'),
   nasRetryBtn: $('#nasRetryBtn'),
   nasConfirmBtn: $('#nasConfirmBtn'),
   nasCancelReconfigureBtn: $('#nasCancelReconfigureBtn'),
+  employeeHelpBtn: $('#employeeHelpBtn'),
+  employeeHelpModal: $('#employeeHelpModal'),
+  employeeHelpVersion: $('#employeeHelpVersion'),
+  employeeHelpTopics: $('#employeeHelpTopics'),
+  employeeHelpCloseBtn: $('#employeeHelpCloseBtn'),
+  employeeHelpRetryBtn: $('#employeeHelpRetryBtn'),
+  employeeHelpReconfigureBtn: $('#employeeHelpReconfigureBtn'),
+  employeeHelpRecoveryBtn: $('#employeeHelpRecoveryBtn'),
   openDirsMenu: $('#openDirsMenu'),
   contextMenu: $('#contextMenu'),
   toast: $('#toast'),
@@ -397,40 +415,116 @@ function replaceSelectOptions(select, values, placeholder, selectedValue = '') {
   select.value = values.includes(selectedValue) ? selectedValue : '';
 }
 
-function renderNasSetup() {
+function effectiveNasSetup() {
   const setup = state.nasSetup || {};
-  const visible = !setup.configured || state.nasReconfiguring;
-  els.nasSetupModal.classList.toggle('hidden', !visible);
-  els.nasCancelReconfigureBtn.classList.toggle('hidden', !setup.configured || !state.nasReconfiguring);
+  const backupState = state.backupStatus?.status;
+  let runtimeState = backupState && backupState !== 'waiting'
+    ? backupState
+    : setup.state || 'unconfigured';
+  if (state.nasUiError) runtimeState = state.nasDetected ? 'error' : 'disconnected';
+  return {
+    ...setup,
+    state: runtimeState,
+    progress: state.backupStatus?.progress || setup.progress || null,
+  };
+}
 
-  const detectionText = state.nasCatalogLoading
-    ? '正在检测'
-    : state.nasDetected
-      ? '已连接'
-      : setup.state === 'disconnected'
-        ? '未连接'
-        : '等待检测';
-  els.nasDetectionBadge.textContent = detectionText;
-  els.nasDetectionBadge.className = `nas-detection-badge ${state.nasDetected ? 'connected' : ''}`;
-  els.nasSetupError.textContent = state.nasUiError || setup.lastError || '';
-  els.nasSetupError.classList.toggle('hidden', !els.nasSetupError.textContent);
-
+function renderNasSetup() {
+  const setup = effectiveNasSetup();
   const department = els.nasDepartment.value;
   const employee = els.nasEmployee.value;
   const validDepartment = state.nasDepartments.includes(department);
   const validEmployee = state.nasEmployees.includes(employee);
-  els.nasDepartment.disabled = state.nasCatalogLoading || !state.nasDetected;
-  els.nasEmployee.disabled = state.nasCatalogLoading || !validDepartment;
-  els.nasConfirmBtn.disabled = state.nasCatalogLoading || !validDepartment || !validEmployee;
-  els.nasRetryBtn.disabled = state.nasCatalogLoading;
+  const decision = window.EmployeeGuidance.onboardingDecision({
+    setup,
+    settings: state.settings,
+    catalogReady: state.nasDetected,
+    selectionValid: validDepartment && validEmployee,
+  });
+  const visible = decision.presentSetup || state.nasReconfiguring;
+  const busy = ['validating', 'seeding', 'verifying'].includes(setup.state);
+  els.nasSetupModal.classList.toggle('hidden', !visible);
+  els.nasSetupTitle.textContent = state.nasReconfiguring
+    ? '更换 NAS 备份身份'
+    : '配置公司 NAS 会话备份';
+  els.nasCancelReconfigureBtn.classList.toggle('hidden', !setup.configured || !state.nasReconfiguring);
+
+  document.querySelectorAll('[data-onboarding-step]').forEach((element) => {
+    const step = Number(element.dataset.onboardingStep);
+    element.classList.toggle('active', step === decision.step);
+    element.classList.toggle('complete', step < decision.step);
+  });
+
+  const guidance = window.EmployeeGuidance.stateGuidance(setup.state);
+  els.nasOnboardingStatus.textContent = guidance.title;
+  els.nasOnboardingDetail.textContent = guidance.detail;
+  const progress = setup.progress || {};
+  const total = Number(progress.totalFiles || 0);
+  const completed = Number(progress.completedFiles || 0);
+  const pending = Number(progress.pendingFiles || 0);
+  els.nasOnboardingCounts.textContent = total > 0
+    ? `已发现 ${total} · 已完成 ${completed} · 待处理 ${pending}`
+    : '';
+
+  let detectionText = '等待检测';
+  if (state.nasCatalogLoading) detectionText = '正在检测';
+  else if (state.nasDetected) detectionText = '已连接';
+  else if (state.nasUiError || setup.state === 'disconnected') detectionText = '未连接';
+  els.nasDetectionBadge.textContent = detectionText;
+  els.nasDetectionBadge.className = `nas-detection-badge ${state.nasDetected ? 'connected' : ''}`;
+  const diagnostic = state.nasUiError || setup.lastError || state.backupStatus?.lastError || '';
+  els.nasSetupErrorDetail.textContent = diagnostic;
+  els.nasSetupError.classList.toggle('hidden', !diagnostic);
+  if (!diagnostic) els.nasSetupError.open = false;
+
+  els.nasDepartment.disabled = state.nasCatalogLoading || busy || !state.nasDetected;
+  els.nasEmployee.disabled = state.nasCatalogLoading || busy || !validDepartment;
+  const canActivate = state.nasReconfiguring
+    ? validDepartment && validEmployee
+    : decision.canActivate;
+  els.nasConfirmBtn.disabled = state.nasCatalogLoading || busy || !canActivate;
+  els.nasRetryBtn.disabled = state.nasCatalogLoading || busy;
   els.nasRetryBtn.textContent = state.nasCatalogLoading
     ? '正在检测...'
     : state.nasDetected
       ? '重新检测'
       : '检测公司 NAS';
   els.nasTargetPreview.textContent = validDepartment && validEmployee
-    ? `192.168.10.99 / 文件中转站 / codex会话备份 / ${department} / ${employee}`
+    ? `公司 NAS / ${department} / ${employee}`
     : '请选择部门和姓名';
+}
+
+function mergeOnboardingSettings(backupStatus) {
+  state.settings = {
+    ...state.settings,
+    onboardingVersion: Number(backupStatus?.onboardingVersion || 0),
+    onboardingInProgress: Boolean(backupStatus?.onboardingInProgress),
+  };
+}
+
+function renderEmployeeHelp() {
+  els.employeeHelpVersion.textContent = `版本 ${state.appVersion || '未知'}`;
+  els.employeeHelpTopics.replaceChildren();
+  for (const topic of window.EmployeeGuidance.helpTopics) {
+    const section = document.createElement('section');
+    const title = document.createElement('h3');
+    const body = document.createElement('p');
+    title.textContent = topic.title;
+    body.textContent = topic.body;
+    section.append(title, body);
+    els.employeeHelpTopics.append(section);
+  }
+}
+
+function openEmployeeHelp() {
+  renderEmployeeHelp();
+  els.employeeHelpModal.classList.remove('hidden');
+  els.employeeHelpCloseBtn.focus();
+}
+
+function closeEmployeeHelp() {
+  els.employeeHelpModal.classList.add('hidden');
+  els.employeeHelpBtn.focus();
 }
 
 async function loadNasEmployees(department, preferredEmployee = '') {
@@ -501,12 +595,16 @@ async function activateNasBackup() {
 
   state.nasCatalogLoading = true;
   state.nasUiError = '';
+  if (!previous.configured) {
+    state.settings = { ...state.settings, onboardingInProgress: true };
+  }
   els.nasConfirmBtn.textContent = '正在验证并启动...';
   renderNasSetup();
   try {
     state.nasSetup = await window.codexManager.activateNasBackup(department, employee);
     state.nasReconfiguring = false;
     state.backupStatus = await window.codexManager.loadBackupStatus() || {};
+    mergeOnboardingSettings(state.backupStatus);
     renderAll();
     await loadNasRecoveryDevices();
     showToast(`公司 NAS 会话备份已配置：${department} / ${employee}`);
@@ -527,6 +625,8 @@ async function retryNasBackup() {
   try {
     state.nasSetup = await window.codexManager.retryNasBackup();
     state.backupStatus = await window.codexManager.loadBackupStatus() || {};
+    state.nasUiError = '';
+    mergeOnboardingSettings(state.backupStatus);
     renderAll();
     showToast('公司 NAS 已重新连接');
   } catch (error) {
@@ -1235,6 +1335,7 @@ async function refresh(options = {}) {
   try {
     showToast('正在刷新...');
     const data = await window.codexManager.loadState();
+    state.appVersion = data.appVersion || state.appVersion;
     state.sessions = data.sessions || [];
     state.snapshots = data.snapshots || [];
     state.currentState = data.currentState || {};
@@ -1265,7 +1366,9 @@ async function refreshBackupStatusOnly() {
   backupStatusRefreshInFlight = true;
 
   try {
-    state.backupStatus = await window.codexManager.loadBackupStatus() || {};
+    const backupStatus = await window.codexManager.loadBackupStatus() || {};
+    state.backupStatus = backupStatus;
+    mergeOnboardingSettings(backupStatus);
     renderBackupStatus();
   } catch {
     // Lightweight polling should not interrupt the main UI or show a toast.
@@ -1687,6 +1790,26 @@ els.contextMenu.addEventListener('click', (event) => {
 });
 
 $('#refreshBtn').addEventListener('click', refresh);
+els.employeeHelpBtn.addEventListener('click', openEmployeeHelp);
+els.employeeHelpCloseBtn.addEventListener('click', closeEmployeeHelp);
+els.employeeHelpRetryBtn.addEventListener('click', () => { void retryNasBackup(); });
+els.employeeHelpReconfigureBtn.addEventListener('click', () => {
+  closeEmployeeHelp();
+  void beginNasSetup(true);
+});
+els.employeeHelpRecoveryBtn.addEventListener('click', () => {
+  closeEmployeeHelp();
+  setSection('snapshots');
+});
+els.employeeHelpModal.addEventListener('click', (event) => {
+  if (event.target === els.employeeHelpModal) closeEmployeeHelp();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !els.employeeHelpModal.classList.contains('hidden')) {
+    event.preventDefault();
+    closeEmployeeHelp();
+  }
+});
 $('#openDirsBtn').addEventListener('click', (event) => {
   event.stopPropagation();
   els.openDirsMenu.classList.toggle('hidden');

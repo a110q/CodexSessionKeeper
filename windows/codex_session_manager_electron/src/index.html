@@ -67,6 +67,7 @@
           </div>
         </div>
         <div class="top-actions">
+          <button id="employeeHelpBtn" class="ghost-button" type="button" aria-haspopup="dialog" aria-controls="employeeHelpModal">使用帮助</button>
           <button id="refreshBtn" class="ghost-button">刷新</button>
           <div class="open-dir-wrap">
             <button id="openDirsBtn" class="ghost-button">打开目录</button>
@@ -182,6 +183,12 @@
       <h2 id="nasSetupTitle">配置公司 NAS 会话备份</h2>
       <p class="nas-setup-intro">软件会根据部门和姓名识别固定目录，不需要在资源管理器中选择路径。</p>
 
+      <ol class="employee-onboarding-steps" aria-label="首次使用步骤">
+        <li data-onboarding-step="1">连接公司 NAS</li>
+        <li data-onboarding-step="2">选择部门和姓名</li>
+        <li data-onboarding-step="3">完成首次备份</li>
+      </ol>
+
       <div class="nas-endpoint-card">
         <span class="nas-endpoint-icon">NAS</span>
         <div>
@@ -191,7 +198,25 @@
         <span id="nasDetectionBadge" class="nas-detection-badge">等待检测</span>
       </div>
 
-      <div id="nasSetupError" class="nas-setup-error hidden"></div>
+      <section id="nasOnboardingProgress" class="nas-onboarding-progress" aria-live="polite">
+        <strong id="nasOnboardingStatus">等待检测</strong>
+        <p id="nasOnboardingDetail">请先连接公司 NAS。</p>
+        <span id="nasOnboardingCounts"></span>
+      </section>
+
+      <details class="nas-connect-help">
+        <summary>如何连接 NAS</summary>
+        <ol>
+          <li>打开文件资源管理器，在地址栏输入 \\192.168.10.99\文件中转站。</li>
+          <li>确认共享盘能够正常打开。</li>
+          <li>返回本软件，点击“重新检测 NAS”。</li>
+        </ol>
+      </details>
+
+      <details id="nasSetupError" class="nas-setup-error hidden">
+        <summary>查看错误详情</summary>
+        <pre id="nasSetupErrorDetail"></pre>
+      </details>
       <div class="nas-setup-fields">
         <label>
           <span>部门</span>
@@ -239,7 +264,26 @@
     </div>
   </div>
 
+  <div id="employeeHelpModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="employeeHelpTitle">
+    <section class="employee-help-panel">
+      <header class="employee-help-header">
+        <div>
+          <h2 id="employeeHelpTitle">使用帮助</h2>
+          <p id="employeeHelpVersion"></p>
+        </div>
+        <button id="employeeHelpCloseBtn" class="ghost-button" type="button" aria-label="关闭使用帮助">关闭</button>
+      </header>
+      <div id="employeeHelpTopics" class="employee-help-topics"></div>
+      <footer class="employee-help-actions">
+        <button id="employeeHelpRetryBtn" class="ghost-button" type="button">重新检测 NAS</button>
+        <button id="employeeHelpReconfigureBtn" class="ghost-button" type="button">重新配置部门和姓名</button>
+        <button id="employeeHelpRecoveryBtn" class="primary-button" type="button">打开恢复页面</button>
+      </footer>
+    </section>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
+  <script src="./user-guidance.js"></script>
   <script src="./renderer.js"></script>
 </body>
 </html>
