@@ -10,16 +10,20 @@ const test = require('node:test');
 const { createNasRuntime } = require('../../src/backup/nas-runtime');
 const { createSettingsStore } = require('../../src/settings');
 
-test('settings store atomically preserves auto restore while patching NAS identity', async (t) => {
+test('settings store atomically preserves all preferences across sequential patches', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'nas-settings-test-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const store = createSettingsStore({ filePath: path.join(root, 'settings.json'), fs, pathImpl: path });
 
   store.savePatch({ autoRestoreOnLaunch: true });
+  store.savePatch({ onboardingInProgress: true });
   store.savePatch({ nasBackup: { department: '运营部', employee: '陈超' } });
+  store.savePatch({ onboardingVersion: 1, onboardingInProgress: false });
 
   assert.equal(store.load().autoRestoreOnLaunch, true);
   assert.equal(store.load().nasBackup.employee, '陈超');
+  assert.equal(store.load().onboardingVersion, 1);
+  assert.equal(store.load().onboardingInProgress, false);
   assert.deepEqual(await fsp.readdir(root), ['settings.json']);
 });
 
@@ -30,7 +34,12 @@ test('settings store fails safely to defaults when the existing file is malforme
   await fsp.writeFile(filePath, '{broken');
   const store = createSettingsStore({ filePath, fs, pathImpl: path });
 
-  assert.deepEqual(store.load(), { autoRestoreOnLaunch: false, nasBackup: null });
+  assert.deepEqual(store.load(), {
+    autoRestoreOnLaunch: false,
+    nasBackup: null,
+    onboardingVersion: 0,
+    onboardingInProgress: false,
+  });
   store.savePatch({ autoRestoreOnLaunch: true });
   assert.equal(store.load().autoRestoreOnLaunch, true);
 });

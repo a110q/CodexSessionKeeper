@@ -15,6 +15,10 @@ const { createNasRuntime } = require('./backup/nas-runtime');
 const { createNasService } = require('./backup/nas-service');
 const { createSettingsStore } = require('./settings');
 const {
+  CURRENT_ONBOARDING_VERSION,
+  onboardingDecision,
+} = require('./user-guidance');
+const {
   ensureRecoveredThreadsInStateDatabase,
   extractRecoveredThreadMetadata,
 } = require('./backup/recovered-thread-index');
@@ -370,7 +374,12 @@ function exists(targetPath) {
 }
 
 function loadSettings() {
-  const defaults = { autoRestoreOnLaunch: false, nasBackup: null };
+  const defaults = {
+    autoRestoreOnLaunch: false,
+    nasBackup: null,
+    onboardingVersion: 0,
+    onboardingInProgress: false,
+  };
   try {
     const settings = { ...defaults, ...settingsStore.load() };
     if (!settings.autoRestoreDefaultOffMigrationV1) {
@@ -389,6 +398,29 @@ function saveSettings(nextSettings) {
   return loadSettings();
 }
 
+function reconcileOnboarding(setup) {
+  const settings = loadSettings();
+  const decision = onboardingDecision({
+    setup,
+    settings,
+    catalogReady: false,
+    selectionValid: false,
+  });
+  const storedVersion = Number(settings.onboardingVersion || 0);
+  const nextVersion = decision.shouldMarkComplete
+    ? CURRENT_ONBOARDING_VERSION
+    : storedVersion;
+  const inProgress = Boolean(settings.onboardingInProgress);
+
+  if (nextVersion !== storedVersion || decision.nextInProgress !== inProgress) {
+    return saveSettings({
+      onboardingVersion: nextVersion,
+      onboardingInProgress: decision.nextInProgress,
+    });
+  }
+  return settings;
+}
+
 function readText(targetPath) {
   return exists(targetPath) ? fs.readFileSync(targetPath, 'utf8') : '';
 }
@@ -399,6 +431,17 @@ function readBackupStatus() {
     ...nasRuntime.backupStatus(),
     autoStartEnabled: launchAtLogin.enabled,
     launchAtLogin,
+  };
+}
+
+function backupStatusWithOnboarding(
+  setup = nasSetupState(),
+  settings = reconcileOnboarding(setup)
+) {
+  return {
+    ...readBackupStatus(),
+    onboardingVersion: Number(settings.onboardingVersion || 0),
+    onboardingInProgress: Boolean(settings.onboardingInProgress),
   };
 }
 
@@ -1648,13 +1691,16 @@ async function loadState() {
   ensureDir(snapshotRoot);
   const sessions = await loadSessions();
   const snapshots = loadSnapshots();
+  const nasSetup = nasSetupState();
+  const settings = reconcileOnboarding(nasSetup);
   return {
+    appVersion,
     currentState: inspectCurrentState(),
     sessions,
     snapshots,
-    settings: loadSettings(),
-    nasSetup: nasSetupState(),
-    backupStatus: readBackupStatus(),
+    settings,
+    nasSetup,
+    backupStatus: backupStatusWithOnboarding(nasSetup, settings),
     autoRestoreSuggestion: await autoRestoreSuggestion(sessions, snapshots)
   };
 }
@@ -1726,7 +1772,7 @@ async function deleteSessionArtifacts(plan) {
 
 handleTrustedIpc('load-state', async () => loadState());
 
-handleTrustedIpc('load-backup-status', async () => readBackupStatus());
+handleTrustedIpc('load-backup-status', async () => backupStatusWithOnboarding());
 
 handleTrustedIpc('get-nas-setup-state', async () => nasSetupState());
 
@@ -1745,7 +1791,10 @@ handleTrustedIpc('list-nas-departments', async () => nasService.departments());
 handleTrustedIpc('list-nas-employees', async (_event, department) => nasService.employees(String(department || '')));
 
 handleTrustedIpc('activate-nas-backup', async (_event, department, employee) => {
+  const settings = loadSettings();
+  if (!settings.nasBackup) saveSettings({ onboardingInProgress: true });
   await nasRuntime.activate({ department: String(department || ''), employee: String(employee || '') });
+  reconcileOnboarding(nasSetupState());
   ensureLaunchAtLoginEnabled();
   updateTrayMenu();
   return nasSetupState();

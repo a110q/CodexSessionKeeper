@@ -5,7 +5,12 @@ const pathDefault = require('node:path');
 
 function createSettingsStore({ filePath, fs = fsDefault, pathImpl = pathDefault }) {
   if (!filePath) throw new Error('settings filePath is required');
-  const defaults = Object.freeze({ autoRestoreOnLaunch: false, nasBackup: null });
+  const defaults = Object.freeze({
+    autoRestoreOnLaunch: false,
+    nasBackup: null,
+    onboardingVersion: 0,
+    onboardingInProgress: false,
+  });
 
   function load() {
     if (!fs.existsSync(filePath)) return { ...defaults };
