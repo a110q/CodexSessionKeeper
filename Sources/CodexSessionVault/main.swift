@@ -386,8 +386,19 @@ final class VaultModel: ObservableObject {
     @Published var nasRecoverySources: [NASRecoverySource] = []
     @Published var selectedNASRecoverySourceID: UUID?
     @Published var isNASSetupPresented = false
+    @Published var isEmployeeHelpPresented = false
+    @Published private(set) var isNASCatalogReady = false
+    @Published private(set) var onboardingDecision = EmployeeOnboardingPolicy.evaluate(
+        snapshot: .unconfigured,
+        storedVersion: 0,
+        inProgress: false,
+        catalogReady: false,
+        selectionValid: false
+    )
 
     private static let nasStatusRefreshInterval: UInt64 = 2_000_000_000
+    private static let onboardingVersionKey = "employeeOnboardingVersion"
+    private static let onboardingInProgressKey = "employeeOnboardingInProgress"
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
@@ -400,6 +411,7 @@ final class VaultModel: ObservableObject {
     private var nasConfigurationService: NASConfigurationService!
     private let launchAtLoginController: MacLaunchAtLoginController
     private var nasStatusTask: Task<Void, Never>?
+    private var isNASReconfigurationPresented = false
     private var currentCancellationURL: URL?
     fileprivate var operationCancellationURL: URL?
     private let vaultPreparationFailure: String?
@@ -422,6 +434,18 @@ final class VaultModel: ObservableObject {
             .appendingPathComponent("recovered_attachments", isDirectory: true)
             .appendingPathComponent(snapshotURL.lastPathComponent, isDirectory: true)
     }
+
+    var nasSelectionIsValid: Bool {
+        nasDepartments.contains { $0.name == selectedNASDepartment }
+            && nasEmployees.contains { $0.name == selectedNASEmployee }
+    }
+
+    var canActivateSelectedNASIdentity: Bool {
+        isNASReconfigurationPresented ? nasSelectionIsValid : onboardingDecision.canActivate
+    }
+
+    var displayAppVersion: String { appVersion }
+    var isManualNASReconfiguration: Bool { isNASReconfigurationPresented }
 
     init(codexRoot explicitCodexRoot: String? = nil, vaultRoot explicitVaultRoot: String? = nil, refreshOnInit: Bool = true) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -655,6 +679,7 @@ final class VaultModel: ObservableObject {
 
     private func syncNASSetupSnapshot() {
         nasSetupSnapshot = nasRuntime.setupSnapshot()
+        reconcileEmployeeOnboarding()
         guard nasSetupSnapshot.configuration != nil else { return }
         let next = launchAtLoginController.currentState()
         if next != launchAtLoginSnapshot {
@@ -662,10 +687,47 @@ final class VaultModel: ObservableObject {
         }
     }
 
+    func reconcileEmployeeOnboarding() {
+        let defaults = UserDefaults.standard
+        let storedVersion = defaults.integer(forKey: Self.onboardingVersionKey)
+        let inProgress = defaults.bool(forKey: Self.onboardingInProgressKey)
+        let decision = EmployeeOnboardingPolicy.evaluate(
+            snapshot: nasSetupSnapshot,
+            storedVersion: storedVersion,
+            inProgress: inProgress,
+            catalogReady: isNASCatalogReady,
+            selectionValid: nasSelectionIsValid
+        )
+
+        if decision.nextInProgress != inProgress {
+            defaults.set(decision.nextInProgress, forKey: Self.onboardingInProgressKey)
+        }
+        if decision.shouldMarkComplete,
+           storedVersion < EmployeeOnboardingPolicy.currentVersion {
+            defaults.set(EmployeeOnboardingPolicy.currentVersion, forKey: Self.onboardingVersionKey)
+        }
+
+        onboardingDecision = decision
+        if decision.presentSetup {
+            isNASSetupPresented = true
+        } else if !isNASReconfigurationPresented {
+            isNASSetupPresented = false
+        }
+    }
+
+    func dismissNASSetup() {
+        guard !onboardingDecision.preventDismissal || isNASReconfigurationPresented else { return }
+        isNASReconfigurationPresented = false
+        isNASSetupPresented = false
+    }
+
     func refreshNASCatalog() {
+        isNASCatalogReady = false
+        reconcileEmployeeOnboarding()
         do {
             let departments = try nasConfigurationService.departments()
             nasDepartments = departments
+            isNASCatalogReady = true
             if !departments.contains(where: { $0.name == selectedNASDepartment }) {
                 let savedDepartment: String? = nasSetupSnapshot.configuration?.department
                 selectedNASDepartment = savedDepartment
@@ -680,11 +742,14 @@ final class VaultModel: ObservableObject {
             nasEmployees = []
             selectedNASDepartment = ""
             selectedNASEmployee = ""
+            isNASCatalogReady = false
             lastError = "检测公司 NAS 失败：\(error.localizedDescription)"
+            reconcileEmployeeOnboarding()
         }
     }
 
     func loadNASEmployees() {
+        defer { reconcileEmployeeOnboarding() }
         guard !selectedNASDepartment.isEmpty else {
             nasEmployees = []
             selectedNASEmployee = ""
@@ -700,6 +765,7 @@ final class VaultModel: ObservableObject {
                     ?? employees.first?.name
                     ?? ""
             }
+            lastError = nil
         } catch {
             nasEmployees = []
             selectedNASEmployee = ""
@@ -729,6 +795,11 @@ final class VaultModel: ObservableObject {
             alert.addButton(withTitle: "取消")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
+        let wasManualReconfiguration = isNASReconfigurationPresented
+        if nasSetupSnapshot.configuration == nil {
+            UserDefaults.standard.set(true, forKey: Self.onboardingInProgressKey)
+            reconcileEmployeeOnboarding()
+        }
         do {
             _ = try nasRuntime.activate(
                 department: selectedNASDepartment,
@@ -737,7 +808,10 @@ final class VaultModel: ObservableObject {
             syncNASSetupSnapshot()
             ensureLaunchAtLoginEnabled()
             refreshNASRecoverySources()
-            isNASSetupPresented = false
+            if wasManualReconfiguration {
+                isNASReconfigurationPresented = false
+                isNASSetupPresented = false
+            }
             lastError = nil
         } catch {
             syncNASSetupSnapshot()
@@ -779,8 +853,26 @@ final class VaultModel: ObservableObject {
     func presentNASReconfiguration() {
         selectedNASDepartment = nasSetupSnapshot.configuration?.department ?? ""
         selectedNASEmployee = nasSetupSnapshot.configuration?.employee ?? ""
+        isNASReconfigurationPresented = true
         isNASSetupPresented = true
         refreshNASCatalog()
+    }
+
+    func showEmployeeHelp() {
+        isEmployeeHelpPresented = true
+    }
+
+    func openRecoveryFromHelp() {
+        isEmployeeHelpPresented = false
+        selectedSection = .snapshots
+    }
+
+    func reconfigureFromHelp() {
+        isEmployeeHelpPresented = false
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            self?.presentNASReconfiguration()
+        }
     }
 
     func stopNASBackup() {
@@ -4446,6 +4538,11 @@ struct ContentView: View {
         .toolbar {
             ToolbarItemGroup {
                 Button {
+                    model.showEmployeeHelp()
+                } label: {
+                    Label("使用帮助", systemImage: "questionmark.circle")
+                }
+                Button {
                     model.refresh()
                 } label: {
                     Label("刷新", systemImage: "arrow.clockwise")
@@ -4493,7 +4590,19 @@ struct ContentView: View {
         .sheet(isPresented: $model.isNASSetupPresented) {
             NASSetupView()
                 .environmentObject(model)
-                .interactiveDismissDisabled(model.nasSetupSnapshot.state == .unconfigured)
+                .interactiveDismissDisabled(
+                    model.onboardingDecision.preventDismissal
+                        && !model.isManualNASReconfiguration
+                )
+        }
+        .sheet(isPresented: $model.isEmployeeHelpPresented) {
+            EmployeeHelpView(
+                version: model.displayAppVersion,
+                retryNAS: { model.retryNASBackup() },
+                reconfigure: { model.reconfigureFromHelp() },
+                openRecovery: { model.openRecoveryFromHelp() }
+            )
+            .frame(minWidth: 620, minHeight: 520)
         }
         .onAppear {
             model.clearSessionSearch()
@@ -4628,42 +4737,55 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
 struct NASSetupView: View {
     @EnvironmentObject private var model: VaultModel
 
-    private var selectionIsValid: Bool {
-        model.nasDepartments.contains { $0.name == model.selectedNASDepartment }
-            && model.nasEmployees.contains { $0.name == model.selectedNASEmployee }
+    private var isBackupBusy: Bool {
+        [.validating, .seeding, .verifying].contains(model.nasSetupSnapshot.state)
+    }
+
+    private var diagnosticDetail: String? {
+        let detail = model.nasSetupSnapshot.lastError ?? model.lastError
+        guard let detail, !detail.isEmpty else { return nil }
+        return detail
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(model.nasSetupSnapshot.configuration == nil ? "检测公司 NAS" : "更换 NAS 备份身份")
+                    Text(model.isManualNASReconfiguration ? "更换 NAS 备份身份" : "配置公司 NAS 备份")
                         .font(.title2.bold())
                     Text("只需选择部门和姓名，软件会验证固定服务器、共享盘和目标目录。")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if model.nasSetupSnapshot.state != .unconfigured {
-                    Button("关闭") { model.isNASSetupPresented = false }
+                if model.isManualNASReconfiguration {
+                    Button("关闭") { model.dismissNASSetup() }
                 }
             }
 
-            if model.nasSetupSnapshot.state == .disconnected {
-                GroupBox("NAS 未连接") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(model.nasSetupSnapshot.lastError ?? "请先在 Finder 中连接 192.168.10.99 的“文件中转站”共享盘。")
-                            .foregroundStyle(.secondary)
-                        Button("立即重试") { model.retryNASBackup() }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            EmployeeOnboardingStepsView(currentStep: model.onboardingDecision.step)
+
+            EmployeeStateCard(snapshot: model.nasSetupSnapshot)
+
+            DisclosureGroup("如何连接 NAS") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("1. 在 Finder 中选择“前往”→“连接服务器”。")
+                    Text("2. 输入 smb://192.168.10.99，并连接“文件中转站”。")
+                    Text("3. 返回本软件，点击“重新检测 NAS”。")
                 }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .padding(.top, 8)
             }
 
-            if let error = model.lastError, !error.isEmpty {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+            if let diagnosticDetail {
+                DisclosureGroup("查看错误详情") {
+                    Text(diagnosticDetail)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 8)
+                }
             }
 
             GroupBox("备份身份") {
@@ -4682,35 +4804,34 @@ struct NASSetupView: View {
                             Text(option.name).tag(option.name)
                         }
                     }
+                    .onChange(of: model.selectedNASEmployee) { _, _ in
+                        model.reconcileEmployeeOnboarding()
+                    }
 
                     LabeledContent("固定目标") {
-                        Text("192.168.10.99 / 文件中转站 / codex会话备份 / \(model.selectedNASDepartment) / \(model.selectedNASEmployee)")
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
+                        Text("公司 NAS / \(model.selectedNASDepartment) / \(model.selectedNASEmployee)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 .padding(.vertical, 6)
-            }
-
-            if model.nasSetupSnapshot.state == .validating || model.nasSetupSnapshot.state == .seeding {
-                VStack(alignment: .leading, spacing: 8) {
-                    ProgressView()
-                    Text(model.nasSetupSnapshot.state == .seeding ? "正在建立初始备份" : "正在验证 NAS 目录和写入能力")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                .disabled(isBackupBusy)
             }
 
             HStack {
-                Button("刷新列表") { model.refreshNASCatalog() }
+                Button("重新检测 NAS") { model.refreshNASCatalog() }
+                    .disabled(isBackupBusy)
+                if [.disconnected, .pending, .error].contains(model.nasSetupSnapshot.state) {
+                    Button("立即重试") { model.retryNASBackup() }
+                }
                 Spacer()
-                Button("验证并启用备份") { model.activateSelectedNASIdentity() }
+                Button("验证并开始备份") { model.activateSelectedNASIdentity() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!selectionIsValid || model.nasSetupSnapshot.state == .validating)
+                    .disabled(!model.canActivateSelectedNASIdentity || isBackupBusy)
             }
         }
         .padding(24)
-        .frame(width: 620)
+        .frame(width: 680)
         .onAppear { model.refreshNASCatalog() }
     }
 }

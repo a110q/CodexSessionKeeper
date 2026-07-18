@@ -37,7 +37,8 @@ let package = Package(
         .executableTarget(
             name: "CodexSessionVault",
             dependencies: ["CodexSessionVaultCore"],
-            path: "Sources/CodexSessionVault"
+            path: "Sources/CodexSessionVault",
+            swiftSettings: [.unsafeFlags(["-parse-as-library"])]
         ),
         .testTarget(
             name: "CodexSessionVaultCoreTests",

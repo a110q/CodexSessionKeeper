@@ -24,9 +24,10 @@ struct MacNASWiringContractTests {
 
         #expect(source.contains("struct NASSetupView: View"))
         #expect(source.contains("检测公司 NAS"))
-        #expect(source.contains("刷新列表"))
+        #expect(source.contains("重新检测 NAS"))
         #expect(source.contains("更换 NAS 备份身份"))
-        #expect(source.contains("interactiveDismissDisabled(model.nasSetupSnapshot.state == .unconfigured)"))
+        #expect(source.contains("model.onboardingDecision.preventDismissal"))
+        #expect(source.contains("!model.isManualNASReconfiguration"))
         #expect(source.contains("fileImporter") == false)
     }
 
@@ -194,6 +195,30 @@ struct MacNASWiringContractTests {
         #expect(source.contains("autoRestoreOnLaunch = AutoRestorePreference.load()"))
         #expect(source.contains("AutoRestorePreference.save(autoRestoreOnLaunch)"))
         #expect(source.contains("UserDefaults.standard.set(false, forKey: Self.autoRestoreDefaultsKey)") == false)
+    }
+
+    @Test
+    func employeeGuidanceUsesRealNASStateAndProvidesOfflineHelp() throws {
+        let source = try macAppSource()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let guidance = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/CodexSessionVault/EmployeeGuidanceViews.swift"
+            ),
+            encoding: .utf8
+        )
+
+        #expect(source.contains("EmployeeOnboardingPolicy.evaluate("))
+        #expect(source.contains("employeeOnboardingVersion"))
+        #expect(source.contains("employeeOnboardingInProgress"))
+        #expect(source.contains("EmployeeHelpView("))
+        #expect(source.contains(".interactiveDismissDisabled("))
+        #expect(source.contains("model.onboardingDecision.preventDismissal"))
+        #expect(source.contains("model.canActivateSelectedNASIdentity"))
+        #expect(guidance.contains("EmployeeGuidanceCatalog.helpTopics"))
+        #expect(guidance.contains("struct EmployeeHelpView: View"))
+        #expect(guidance.contains("连接公司 NAS"))
+        #expect(guidance.contains("完成首次备份"))
     }
 
     private func macAppSource() throws -> String {
