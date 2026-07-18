@@ -187,6 +187,15 @@ struct MacNASWiringContractTests {
         #expect(source.contains("onDismiss: { model.dismissConversationViewer() }"))
     }
 
+    @Test
+    func automaticRecoveryPreferenceMigratesOnceAndPersistsExplicitChoice() throws {
+        let source = try macAppSource()
+
+        #expect(source.contains("autoRestoreOnLaunch = AutoRestorePreference.load()"))
+        #expect(source.contains("AutoRestorePreference.save(autoRestoreOnLaunch)"))
+        #expect(source.contains("UserDefaults.standard.set(false, forKey: Self.autoRestoreDefaultsKey)") == false)
+    }
+
     private func macAppSource() throws -> String {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         return try String(

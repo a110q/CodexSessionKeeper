@@ -362,7 +362,7 @@ final class VaultModel: ObservableObject {
     @Published var conversationViewerError: String?
     @Published var autoRestoreOnLaunch: Bool {
         didSet {
-            UserDefaults.standard.set(autoRestoreOnLaunch, forKey: Self.autoRestoreDefaultsKey)
+            AutoRestorePreference.save(autoRestoreOnLaunch)
             if autoRestoreOnLaunch, oldValue == false {
                 runLaunchAutoRestoreIfNeeded(force: true)
             }
@@ -387,7 +387,6 @@ final class VaultModel: ObservableObject {
     @Published var selectedNASRecoverySourceID: UUID?
     @Published var isNASSetupPresented = false
 
-    private static let autoRestoreDefaultsKey = "autoRestoreOnLaunch"
     private static let nasStatusRefreshInterval: UInt64 = 2_000_000_000
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
@@ -431,8 +430,7 @@ final class VaultModel: ObservableObject {
         let resolvedVaultRoot = explicitVaultRoot ?? "\(home)/.codex-session-vault"
         codexRoot = resolvedCodexRoot
         vaultRoot = resolvedVaultRoot
-        autoRestoreOnLaunch = false
-        UserDefaults.standard.set(false, forKey: Self.autoRestoreDefaultsKey)
+        autoRestoreOnLaunch = AutoRestorePreference.load()
         let vaultURL = URL(fileURLWithPath: resolvedVaultRoot, isDirectory: true)
         do {
             try LocalVaultPermissionHardener().prepareVault(at: vaultURL)
