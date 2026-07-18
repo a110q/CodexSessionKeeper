@@ -1878,7 +1878,7 @@ final class VaultModel: ObservableObject {
         let root = URL(fileURLWithPath: codexRoot, isDirectory: true)
         let database = root.appendingPathComponent("state_5.sqlite")
         if fileManager.fileExists(atPath: database.path),
-           let sessions = try? loadSessionsFromStateDatabase(database: database, dataRoot: root, snapshotCodexRoot: codexRoot),
+           let sessions = try? loadSessionsFromStateDatabase(database: database, dataRoot: root),
            !sessions.isEmpty {
             return sessions
         }
@@ -1894,8 +1894,7 @@ final class VaultModel: ObservableObject {
 
         let databaseSessions = (try? loadSessionsFromStateDatabase(
             database: database,
-            dataRoot: dataURL,
-            snapshotCodexRoot: snapshot.codexRoot
+            dataRoot: dataURL
         )) ?? []
         if !databaseSessions.isEmpty, databaseSessions.allSatisfy(\.existsOnDisk) {
             return databaseSessions
@@ -1906,16 +1905,12 @@ final class VaultModel: ObservableObject {
 
     private func loadSessionsFromStateDatabase(
         database: URL,
-        dataRoot: URL,
-        snapshotCodexRoot: String
+        dataRoot: URL
     ) throws -> [CodexSession] {
-        try loadSessionRows(from: database).map { row in
-            let snapshotFileURL = resolvedRolloutFileURL(
-                sessionID: row.id,
-                rolloutPath: row.rolloutPath,
-                dataRoot: dataRoot,
-                snapshotCodexRoot: snapshotCodexRoot
-            )
+        let trustedRollouts = try TrustedSessionFileResolver.index(under: dataRoot)
+        return try loadSessionRows(from: database).map { row in
+            let normalizedID = SessionJSONLValidator.normalizeSessionID(row.id)
+            let snapshotFileURL = normalizedID.flatMap { trustedRollouts[$0]?.first }
             let exists = snapshotFileURL != nil
             return makeSession(
                 row: row,
@@ -2174,7 +2169,7 @@ final class VaultModel: ObservableObject {
             try checkOperationCancellation()
             let restorableIDs = try sanitizeSnapshotData(dataURL: dataURL, snapshotCodexRoot: codexRoot)
             restorableIDsForAttachments = restorableIDs
-            let counts = snapshotSessionCounts(dataURL: dataURL, sessionIDs: restorableIDs)
+            let counts = try snapshotSessionCounts(dataURL: dataURL, sessionIDs: restorableIDs)
             snapshotSessionCount = counts.active
             snapshotArchivedSessionCount = counts.archived
         }
@@ -2298,7 +2293,7 @@ final class VaultModel: ObservableObject {
             if try copyExternalAttachments(sessionIDs: restorableIDs, from: dataURL) {
                 finalIncludedPaths.insert("external_attachments")
             }
-            let counts = snapshotSessionCounts(dataURL: dataURL, sessionIDs: restorableIDs)
+            let counts = try snapshotSessionCounts(dataURL: dataURL, sessionIDs: restorableIDs)
             let state = inspectCurrentState()
             meta = SnapshotMeta(
                 id: id,
@@ -2723,38 +2718,6 @@ final class VaultModel: ObservableObject {
         )
     }
 
-    private func snapshotRelativePath(for absolutePath: String, snapshotCodexRoot: String) -> String? {
-        guard !absolutePath.isEmpty else { return nil }
-        let normalizedPath = URL(fileURLWithPath: absolutePath).standardizedFileURL.path
-        let snapshotRoot = URL(fileURLWithPath: snapshotCodexRoot, isDirectory: true).standardizedFileURL.path
-        let currentRoot = URL(fileURLWithPath: codexRoot, isDirectory: true).standardizedFileURL.path
-
-        for root in [snapshotRoot, currentRoot] where normalizedPath.hasPrefix(root + "/") {
-            return String(normalizedPath.dropFirst(root.count + 1))
-        }
-
-        if let range = normalizedPath.range(of: "/.codex/") {
-            return String(normalizedPath[range.upperBound...])
-        }
-
-        return nil
-    }
-
-    private func resolvedRolloutFileURL(
-        sessionID: String,
-        rolloutPath: String,
-        dataRoot: URL,
-        snapshotCodexRoot: String
-    ) -> URL? {
-        _ = rolloutPath
-        _ = snapshotCodexRoot
-        return findRolloutFile(sessionID: sessionID, root: dataRoot)
-    }
-
-    private func findRolloutFile(sessionID: String, root: URL) -> URL? {
-        try? TrustedSessionFileResolver.resolve(sessionIDs: [sessionID], under: root).first?.fileURL
-    }
-
     private func relativePath(_ fileURL: URL, under root: URL) -> String? {
         let filePath = fileURL.standardizedFileURL.path
         let rootPath = root.standardizedFileURL.path
@@ -2908,18 +2871,18 @@ final class VaultModel: ObservableObject {
         try runCommand(executable: "/usr/bin/sqlite3", arguments: [database.path, sql])
     }
 
-    private func restorableSessionIDs(from dataURL: URL, snapshotCodexRoot: String) throws -> Set<String> {
+    private func restorableSessionIDs(from dataURL: URL) throws -> Set<String> {
         let database = dataURL.appendingPathComponent("state_5.sqlite")
         guard fileManager.fileExists(atPath: database.path) else { return [] }
 
+        let trustedRollouts = try TrustedSessionFileResolver.index(under: dataURL)
         let rows = try loadSessionRows(from: database)
         let ids = rows.compactMap { row -> String? in
-            resolvedRolloutFileURL(
-                sessionID: row.id,
-                rolloutPath: row.rolloutPath,
-                dataRoot: dataURL,
-                snapshotCodexRoot: snapshotCodexRoot
-            ) == nil ? nil : row.id
+            guard let normalizedID = SessionJSONLValidator.normalizeSessionID(row.id),
+                  trustedRollouts[normalizedID]?.isEmpty == false else {
+                return nil
+            }
+            return row.id
         }
         return Set(ids)
     }
@@ -3318,12 +3281,16 @@ final class VaultModel: ObservableObject {
     private func copyExternalAttachments(sessionIDs: Set<String>, from dataURL: URL) throws -> Bool {
         guard !sessionIDs.isEmpty else { return false }
         try checkOperationCancellation()
+        let trustedRollouts = try TrustedSessionFileResolver.index(under: dataURL)
         var records: [ExternalAttachmentRestoreRecord] = []
         var seen = Set<String>()
 
         for sessionID in sessionIDs {
             try checkOperationCancellation()
-            guard let rolloutURL = findRolloutFile(sessionID: sessionID, root: dataURL) else { continue }
+            guard let normalizedID = SessionJSONLValidator.normalizeSessionID(sessionID),
+                  let rolloutURL = trustedRollouts[normalizedID]?.first else {
+                continue
+            }
             let paths = try localAttachmentPaths(in: rolloutURL)
             for path in paths {
                 try checkOperationCancellation()
@@ -3588,7 +3555,7 @@ final class VaultModel: ObservableObject {
         let database = dataURL.appendingPathComponent("state_5.sqlite")
         guard fileManager.fileExists(atPath: database.path) else { return [] }
 
-        let restorableIDs = try restorableSessionIDs(from: dataURL, snapshotCodexRoot: snapshotCodexRoot)
+        let restorableIDs = try restorableSessionIDs(from: dataURL)
         try checkOperationCancellation()
         try pruneStateDatabase(database: database, sqlite: "/usr/bin/sqlite3", allowedSessionIDs: restorableIDs)
         try checkOperationCancellation()
@@ -3622,9 +3589,11 @@ final class VaultModel: ObservableObject {
         sessionIDs: Set<String>
     ) throws {
         let root = URL(fileURLWithPath: snapshotCodexRoot, isDirectory: true)
+        let trustedRollouts = try TrustedSessionFileResolver.index(under: dataRoot)
         for sessionID in sessionIDs {
             try checkOperationCancellation()
-            guard let rolloutURL = findRolloutFile(sessionID: sessionID, root: dataRoot),
+            guard let normalizedID = SessionJSONLValidator.normalizeSessionID(sessionID),
+                  let rolloutURL = trustedRollouts[normalizedID]?.first,
                   let relPath = relativePath(rolloutURL, under: dataRoot) else {
                 continue
             }
@@ -3639,12 +3608,14 @@ final class VaultModel: ObservableObject {
         }
     }
 
-    private func snapshotSessionCounts(dataURL: URL, sessionIDs: Set<String>) -> (active: Int, archived: Int) {
+    private func snapshotSessionCounts(dataURL: URL, sessionIDs: Set<String>) throws -> (active: Int, archived: Int) {
         var active = 0
         var archived = 0
+        let trustedRollouts = try TrustedSessionFileResolver.index(under: dataURL)
 
         for sessionID in sessionIDs {
-            guard let rolloutURL = findRolloutFile(sessionID: sessionID, root: dataURL),
+            guard let normalizedID = SessionJSONLValidator.normalizeSessionID(sessionID),
+                  let rolloutURL = trustedRollouts[normalizedID]?.first,
                   let relPath = relativePath(rolloutURL, under: dataURL) else {
                 continue
             }

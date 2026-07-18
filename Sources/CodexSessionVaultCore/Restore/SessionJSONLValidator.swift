@@ -259,6 +259,17 @@ public enum TrustedSessionFileResolver {
         }
     }
 
+    public static func index(
+        under codexRoot: URL,
+        fileManager: FileManager = .default
+    ) throws -> [String: [URL]] {
+        var result: [String: [URL]] = [:]
+        for reference in try discover(under: codexRoot, fileManager: fileManager) {
+            result[reference.sessionID, default: []].append(reference.fileURL)
+        }
+        return result
+    }
+
     public static func resolve(
         sessionIDs: Set<String>,
         under codexRoot: URL,
@@ -356,11 +367,13 @@ public enum TrustedSessionFileResolver {
             }
         }
         if line.last == 0x0D { line.removeLast() }
-        guard !line.isEmpty,
-              let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
-            throw untrusted(fileURL, "首条记录不是有效 JSON")
+        return try autoreleasepool {
+            guard !line.isEmpty,
+                  let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+                throw untrusted(fileURL, "首条记录不是有效 JSON")
+            }
+            return try rolloutSessionID(object, fileURL: fileURL)
         }
-        return try rolloutSessionID(object, fileURL: fileURL)
     }
 
     private static func validateRollout(
@@ -464,14 +477,16 @@ enum SessionJSONLScanner {
                     reason: "单行超过 32 MiB"
                 )
             }
-            guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
-                throw SessionJSONLValidationError(
-                    fileURL: fileURL,
-                    lineNumber: lineNumber,
-                    reason: "不是有效 UTF-8 JSON 对象"
-                )
+            try autoreleasepool {
+                guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+                    throw SessionJSONLValidationError(
+                        fileURL: fileURL,
+                        lineNumber: lineNumber,
+                        reason: "不是有效 UTF-8 JSON 对象"
+                    )
+                }
+                try onRecord?(lineNumber, line, object)
             }
-            try onRecord?(lineNumber, line, object)
         }
 
         while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {

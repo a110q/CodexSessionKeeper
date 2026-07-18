@@ -189,6 +189,33 @@ struct MacNASWiringContractTests {
     }
 
     @Test
+    func sessionListBuildsOneTrustedRolloutIndexInsteadOfRescanningForEveryDatabaseRow() throws {
+        let source = try macAppSource()
+        let load = try modelFunctionSource("loadSessionsFromStateDatabase(", in: source)
+
+        #expect(load.contains("TrustedSessionFileResolver.index(under: dataRoot)"))
+        #expect(load.contains("resolvedRolloutFileURL(") == false)
+        #expect(load.components(separatedBy: "TrustedSessionFileResolver.index(").count - 1 == 1)
+    }
+
+    @Test
+    func batchSnapshotHelpersUseOneTrustedIndexInsteadOfPerSessionDirectoryScans() throws {
+        let source = try macAppSource()
+        let signatures = [
+            "restorableSessionIDs(",
+            "copyExternalAttachments(",
+            "repairSnapshotStateDatabaseRolloutPaths(",
+            "snapshotSessionCounts("
+        ]
+
+        for signature in signatures {
+            let function = try modelFunctionSource(signature, in: source)
+            #expect(function.contains("TrustedSessionFileResolver.index(under:"))
+            #expect(function.contains("findRolloutFile(") == false)
+        }
+    }
+
+    @Test
     func automaticRecoveryPreferenceMigratesOnceAndPersistsExplicitChoice() throws {
         let source = try macAppSource()
 

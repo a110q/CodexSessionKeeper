@@ -225,6 +225,33 @@ test('trusted rollout index rejects a symbolic-link trust root', (t) => {
   );
 });
 
+test('trusted rollout index reads each file once for an employee-scale catalog', (t) => {
+  const codexRoot = fixture(t);
+  const sessions = path.join(codexRoot, 'sessions', '2026', '07');
+  const sessionCount = 565;
+  for (let index = 0; index < sessionCount; index += 1) {
+    write(path.join(sessions, `rollout-${index}.jsonl`), [
+      JSON.stringify({ type: 'session_meta', payload: { id: `session-${String(index).padStart(3, '0')}` } }),
+    ]);
+  }
+
+  const originalOpenSync = fs.openSync;
+  let jsonlOpenCount = 0;
+  fs.openSync = (...args) => {
+    if (String(args[0]).endsWith('.jsonl')) jsonlOpenCount += 1;
+    return originalOpenSync(...args);
+  };
+  let index;
+  try {
+    index = indexTrustedSessionFiles({ codexRoot });
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+
+  assert.equal(index.size, sessionCount);
+  assert.equal(jsonlOpenCount, sessionCount);
+});
+
 test('restore plan rejects a symbolic-link destination root', (t) => {
   const parent = fixture(t);
   const sourceRoot = path.join(parent, 'source');
@@ -463,6 +490,35 @@ test('protection snapshots materialize the frozen security plan', () => {
   assert.match(mainSource, /materializeSessionProtectionPlan\(protectionPlan\)/);
   assert.doesNotMatch(mainSource, /copyRolloutFilesForSessions/);
   assert.doesNotMatch(mainSource, /buildSessionDeletionPlan\([^)]*\);\s*\n\s*ensureDir\(snapshotRoot\)/);
+});
+
+test('session lists build one trusted rollout index instead of rescanning for every database row', () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, '../../src/main.js'), 'utf8');
+  const liveStart = mainSource.indexOf('async function loadSessionsFromSqlite(');
+  const snapshotStart = mainSource.indexOf('async function loadSessionsInSnapshot(');
+  const liveEnd = mainSource.indexOf('function safeRelativePath(', liveStart);
+  const liveSource = mainSource.slice(liveStart, liveEnd);
+  const snapshotEnd = mainSource.indexOf('function firstUserMessageFromRollout(', snapshotStart);
+  const snapshotSource = mainSource.slice(snapshotStart, snapshotEnd);
+
+  assert.equal((liveSource.match(/indexTrustedSessionFiles\(/g) || []).length, 1);
+  assert.equal((snapshotSource.match(/indexTrustedSessionFiles\(/g) || []).length, 1);
+  assert.doesNotMatch(liveSource, /resolveRolloutFilePath\(/);
+  assert.doesNotMatch(snapshotSource, /snapshotFilePathForSession\(/);
+});
+
+test('batch snapshot helpers use one trusted index instead of per-session directory scans', () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, '../../src/main.js'), 'utf8');
+  for (const [signature, nextSignature] of [
+    ['function snapshotSessionCounts(', 'function repairSnapshotStateDatabaseRolloutPaths('],
+    ['function repairSnapshotStateDatabaseRolloutPaths(', 'async function sanitizeSnapshotData('],
+  ]) {
+    const start = mainSource.indexOf(signature);
+    const end = mainSource.indexOf(nextSignature, start + signature.length);
+    const functionSource = mainSource.slice(start, end);
+    assert.equal((functionSource.match(/indexTrustedSessionFiles\(/g) || []).length, 1);
+    assert.doesNotMatch(functionSource, /findRolloutFile\(/);
+  }
 });
 
 test('staged rollout content must still match the frozen source digest', (t) => {

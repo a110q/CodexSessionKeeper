@@ -612,8 +612,10 @@ async function loadSessionsFromSqlite(root = codexRoot) {
       FROM threads
       ORDER BY updated_at DESC, created_at DESC;
     `);
+    const trustedIndex = indexTrustedSessionFiles({ codexRoot: root });
     return rows.map((row) => {
-      const resolvedPath = resolveRolloutFilePath(String(row.id || ''), '', root, codexRoot);
+      const sessionId = normalizeSessionId(String(row.id || ''));
+      const resolvedPath = trustedIndex.get(sessionId)?.[0] || '';
       const fileExists = exists(resolvedPath);
       return makeSession(row, fileExists, fileExists ? fileSize(resolvedPath) : 0, resolvedPath);
     });
@@ -631,22 +633,6 @@ function safeRelativePath(fromRoot, targetPath) {
   return relative;
 }
 
-function snapshotRelativePath(absolutePath, snapshotCodexRoot) {
-  if (!absolutePath) return null;
-  const roots = [snapshotCodexRoot, codexRoot].filter(Boolean);
-  for (const root of roots) {
-    const relative = safeRelativePath(root, absolutePath);
-    if (relative) return relative;
-  }
-
-  const slashPath = String(absolutePath).replace(/\\/g, '/');
-  const markerIndex = slashPath.toLowerCase().indexOf('/.codex/');
-  if (markerIndex >= 0) {
-    return slashPath.slice(markerIndex + '/.codex/'.length).split('/').join(path.sep);
-  }
-  return null;
-}
-
 function findRolloutFile(root, sessionId) {
   if (!root || !sessionId) return '';
   try {
@@ -654,16 +640,6 @@ function findRolloutFile(root, sessionId) {
   } catch {
     return '';
   }
-}
-
-function resolveRolloutFilePath(sessionId, rolloutPath, dataRoot, snapshotCodexRoot) {
-  void rolloutPath;
-  void snapshotCodexRoot;
-  return findRolloutFile(dataRoot, sessionId);
-}
-
-function snapshotFilePathForSession(snapshot, session) {
-  return resolveRolloutFilePath(session.id, '', snapshot.dataPath, snapshot.codexRoot);
 }
 
 async function loadSessionsInSnapshot(snapshot) {
@@ -690,9 +666,10 @@ async function loadSessionsInSnapshot(snapshot) {
       FROM threads
       ORDER BY updated_at DESC, created_at DESC;
     `);
+    const trustedIndex = indexTrustedSessionFiles({ codexRoot: snapshot.dataPath });
     databaseSessions = rows.map((row) => {
-      const session = makeSession(row, false, 0);
-      const probe = snapshotFilePathForSession(snapshot, session);
+      const sessionId = normalizeSessionId(String(row.id || ''));
+      const probe = trustedIndex.get(sessionId)?.[0] || '';
       const fileExists = exists(probe);
       return makeSession(row, fileExists, fileExists ? fileSize(probe) : 0, probe);
     });
@@ -1026,8 +1003,9 @@ function removeStateDatabaseSidecars(dataPath) {
 function snapshotSessionCounts(dataPath, sessionIds) {
   let active = 0;
   let archived = 0;
+  const trustedIndex = indexTrustedSessionFiles({ codexRoot: dataPath });
   for (const sessionId of sessionIds) {
-    const rolloutPath = findRolloutFile(dataPath, sessionId);
+    const rolloutPath = trustedIndex.get(normalizeSessionId(sessionId))?.[0] || '';
     const relative = safeRelativePath(dataPath, rolloutPath);
     if (!relative) continue;
     if (relative.split(path.sep)[0] === 'archived_sessions') archived += 1;
@@ -1037,8 +1015,9 @@ function snapshotSessionCounts(dataPath, sessionIds) {
 }
 
 function repairSnapshotStateDatabaseRolloutPaths(db, dataPath, snapshotCodexRoot, sessionIds) {
+  const trustedIndex = indexTrustedSessionFiles({ codexRoot: dataPath });
   for (const sessionId of sessionIds) {
-    const rolloutPath = findRolloutFile(dataPath, sessionId);
+    const rolloutPath = trustedIndex.get(normalizeSessionId(sessionId))?.[0] || '';
     const relative = safeRelativePath(dataPath, rolloutPath);
     if (!relative) continue;
     const archived = relative.split(path.sep)[0] === 'archived_sessions';

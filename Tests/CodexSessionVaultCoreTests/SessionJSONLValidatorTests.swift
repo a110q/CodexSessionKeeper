@@ -92,6 +92,27 @@ struct SessionJSONLValidatorTests {
     }
 
     @Test
+    func buildsOneTrustedIndexForAnEmployeeScaleSessionCatalog() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let sessions = fixture.root.appendingPathComponent("sessions/2026/07", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let sessionCount = 565
+        for index in 0..<sessionCount {
+            let sessionID = String(format: "session-%03d", index)
+            try fixture.write(
+                [["type": "session_meta", "payload": ["id": sessionID]]],
+                to: sessions.appendingPathComponent("rollout-\(index).jsonl")
+            )
+        }
+
+        let trustedIndex = try TrustedSessionFileResolver.index(under: fixture.root)
+
+        #expect(trustedIndex.count == sessionCount)
+        #expect(trustedIndex.values.allSatisfy { $0.count == 1 })
+    }
+
+    @Test
     func rejectsSymlinkedRolloutFilesAndKeepsExternalTargetsOutOfTheResult() throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
