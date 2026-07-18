@@ -11,6 +11,7 @@ const { verifyFullBackupFile } = require('./backup-file-verifier');
 const { assertSafeDestinationPath, assertSafeSourcePath } = require('./restore-filesystem');
 const { createSecureRecoveryDirectory } = require('./secure-recovery-directory');
 const { loadVerification } = require('./verification-store');
+const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
 const SHA256_PATTERN = /^[a-f\d]{64}$/i;
 
@@ -282,6 +283,7 @@ async function stageAndVerifySource({ paths, item, stagingPath }) {
       verifyTemporary: (temporaryPath) => verifyFullBackupFile({
         filePath: temporaryPath,
         chunkSize: item.expectedVerification.chunkSize,
+        maxLineBytes: MAX_JSONL_LINE_BYTES,
         expectedByteCount: item.expectedVerification.byteCount,
         expectedLineCount: item.expectedVerification.lineCount,
         expectedContentHash: item.expectedVerification.contentHash,
@@ -321,6 +323,7 @@ async function validatedRecoveryExpectation({ sourcePath, record, verification }
     const result = await verifyFullBackupFile({
       filePath: sourcePath,
       chunkSize: verification.chunkSize,
+      maxLineBytes: MAX_JSONL_LINE_BYTES,
       expectedByteCount: byteCount,
       expectedLineCount: lineCount,
       expectedChunkHashes: entry.chunkHashes,
@@ -340,6 +343,7 @@ async function validatedRecoveryExpectation({ sourcePath, record, verification }
   const result = await verifyFullBackupFile({
     filePath: sourcePath,
     chunkSize: verification.chunkSize,
+    maxLineBytes: MAX_JSONL_LINE_BYTES,
     expectedByteCount: byteCount,
     expectedLineCount: lineCount,
     expectedContentHash: record.contentHash,

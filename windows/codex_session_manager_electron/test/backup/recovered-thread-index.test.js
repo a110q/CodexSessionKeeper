@@ -118,6 +118,25 @@ test('extractRecoveredThreadMetadata falls back to record dates and session id',
   assert.equal(entry.hasUserEvent, 0);
 });
 
+test('recovered metadata rejects max plus one when newline arrives in the next chunk', async (t) => {
+  const { codexRoot, recoveredRoot } = await makeFixture(t);
+  const recoveredPath = path.join(recoveredRoot, 'boundary.jsonl');
+  await fs.writeFile(recoveredPath, Buffer.concat([
+    Buffer.alloc(8, 0x78),
+    Buffer.from('x\n'),
+  ]));
+
+  await assert.rejects(
+    extractRecoveredThreadMetadata(
+      record('boundary'),
+      recoveredPath,
+      codexRoot,
+      { maxLineBytes: 8, readBufferBytes: 8 },
+    ),
+    /exceeds 8 bytes/,
+  );
+});
+
 test('ensureRecoveredThreadsInStateDatabase inserts missing row', async (t) => {
   const { codexRoot, recoveredRoot } = await makeFixture(t);
   const databasePath = path.join(codexRoot, 'state_5.sqlite');

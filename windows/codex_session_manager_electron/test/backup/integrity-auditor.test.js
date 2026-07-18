@@ -152,6 +152,7 @@ class IntegrityFixture {
       pendingPartialLine: this.localTail.toString('utf8'),
       status: 'active',
       lastError: null,
+      blockedLineLimitBytes: null,
       updatedAt: (this.now.getTime() - 100000000) / 1000,
       ...overrides,
     };
@@ -489,6 +490,28 @@ test('corruption in every bounded chunk is detected and repaired', async (t) => 
     assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 1 });
     assert.deepEqual(await fs.readFile(fixture.targetPath), committed);
   }
+});
+
+test('integrity repair preserves a deterministic line-block diagnostic', async (t) => {
+  const fixture = await IntegrityFixture.create(t, { corrupted: true });
+  const blockedError = `Session JSONL line exceeds maximum JSONL line size of 64 bytes at offset ${fixture.committed.length}: ${fixture.sourcePath}`;
+  fixture.cursor = {
+    ...fixture.cursor,
+    lastError: blockedError,
+    blockedLineLimitBytes: 64,
+  };
+  fixture.cursors.set(fixture.sourcePath, fixture.cursor);
+  await fixture.saveCursor(fixture.cursor);
+  await fixture.writeStatus({ status: 'error', lastError: blockedError });
+
+  assert.deepEqual(await fixture.run(), { outcome: 'completed', checked: 1, repaired: 1 });
+
+  const repaired = await fixture.loadCursor();
+  assert.equal(repaired.lastError, blockedError);
+  assert.equal(repaired.blockedLineLimitBytes, 64);
+  const status = await readJson(fixture.paths.localStatusPath);
+  assert.equal(status.status, 'error');
+  assert.equal(status.lastError, blockedError);
 });
 
 test('repair readback failure retries once before replacing the formal target', async (t) => {

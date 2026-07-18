@@ -133,6 +133,34 @@ test('verified state requires final status after readback progress', async () =>
   assert.equal(harness.runtime.snapshot().state, 'running');
 });
 
+test('failedFiles remains truthful through runtime progress and final error status', async () => {
+  const harness = runtimeHarness({ saved: configuration('运营部', '陈超') });
+  await harness.runtime.initialize();
+
+  harness.created[0].report({
+    phase: 'scanning',
+    totalFiles: 3,
+    completedFiles: 3,
+    failedFiles: 1,
+    pendingFiles: 0,
+  });
+  harness.created[0].reportStatus({
+    status: 'error',
+    mode: 'polling',
+    lastError: 'exact blocked path and reason',
+  });
+
+  assert.deepEqual(harness.runtime.backupStatus().progress, {
+    phase: 'scanning',
+    totalFiles: 3,
+    completedFiles: 3,
+    failedFiles: 1,
+    pendingFiles: 0,
+  });
+  assert.equal(harness.runtime.backupStatus().status, 'error');
+  assert.equal(harness.runtime.backupStatus().lastError, 'exact blocked path and reason');
+});
+
 test('persisted status is loaded once and repeated renderer status reads are memory-only', async () => {
   const savedStatus = {
     status: 'running',

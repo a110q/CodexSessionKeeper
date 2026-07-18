@@ -26,6 +26,7 @@ const {
   rebuildSessionCompleteLines,
   verifyCompletePrefix,
 } = require('./session-backup-streamer');
+const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
 const ACTIVE_STATUS = 'active';
 const AUDIT_INTERVAL_MS = 86400 * 1000;
@@ -37,7 +38,8 @@ class BackupAgent {
     paths,
     now = () => new Date(),
     validateTarget = defaultValidateTarget,
-    fileCommitter = createFileCommitter(),
+    maxLineBytes = MAX_JSONL_LINE_BYTES,
+    fileCommitter = null,
     initialStatus = null,
     onProgress = null,
     onStatus = null,
@@ -60,7 +62,10 @@ class BackupAgent {
     this.paths = paths;
     this.now = now;
     this.validateTarget = validateTarget;
-    this.fileCommitter = fileCommitter;
+    this.maxLineBytes = normalizedLineLimit(maxLineBytes);
+    this.fileCommitter = fileCommitter || createFileCommitter({
+      maxLineBytes: this.maxLineBytes,
+    });
     this.cachedStatus = initialStatus ? { ...initialStatus } : null;
     this.healthCheckIntervalMs = positiveInterval(healthCheckIntervalMs, 'healthCheckIntervalMs');
     this.remoteHeartbeatIntervalMs = positiveInterval(remoteHeartbeatIntervalMs, 'remoteHeartbeatIntervalMs');
@@ -443,6 +448,7 @@ class BackupAgent {
       this.onProgress?.({
         totalFiles: sources.length,
         completedFiles: 0,
+        failedFiles: 0,
         pendingFiles: sources.length,
         phase,
       });
@@ -452,6 +458,7 @@ class BackupAgent {
       const staleCursorSourcePaths = [];
       const scanErrors = [];
       let completedFiles = 0;
+      let failedFiles = 0;
       let interrupted = false;
       let remainingSources = [];
       for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
@@ -475,6 +482,7 @@ class BackupAgent {
           onVerifying: () => this.onProgress?.({
             totalFiles: sources.length,
             completedFiles,
+            failedFiles,
             pendingFiles: Math.max(0, sources.length - completedFiles),
             phase: 'verifying',
           }),
@@ -482,7 +490,9 @@ class BackupAgent {
           sessionId,
           sourcePath,
         });
-        nextSettledSourceSnapshot.set(sourcePath, result.sourceStats);
+        if (!result.lastError || result.isLineLimitBlocked) {
+          nextSettledSourceSnapshot.set(sourcePath, result.sourceStats);
+        }
         manifestChanged ||= result.manifestChanged;
         if (result.cursor) {
           updatedCursors.push(result.cursor);
@@ -495,10 +505,12 @@ class BackupAgent {
         if (result.lastError) {
           scanErrors.push(result.lastError);
         }
+        if (result.isLineLimitBlocked) failedFiles += 1;
         completedFiles += 1;
         this.onProgress?.({
           totalFiles: sources.length,
           completedFiles,
+          failedFiles,
           pendingFiles: Math.max(0, sources.length - completedFiles),
           phase,
         });
@@ -526,6 +538,7 @@ class BackupAgent {
         this.onProgress?.({
           totalFiles: sources.length,
           completedFiles,
+          failedFiles,
           pendingFiles: pending.length,
           phase,
         });
@@ -537,6 +550,7 @@ class BackupAgent {
       this.onProgress?.({
         totalFiles: sources.length,
         completedFiles: sources.length,
+        failedFiles,
         pendingFiles: 0,
         phase,
       });
@@ -545,8 +559,8 @@ class BackupAgent {
       if (scanErrors.length === 0) {
         await integrityAuditor.recordInitialSeedCompleted(scanDate);
         this.auditLastCompletedAt ??= scanDate.toISOString();
-        this.settledSourceSnapshot = nextSettledSourceSnapshot;
       }
+      this.settledSourceSnapshot = nextSettledSourceSnapshot;
       return manifest;
     } finally {
       await cursorStore.close();
@@ -619,7 +633,9 @@ class BackupAgent {
       relativeBackupPath,
       chunkSize: verification.chunkSize,
     });
-    if (recordHasTrustedVerification && scanIsStrictlyUnchanged({
+    if (recordHasTrustedVerification
+      && !shouldRetryBlockedLine(currentCursor, this.maxLineBytes)
+      && scanIsStrictlyUnchanged({
       sourcePath,
       relativeBackupPath,
       sourceStats,
@@ -631,6 +647,7 @@ class BackupAgent {
         cursor: null,
         staleCursorSourcePath: null,
         lastError: currentCursor?.lastError || null,
+        isLineLimitBlocked: currentCursor?.blockedLineLimitBytes != null,
         sourceStats,
       };
     }
@@ -638,18 +655,29 @@ class BackupAgent {
     const targetState = await this.fileCommitter.inspectTarget(backupPath);
     const recordedLines = Number(baselineCursor?.lineCount ?? existingRecord?.lineCount ?? 0);
     const recordedOffset = Number(baselineCursor?.lastByteOffset ?? 0);
-    const metadataAgrees = Boolean(
-      baselineCursor
-      && sourceStats.size > baselineCursor.lastSourceSize
-      && sourceStats.size >= baselineCursor.lastByteOffset
-      && existingRecord?.bytesBackedUp === baselineCursor.lastByteOffset
-      && existingRecord?.lineCount === baselineCursor.lineCount
-    );
-    const identityAgrees = Boolean(
-      baselineCursor
-      && (baselineCursor.sourceFileIdentity == null
-        || baselineCursor.sourceFileIdentity === sourceStats.fileIdentity)
-    );
+    const retryingBlockedLine = shouldRetryBlockedLine(baselineCursor, this.maxLineBytes);
+    const metadataAgrees = Boolean(baselineCursor && (
+      (
+        sourceStats.size > baselineCursor.lastSourceSize
+        && sourceStats.size >= baselineCursor.lastByteOffset
+        && existingRecord?.bytesBackedUp === baselineCursor.lastByteOffset
+        && existingRecord?.lineCount === baselineCursor.lineCount
+      )
+      || (
+        retryingBlockedLine
+        && sourceStats.size === baselineCursor.lastSourceSize
+        && sourceStats.modifiedAt === baselineCursor.lastSourceModifiedAt
+        && existingRecord?.bytesBackedUp === baselineCursor.lastByteOffset
+        && existingRecord?.lineCount === baselineCursor.lineCount
+      )
+    ));
+    const identityAgrees = Boolean(baselineCursor && (
+      retryingBlockedLine
+        ? baselineCursor.sourceFileIdentity != null
+          && baselineCursor.sourceFileIdentity === sourceStats.fileIdentity
+        : baselineCursor.sourceFileIdentity == null
+          || baselineCursor.sourceFileIdentity === sourceStats.fileIdentity
+    ));
     const pathAgrees = Boolean(
       baselineCursor
       && baselineCursor.backupPath === relativeBackupPath
@@ -696,6 +724,7 @@ class BackupAgent {
               attemptVerification = await verifyFullBackupFile({
                 filePath: temporaryPath,
                 chunkSize: verification.chunkSize,
+                maxLineBytes: this.maxLineBytes,
                 expectedByteCount: expected.committedByteCount,
                 expectedLineCount: expected.lineCount,
                 expectedContentHash: expected.contentHash,
@@ -758,6 +787,7 @@ class BackupAgent {
               lineCount: attemptFinalLineCount,
               verifiedAt: scanDate,
               chunkSize: verification.chunkSize,
+              maxLineBytes: this.maxLineBytes,
             });
           })()
           : existingVerification;
@@ -779,15 +809,7 @@ class BackupAgent {
             ? error
             : sourceChangedDuringBackupError(sourcePath, error);
         }
-        rebuiltAfterAppendFailure = await rebuildAndVerify(1);
-        streamed = rebuiltAfterAppendFailure.streamed;
-        verification.sessions[sessionId] = {
-          backupPath: relativeBackupPath,
-          byteCount: rebuiltAfterAppendFailure.verified.byteCount,
-          lineCount: rebuiltAfterAppendFailure.verified.lineCount,
-          chunkHashes: rebuiltAfterAppendFailure.verified.chunkHashes,
-          verifiedAt: scanDate.toISOString(),
-        };
+        throw error;
       }
       finalOffset = streamed.committedByteCount;
       finalStats = {
@@ -846,6 +868,7 @@ class BackupAgent {
       pendingPartialLine: streamed.pendingPartialLine,
       status: ACTIVE_STATUS,
       lastError: streamed.blockedError || null,
+      blockedLineLimitBytes: streamed.blockedError ? this.maxLineBytes : null,
       updatedAt: scanDate.getTime() / 1000,
     };
 
@@ -856,6 +879,7 @@ class BackupAgent {
         : updatedCursor,
       staleCursorSourcePath,
       lastError: streamed.blockedError || null,
+      isLineLimitBlocked: streamed.blockedError != null,
       sourceStats,
     };
   }
@@ -1006,7 +1030,11 @@ function verificationMatches({ entry, record, relativeBackupPath, chunkSize }) {
   return entry.chunkHashes.every((hash) => /^[a-f\d]{64}$/i.test(hash));
 }
 
-function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
+function createFileCommitter({
+  sync = (handle) => handle.sync(),
+  maxLineBytes = MAX_JSONL_LINE_BYTES,
+} = {}) {
+  const effectiveMaxLineBytes = normalizedLineLimit(maxLineBytes);
   return {
     async inspectTarget(targetPath) {
       try {
@@ -1022,7 +1050,12 @@ function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
     },
 
     async verifyCompletePrefix(targetPath, sourcePath, targetByteCount) {
-      return verifyCompletePrefix({ sourcePath, targetPath, targetByteCount });
+      return verifyCompletePrefix({
+        sourcePath,
+        targetPath,
+        targetByteCount,
+        maxLineBytes: effectiveMaxLineBytes,
+      });
     },
 
     async synchronizeTarget(targetPath, backupRoot) {
@@ -1041,7 +1074,13 @@ function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
 
     async appendCompleteLines(sourcePath, targetPath, sourceOffset, backupRoot) {
       await assertContainedTarget(backupRoot, targetPath);
-      return appendCompleteLines({ sourcePath, sourceOffset, targetPath, sync });
+      return appendCompleteLines({
+        sourcePath,
+        sourceOffset,
+        targetPath,
+        maxLineBytes: effectiveMaxLineBytes,
+        sync,
+      });
     },
 
     async rebuildCompleteLines(sourcePath, targetPath, backupRoot, verifyTemporary = null) {
@@ -1049,6 +1088,7 @@ function createFileCommitter({ sync = (handle) => handle.sync() } = {}) {
       return rebuildSessionCompleteLines({
         sourcePath,
         targetPath,
+        maxLineBytes: effectiveMaxLineBytes,
         sync,
         verifyTemporary,
       });
@@ -1230,8 +1270,22 @@ function sameRecord(lhs, rhs) {
 function sameCursor(lhs, rhs) {
   if (!lhs) return false;
   return ['sessionId', 'sourcePath', 'backupPath', 'lastByteOffset', 'lastSourceSize',
-    'lastSourceModifiedAt', 'sourceFileIdentity', 'lineCount', 'pendingPartialLine', 'status', 'lastError']
+    'lastSourceModifiedAt', 'sourceFileIdentity', 'lineCount', 'pendingPartialLine', 'status', 'lastError',
+    'blockedLineLimitBytes']
     .every((key) => lhs[key] === rhs[key]);
+}
+
+function normalizedLineLimit(value) {
+  const parsed = Number(value ?? MAX_JSONL_LINE_BYTES);
+  return Math.max(
+    0,
+    Number.isFinite(parsed) ? Math.floor(parsed) : MAX_JSONL_LINE_BYTES,
+  );
+}
+
+function shouldRetryBlockedLine(cursor, maxLineBytes) {
+  return cursor?.blockedLineLimitBytes != null
+    && cursor.blockedLineLimitBytes < maxLineBytes;
 }
 
 function maxIsoDate(values) {

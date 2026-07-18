@@ -34,6 +34,7 @@ function makeCursor(root, name, overrides = {}) {
     pendingPartialLine: '',
     status: 'active',
     lastError: null,
+    blockedLineLimitBytes: null,
     updatedAt: 1770000001.5,
     ...overrides,
   };
@@ -51,7 +52,8 @@ function queryRows(databasePath, sql) {
   return output ? JSON.parse(output) : [];
 }
 
-async function writeLegacySqlJsDatabase(databasePath, cursor) {
+async function writeLegacySqlJsDatabase(databasePath, cursorOrCursors) {
+  const cursors = Array.isArray(cursorOrCursors) ? cursorOrCursors : [cursorOrCursors];
   const SQL = await initSqlJs();
   const database = new SQL.Database();
   try {
@@ -70,24 +72,26 @@ async function writeLegacySqlJsDatabase(databasePath, cursor) {
         updated_at REAL NOT NULL
       );
     `);
-    database.run(`
-      INSERT INTO backup_cursors (
-        source_path, session_id, backup_path, last_byte_offset, last_source_size,
-        last_source_modified_at, line_count, pending_partial_line, status, last_error, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-    `, [
-      cursor.sourcePath,
-      cursor.sessionId,
-      cursor.backupPath,
-      cursor.lastByteOffset,
-      cursor.lastSourceSize,
-      cursor.lastSourceModifiedAt,
-      cursor.lineCount,
-      Buffer.from(cursor.pendingPartialLine, 'utf8').toString('base64'),
-      cursor.status,
-      cursor.lastError,
-      cursor.updatedAt,
-    ]);
+    for (const cursor of cursors) {
+      database.run(`
+        INSERT INTO backup_cursors (
+          source_path, session_id, backup_path, last_byte_offset, last_source_size,
+          last_source_modified_at, line_count, pending_partial_line, status, last_error, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+      `, [
+        cursor.sourcePath,
+        cursor.sessionId,
+        cursor.backupPath,
+        cursor.lastByteOffset,
+        cursor.lastSourceSize,
+        cursor.lastSourceModifiedAt,
+        cursor.lineCount,
+        Buffer.from(cursor.pendingPartialLine, 'utf8').toString('base64'),
+        cursor.status,
+        cursor.lastError,
+        cursor.updatedAt,
+      ]);
+    }
     await fs.mkdir(path.dirname(databasePath), { recursive: true });
     await fs.writeFile(databasePath, Buffer.from(database.export()));
   } finally {
@@ -195,30 +199,44 @@ function spawnCursorWriter(databasePath, cursor) {
   };
 }
 
-test('open migrates a legacy sql.js database and preserves its rows', async (t) => {
+test('open migrates legacy cursor line-limit state with an exact selective backfill', async (t) => {
   const { root, paths } = await makeFixture(t);
   const legacy = makeCursor(root, 'legacy', {
     sourceFileIdentity: undefined,
+    blockedLineLimitBytes: undefined,
     pendingPartialLine: 'legacy partial',
-    lastError: "旧错误 'quoted'",
+    lastError: `Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset 10: ${path.join(root, 'sessions', 'legacy.jsonl')}`,
   });
-  await writeLegacySqlJsDatabase(paths.cursorDatabasePath, legacy);
+  const unrelated = makeCursor(root, 'unrelated', {
+    sourceFileIdentity: undefined,
+    blockedLineLimitBytes: undefined,
+    lastError: 'NAS volume unavailable',
+  });
+  const caseVariant = makeCursor(root, 'case-variant', {
+    sourceFileIdentity: undefined,
+    blockedLineLimitBytes: undefined,
+    lastError: `session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset 10: ${path.join(root, 'sessions', 'case-variant.jsonl')}`,
+  });
+  await writeLegacySqlJsDatabase(paths.cursorDatabasePath, [legacy, unrelated, caseVariant]);
   const store = new CursorStore({ paths, sqlitePath: SQLITE_PATH });
   t.after(async () => store.close());
 
   await store.open();
 
-  assert.deepEqual(await store.get(legacy.sourcePath), {
-    ...legacy,
-    sourceFileIdentity: null,
-  });
-  assert.ok(queryRows(paths.cursorDatabasePath, 'PRAGMA table_info(backup_cursors);')
-    .some((column) => column.name === 'source_file_identity'));
+  assert.equal((await store.get(legacy.sourcePath)).blockedLineLimitBytes, 33_554_432);
+  assert.equal((await store.get(unrelated.sourcePath)).blockedLineLimitBytes, null);
+  assert.equal((await store.get(caseVariant.sourcePath)).blockedLineLimitBytes, null);
+  const columns = queryRows(paths.cursorDatabasePath, 'PRAGMA table_info(backup_cursors);');
+  assert.ok(columns.some((column) => column.name === 'source_file_identity'));
+  assert.ok(columns.some((column) => column.name === 'blocked_line_limit_bytes'));
 });
 
 test('concurrent opens safely migrate the old schema', async (t) => {
   const { root, paths } = await makeFixture(t);
-  const legacy = makeCursor(root, 'concurrent-legacy', { sourceFileIdentity: undefined });
+  const legacy = makeCursor(root, 'concurrent-legacy', {
+    sourceFileIdentity: undefined,
+    blockedLineLimitBytes: undefined,
+  });
   await writeLegacySqlJsDatabase(paths.cursorDatabasePath, legacy);
   const stores = [
     new CursorStore({ paths, sqlitePath: SQLITE_PATH }),
@@ -230,6 +248,7 @@ test('concurrent opens safely migrate the old schema', async (t) => {
 
   assert.equal((await stores[0].get(legacy.sourcePath)).sourceFileIdentity, null);
   assert.equal((await stores[1].get(legacy.sourcePath)).sourceFileIdentity, null);
+  assert.equal((await stores[0].get(legacy.sourcePath)).blockedLineLimitBytes, null);
 });
 
 test('round trips Chinese, quotes, nullable identity, and a NUL partial line', async (t) => {
@@ -243,6 +262,7 @@ test('round trips Chinese, quotes, nullable identity, and a NUL partial line', a
     pendingPartialLine: "前半段\0后半段 'quoted' 🚀",
     status: "active-'中文",
     lastError: "错误'); DROP TABLE backup_cursors; -- 中文",
+    blockedLineLimitBytes: 67_108_864,
   });
 
   await store.upsert(cursor);
@@ -377,7 +397,11 @@ test('a stale writer on the same row gets CURSOR_CONFLICT without overwriting', 
   const stale = new CursorStore({ paths, sqlitePath: SQLITE_PATH });
   t.after(async () => Promise.all([first.close(), stale.close()]));
   await Promise.all([first.open(), stale.open()]);
-  const winner = { ...original, sourceFileIdentity: 'winner-identity' };
+  const winner = {
+    ...original,
+    sourceFileIdentity: 'winner-identity',
+    blockedLineLimitBytes: 67_108_864,
+  };
   const loser = { ...original, lastByteOffset: 30, updatedAt: 1770000003.5 };
 
   await first.upsert(winner);
@@ -388,6 +412,10 @@ test('a stale writer on the same row gets CURSOR_CONFLICT without overwriting', 
   assert.equal(
     queryRows(paths.cursorDatabasePath, 'SELECT source_file_identity AS value FROM backup_cursors;')[0].value,
     winner.sourceFileIdentity,
+  );
+  assert.equal(
+    queryRows(paths.cursorDatabasePath, 'SELECT blocked_line_limit_bytes AS value FROM backup_cursors;')[0].value,
+    winner.blockedLineLimitBytes,
   );
 });
 

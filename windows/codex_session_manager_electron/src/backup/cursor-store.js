@@ -16,6 +16,7 @@ const CREATE_CURSOR_TABLE = `
     status TEXT NOT NULL,
     last_error TEXT,
     source_file_identity TEXT,
+    blocked_line_limit_bytes INTEGER,
     updated_at REAL NOT NULL
   );
 `;
@@ -32,6 +33,7 @@ const CURSOR_COLUMNS = `
   pending_partial_line AS pendingPartialLine,
   status,
   last_error AS lastError,
+  blocked_line_limit_bytes AS blockedLineLimitBytes,
   updated_at AS updatedAt
 `;
 
@@ -47,6 +49,7 @@ const PERSISTED_FIELDS = [
   ['status', 'status', 'text'],
   ['last_error', 'lastError', 'nullableText'],
   ['source_file_identity', 'sourceFileIdentity', 'nullableText'],
+  ['blocked_line_limit_bytes', 'blockedLineLimitBytes', 'nullableInteger'],
   ['updated_at', 'updatedAt', 'number'],
 ];
 
@@ -77,6 +80,13 @@ function finiteNumber(value, field) {
   return number;
 }
 
+function optionalSafeInteger(value, field) {
+  if (value == null) return null;
+  const number = safeInteger(value, field);
+  if (number < 0) throw new TypeError(`${field} must be non-negative.`);
+  return number;
+}
+
 function normalizeCursor(cursor) {
   return {
     sessionId: String(cursor.sessionId ?? ''),
@@ -94,6 +104,10 @@ function normalizeCursor(cursor) {
       : String(cursor.pendingPartialLine ?? ''),
     status: String(cursor.status ?? ''),
     lastError: cursor.lastError == null ? null : String(cursor.lastError),
+    blockedLineLimitBytes: optionalSafeInteger(
+      cursor.blockedLineLimitBytes,
+      'blockedLineLimitBytes',
+    ),
     updatedAt: finiteNumber(cursor.updatedAt, 'updatedAt'),
   };
 }
@@ -122,6 +136,7 @@ function cursorSqlValue(cursor, field, kind) {
   const value = cursor[field];
   if (kind === 'text') return sqlText(value);
   if (kind === 'nullableText') return sqlNullableText(value);
+  if (kind === 'nullableInteger') return value == null ? 'NULL' : String(value);
   if (kind === 'partial') return sqlText(encodePendingPartialLine(value));
   return String(value);
 }
@@ -129,7 +144,9 @@ function cursorSqlValue(cursor, field, kind) {
 function cursorEquality(cursor) {
   return PERSISTED_FIELDS.map(([column, field, kind]) => {
     const value = cursorSqlValue(cursor, field, kind);
-    if (kind === 'nullableText' && value === 'NULL') return `${column} IS NULL`;
+    if ((kind === 'nullableText' || kind === 'nullableInteger') && value === 'NULL') {
+      return `${column} IS NULL`;
+    }
     return `${column} = ${value}`;
   }).join('\n      AND ');
 }
@@ -168,6 +185,7 @@ function upsertStatement(cursor) {
       status = excluded.status,
       last_error = excluded.last_error,
       source_file_identity = excluded.source_file_identity,
+      blocked_line_limit_bytes = excluded.blocked_line_limit_bytes,
       updated_at = excluded.updated_at;
   `;
 }
@@ -214,11 +232,31 @@ class CursorStore {
     await fs.mkdir(path.dirname(this.paths.cursorDatabasePath), { recursive: true });
     await this.runSQLite(CREATE_CURSOR_TABLE);
 
-    if (!await this.hasSourceFileIdentityColumn()) {
+    if (!await this.hasColumn('source_file_identity')) {
       try {
         await this.runSQLite('ALTER TABLE backup_cursors ADD COLUMN source_file_identity TEXT;');
       } catch (error) {
-        if (!await this.hasSourceFileIdentityColumn()) throw error;
+        if (!await this.hasColumn('source_file_identity')) throw error;
+      }
+    }
+
+    if (!await this.hasColumn('blocked_line_limit_bytes')) {
+      try {
+        await this.runSQLite(`
+          BEGIN IMMEDIATE;
+          ALTER TABLE backup_cursors ADD COLUMN blocked_line_limit_bytes INTEGER;
+          UPDATE backup_cursors
+          SET blocked_line_limit_bytes = 33554432
+          WHERE blocked_line_limit_bytes IS NULL
+            AND substr(
+              last_error,
+              1,
+              length('Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset ')
+            ) COLLATE BINARY = 'Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset ';
+          COMMIT;
+        `);
+      } catch (error) {
+        if (!await this.hasColumn('blocked_line_limit_bytes')) throw error;
       }
     }
 
@@ -236,11 +274,11 @@ class CursorStore {
     return this;
   }
 
-  async hasSourceFileIdentityColumn() {
+  async hasColumn(columnName) {
     const output = await this.runSQLite(`
       SELECT COUNT(*)
       FROM pragma_table_info('backup_cursors')
-      WHERE name = 'source_file_identity';
+      WHERE name = ${sqlText(columnName)};
     `);
     return Number(String(output).trim()) > 0;
   }

@@ -5,12 +5,13 @@ const fsp = require('node:fs/promises');
 
 const { durableReplaceWithWriter } = require('./durable-write');
 const { titleFromJsonLine } = require('./session-identity');
+const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
 const NEWLINE_BYTE = 0x0A;
 const DEFAULT_CHUNK_SIZE = 1024 * 1024;
 const MAXIMUM_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_WRITE_BUFFER_SIZE = 1024 * 1024;
-const DEFAULT_MAX_LINE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_LINE_BYTES = MAX_JSONL_LINE_BYTES;
 const MAX_PENDING_PARTIAL_BYTES = 64 * 1024;
 const NEWLINE = Buffer.from([NEWLINE_BYTE]);
 

@@ -163,6 +163,7 @@ function cursorFor(paths, sourceName, overrides = {}) {
     pendingPartialLine: '',
     status: 'active',
     lastError: null,
+    blockedLineLimitBytes: null,
     updatedAt: 1770000001.5,
     ...overrides,
   };
@@ -367,7 +368,7 @@ test('two rebuild readback failures preserve the formal backup and metadata', as
   assert.deepEqual(after, before);
 });
 
-test('two append readback failures roll back to the last verified length', async (t) => {
+test('append readback failure rolls back to the last verified length without rebuilding', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'append-readback-fails.jsonl');
   const first = jsonLine({ role: 'user', content: 'first' });
@@ -388,7 +389,7 @@ test('two append readback failures roll back to the last verified length', async
     sync: async (handle) => {
       syncCount += 1;
       await handle.sync();
-      if (syncCount === 1 || syncCount === 3) {
+      if (syncCount === 1) {
         await handle.write(Buffer.from('x'), 0, 1, oldOffset);
         await handle.sync();
       }
@@ -397,7 +398,7 @@ test('two append readback failures roll back to the last verified length', async
 
   await assert.rejects(new BackupAgent({ paths, fileCommitter }).performOneShotScan());
 
-  assert.equal(syncCount, 3);
+  assert.equal(syncCount, 2);
   const after = await Promise.all([
     fs.readFile(targetPath),
     fs.readFile(paths.manifestPath),
@@ -407,13 +408,18 @@ test('two append readback failures roll back to the last verified length', async
   assert.deepEqual(after, before);
 });
 
-test('append verification repairs an already-corrupted final chunk with one rebuild retry', async (t) => {
+test('append verification failure restores the prior length without advancing metadata', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'append-repairs-old-chunk.jsonl');
   const first = jsonLine({ role: 'user', content: 'first' });
   const second = jsonLine({ role: 'assistant', content: 'second' });
   await writeSessionFile(sourcePath, [first]);
   await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+  const beforeMetadata = await Promise.all([
+    fs.readFile(paths.manifestPath),
+    fs.readFile(paths.cursorDatabasePath),
+    fs.readFile(paths.verificationPath),
+  ]);
 
   const targetPath = paths.backupFilePath(sourcePath);
   const corrupted = await fs.readFile(targetPath);
@@ -421,14 +427,17 @@ test('append verification repairs an already-corrupted final chunk with one rebu
   await fs.writeFile(targetPath, corrupted);
   await fs.appendFile(sourcePath, second);
 
-  await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+  await assert.rejects(
+    new BackupAgent({ paths, now: makeClock() }).performOneShotScan(),
+    /Backup chunk mismatch/,
+  );
 
-  assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
-  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
-  const verification = await loadVerification(paths.verificationPath);
-  assert.equal(manifest.sessions['append-repairs-old-chunk'].bytesBackedUp, Buffer.byteLength(first + second));
-  assert.equal(verification.sessions['append-repairs-old-chunk'].byteCount, Buffer.byteLength(first + second));
-  assert.equal((await loadCursor(paths, sourcePath)).lastByteOffset, Buffer.byteLength(first + second));
+  assert.equal((await fs.stat(targetPath)).size, Buffer.byteLength(first));
+  assert.deepEqual(await Promise.all([
+    fs.readFile(paths.manifestPath),
+    fs.readFile(paths.cursorDatabasePath),
+    fs.readFile(paths.verificationPath),
+  ]), beforeMetadata);
 });
 
 test('second scan appends only new completed lines and repeated scan has no duplicate', async (t) => {
@@ -1195,12 +1204,13 @@ test('oversized line beyond limit sets error status and continues other sessions
   const healthyId = 'healthy';
   const blockedPath = path.join(paths.codexRoot, 'sessions', `${blockedId}.jsonl`);
   const healthyPath = path.join(paths.codexRoot, 'sessions', `${healthyId}.jsonl`);
-  await writeSessionFile(blockedPath, ['x'.repeat(32 * 1024 * 1024 + 1)]);
+  await writeSessionFile(blockedPath, ['x'.repeat(65)]);
   await writeSessionFile(healthyPath, [jsonLine({ role: 'user', content: 'healthy' })]);
 
   let validations = 0;
   const agent = new BackupAgent({
     paths,
+    maxLineBytes: 64,
     now: makeClock(),
     validateTarget: async () => { validations += 1; },
   });
@@ -1220,6 +1230,7 @@ test('oversized line beyond limit sets error status and continues other sessions
   assert.equal(blockedRecord.lineCount, 0);
   assert.equal(blockedRecord.bytesBackedUp, 0);
   assert.equal(blockedCursor.lastByteOffset, 0);
+  assert.equal(blockedCursor.blockedLineLimitBytes, 64);
   assert.match(blockedCursor.lastError, /exceeds maximum JSONL line size/);
   assert.deepEqual(await readLines(path.join(paths.backupRoot, healthyRecord.backupPath)), [
     JSON.stringify({ role: 'user', content: 'healthy' }),
@@ -1228,8 +1239,148 @@ test('oversized line beyond limit sets error status and continues other sessions
   assert.match(status.lastError, /exceeds maximum JSONL line size/);
 
   validations = 0;
-  await agent.requestImmediateScan('timer');
-  assert.equal(validations, 1, 'an unchanged source with a backup error must be retried');
+  const timerReads = await withTrackedReadRanges(
+    [blockedPath],
+    () => agent.requestImmediateScan('timer'),
+  );
+  assert.equal(validations, 0, 'a current-policy block must be settled for timer ticks');
+  assert.deepEqual(timerReads.get(blockedPath), []);
+  assert.equal(JSON.parse(await fs.readFile(paths.statusPath, 'utf8')).status, 'error');
+});
+
+test('a lower-policy block resumes only the verified suffix under a higher limit', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sessionId = 'line-policy-upgrade';
+  const sourcePath = path.join(paths.codexRoot, 'sessions', `${sessionId}.jsonl`);
+  const prefix = jsonLine({ role: 'user', content: 'ok' });
+  const largeLine = jsonLine({ role: 'assistant', content: 'x'.repeat(70) });
+  await writeSessionFile(sourcePath, [prefix, largeLine]);
+
+  await new BackupAgent({ paths, maxLineBytes: 64, now: makeClock() }).performOneShotScan();
+  const targetPath = paths.backupFilePath(sourcePath);
+  const oldOffset = Buffer.byteLength(prefix);
+  const blocked = await loadCursor(paths, sourcePath);
+  assert.equal(blocked.lastByteOffset, oldOffset);
+  assert.equal(blocked.blockedLineLimitBytes, 64);
+  assert.equal(await fs.readFile(targetPath, 'utf8'), prefix);
+
+  const baseCommitter = createFileCommitter({ maxLineBytes: 128 });
+  let appendOffset = null;
+  let rebuildCount = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async appendCompleteLines(source, target, offset, backupRoot) {
+      appendOffset = offset;
+      return baseCommitter.appendCompleteLines(source, target, offset, backupRoot);
+    },
+    async rebuildCompleteLines(...args) {
+      rebuildCount += 1;
+      return baseCommitter.rebuildCompleteLines(...args);
+    },
+  };
+
+  await new BackupAgent({
+    paths,
+    maxLineBytes: 128,
+    fileCommitter,
+    now: makeClock(),
+  }).performOneShotScan();
+
+  const repaired = await loadCursor(paths, sourcePath);
+  assert.equal(appendOffset, oldOffset);
+  assert.equal(rebuildCount, 0);
+  assert.equal(repaired.lastError, null);
+  assert.equal(repaired.blockedLineLimitBytes, null);
+  assert.deepEqual(await fs.readFile(targetPath), await fs.readFile(sourcePath));
+});
+
+test('a lower-policy block with mismatched identity uses the atomic rebuild path', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sessionId = 'line-policy-identity-mismatch';
+  const sourcePath = path.join(paths.codexRoot, 'sessions', `${sessionId}.jsonl`);
+  await writeSessionFile(sourcePath, [
+    jsonLine({ role: 'user', content: 'ok' }),
+    jsonLine({ role: 'assistant', content: 'x'.repeat(70) }),
+  ]);
+  await new BackupAgent({ paths, maxLineBytes: 64 }).performOneShotScan();
+  const store = new CursorStore({ paths });
+  await store.open();
+  const blocked = await store.get(sourcePath);
+  await store.upsert({ ...blocked, sourceFileIdentity: 'stale:identity' });
+  await store.close();
+
+  const baseCommitter = createFileCommitter({ maxLineBytes: 128 });
+  let appendCount = 0;
+  let rebuildCount = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async appendCompleteLines(...args) {
+      appendCount += 1;
+      return baseCommitter.appendCompleteLines(...args);
+    },
+    async rebuildCompleteLines(...args) {
+      rebuildCount += 1;
+      return baseCommitter.rebuildCompleteLines(...args);
+    },
+  };
+
+  await new BackupAgent({ paths, maxLineBytes: 128, fileCommitter }).performOneShotScan();
+
+  assert.equal(appendCount, 0);
+  assert.equal(rebuildCount, 1);
+  assert.deepEqual(await fs.readFile(paths.backupFilePath(sourcePath)), await fs.readFile(sourcePath));
+});
+
+test('a lower-policy block with mismatched trusted anchors uses the atomic rebuild path', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sessionId = 'line-policy-anchor-mismatch';
+  const sourcePath = path.join(paths.codexRoot, 'sessions', `${sessionId}.jsonl`);
+  const originalPrefix = jsonLine({ role: 'user', content: 'ok' });
+  const rewrittenPrefix = jsonLine({ role: 'user', content: 'no' });
+  const largeLine = jsonLine({ role: 'assistant', content: 'x'.repeat(70) });
+  await writeSessionFile(sourcePath, [originalPrefix, largeLine]);
+  await new BackupAgent({ paths, maxLineBytes: 64 }).performOneShotScan();
+  const originalStats = await fs.stat(sourcePath);
+  await writeSessionFile(sourcePath, [rewrittenPrefix, largeLine]);
+  await fs.utimes(sourcePath, originalStats.atime, originalStats.mtime);
+
+  const baseCommitter = createFileCommitter({ maxLineBytes: 128 });
+  let rebuildCount = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async rebuildCompleteLines(...args) {
+      rebuildCount += 1;
+      return baseCommitter.rebuildCompleteLines(...args);
+    },
+  };
+  await new BackupAgent({ paths, maxLineBytes: 128, fileCommitter }).performOneShotScan();
+
+  assert.equal(rebuildCount, 1);
+  assert.deepEqual(await fs.readFile(paths.backupFilePath(sourcePath)), await fs.readFile(sourcePath));
+});
+
+test('blocked sessions increment failedFiles without changing completedFiles', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  await writeSessionFile(path.join(paths.codexRoot, 'sessions', 'failed-progress.jsonl'), ['x'.repeat(65)]);
+  await writeSessionFile(path.join(paths.codexRoot, 'sessions', 'healthy-progress.jsonl'), [
+    jsonLine({ role: 'user', content: 'ok' }),
+  ]);
+  const progress = [];
+
+  await new BackupAgent({
+    paths,
+    maxLineBytes: 64,
+    onProgress: (event) => progress.push(event),
+  }).performOneShotScan();
+
+  assert.deepEqual(progress.at(-1), {
+    totalFiles: 2,
+    completedFiles: 2,
+    failedFiles: 1,
+    pendingFiles: 0,
+    phase: 'seeding',
+  });
+  assert.equal(JSON.parse(await fs.readFile(paths.statusPath, 'utf8')).status, 'error');
 });
 
 test('invalid relative backup path throws a clear error', async (t) => {
@@ -1752,6 +1903,7 @@ test('cursor store preserves tricky values and pending partial line', async (t) 
     pendingPartialLine,
     status: 'active',
     lastError: "boom'); DROP TABLE backup_cursors; --",
+    blockedLineLimitBytes: null,
     updatedAt: 1770000001.5,
   };
 
@@ -1890,9 +2042,9 @@ test('successful initial seed initializes audit state and prevents an immediate 
 test('blocked initial seed does not initialize audit completion', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'blocked-audit-seed.jsonl');
-  await writeSessionFile(sourcePath, ['x'.repeat(32 * 1024 * 1024 + 1)]);
+  await writeSessionFile(sourcePath, ['x'.repeat(65)]);
 
-  await new BackupAgent({ paths }).performOneShotScan();
+  await new BackupAgent({ paths, maxLineBytes: 64 }).performOneShotScan();
 
   assert.equal(await fileExists(paths.auditStatePath), false);
   assert.equal(JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8')).status, 'error');

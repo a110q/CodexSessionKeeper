@@ -5,8 +5,9 @@ const fsp = require('node:fs/promises');
 const { TextDecoder } = require('node:util');
 
 const { DEFAULT_VERIFICATION_CHUNK_SIZE } = require('./verification-store');
+const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
-const DEFAULT_MAX_LINE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_LINE_BYTES = MAX_JSONL_LINE_BYTES;
 
 class BackupFileVerificationError extends Error {}
 

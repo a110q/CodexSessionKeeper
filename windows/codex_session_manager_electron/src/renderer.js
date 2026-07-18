@@ -461,9 +461,12 @@ function renderNasSetup() {
   const progress = setup.progress || {};
   const total = Number(progress.totalFiles || 0);
   const completed = Number(progress.completedFiles || 0);
+  const failed = Number(progress.failedFiles || 0);
   const pending = Number(progress.pendingFiles || 0);
   els.nasOnboardingCounts.textContent = total > 0
-    ? `已发现 ${total} · 已完成 ${completed} · 待处理 ${pending}`
+    ? failed > 0
+      ? `已发现 ${total} · 成功 ${completed - failed} · 异常 ${failed} · 待处理 ${pending}`
+      : `已发现 ${total} · 已检查 ${completed} · 待处理 ${pending}`
     : '';
 
   let detectionText = '等待检测';

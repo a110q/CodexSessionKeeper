@@ -88,3 +88,11 @@ test('launch-at-login warning and repair actions are exposed through guarded IPC
   assert.match(html, /id="openLoginItemSettingsBtn"/);
   assert.match(renderer, /launchAtLogin\.enabled/);
 });
+
+test('NAS onboarding renders truthful Chinese processed and failure counts', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'renderer.js'), 'utf8');
+
+  assert.match(renderer, /已发现 \$\{total\} · 已检查 \$\{completed\} · 待处理 \$\{pending\}/);
+  assert.match(renderer, /已发现 \$\{total\} · 成功 \$\{completed - failed\} · 异常 \$\{failed\} · 待处理 \$\{pending\}/);
+  assert.doesNotMatch(renderer, /已发现 \$\{total\} · 已完成/);
+});

@@ -17,10 +17,11 @@ const { assertSafeDestinationPath, assertSafeSourcePath } = require('./restore-f
 const { rebuildSessionCompleteLines } = require('./session-backup-streamer');
 const { sessionIdFromPath } = require('./session-identity');
 const { loadVerification, saveVerification } = require('./verification-store');
+const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
 const MAXIMUM_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_CHUNK_SIZE = MAXIMUM_CHUNK_SIZE;
-const MAXIMUM_LINE_BYTES = 32 * 1024 * 1024;
+const MAXIMUM_LINE_BYTES = MAX_JSONL_LINE_BYTES;
 const AUDIT_INTERVAL_MS = 86400 * 1000;
 const RETENTION_INTERVAL_MS = 30 * AUDIT_INTERVAL_MS;
 const MAXIMUM_QUARANTINE_COPIES = 3;
@@ -204,6 +205,7 @@ class BackupIntegrityAuditor {
       const result = await verifyFullBackupFile({
         filePath: targetPath,
         chunkSize: document.chunkSize,
+        maxLineBytes: MAX_JSONL_LINE_BYTES,
         expectedByteCount: record.bytesBackedUp,
         expectedLineCount: record.lineCount,
         expectedContentHash: record.contentHash || null,
@@ -391,6 +393,7 @@ class BackupIntegrityAuditor {
           targetPath: repairTemporary,
           maximumOffset: revalidated.cursor.lastByteOffset,
           chunkSize: this.chunkSize,
+          maxLineBytes: MAX_JSONL_LINE_BYTES,
           interruptionRequested,
           onChunk: async (offset, length) => {
             await this.didStreamChunk('repairTemporary', revalidated.sourcePath, offset, length);
@@ -843,7 +846,11 @@ class BackupIntegrityAuditor {
       }
       const repairedAtSeconds = repairedAtDate.getTime() / 1000;
       if (cursor.lastByteOffset === byteCount && cursor.updatedAt <= repairedAtSeconds) {
-        await store.upsert({ ...cursor, updatedAt: repairedAtSeconds, lastError: null });
+        await store.upsert({
+          ...cursor,
+          updatedAt: repairedAtSeconds,
+          lastError: cursor.blockedLineLimitBytes == null ? null : cursor.lastError,
+        });
       }
     } finally {
       await store.close();

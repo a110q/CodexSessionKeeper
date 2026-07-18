@@ -4,9 +4,9 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { TextDecoder } = require('node:util');
+const { MAX_JSONL_LINE_BYTES } = require('./jsonl-policy');
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MAX_JSONL_LINE_BYTES = 32 * 1024 * 1024;
 const IDENTITY_KEY_BY_KIND = Object.freeze({
   history: 'session_id',
   historyBackup: 'session_id',
@@ -72,7 +72,7 @@ function scanJsonlFile(filePath, { collectRecords = false, onFirstRecord = null 
   function acceptLine(lineBytes, isTerminalLine) {
     lineNumber += 1;
     if (lineBytes.length > MAX_JSONL_LINE_BYTES) {
-      throw invalidJsonl(filePath, lineNumber, '单行超过 32 MiB');
+      throw invalidJsonl(filePath, lineNumber, `单行超过 ${MAX_JSONL_LINE_BYTES} bytes`);
     }
     if (lineBytes.length > 0 && lineBytes[lineBytes.length - 1] === 0x0d) {
       lineBytes = lineBytes.subarray(0, lineBytes.length - 1);
@@ -116,7 +116,7 @@ function scanJsonlFile(filePath, { collectRecords = false, onFirstRecord = null 
       }
       pending = Buffer.from(data.subarray(start));
       if (pending.length > MAX_JSONL_LINE_BYTES) {
-        throw invalidJsonl(filePath, lineNumber + 1, '单行超过 32 MiB');
+        throw invalidJsonl(filePath, lineNumber + 1, `单行超过 ${MAX_JSONL_LINE_BYTES} bytes`);
       }
       endedWithNewline = data.length > 0 && data[data.length - 1] === 0x0a;
     }
@@ -408,7 +408,10 @@ function firstRolloutIdentity(filePath) {
       chunks.push(newline >= 0 ? chunk.subarray(0, newline) : chunk);
       total += chunks[chunks.length - 1].length;
       if (total > MAX_JSONL_LINE_BYTES) {
-        throw securityError('UNTRUSTED_SESSION_FILE', `${filePath} 首行超过 32 MiB`);
+        throw securityError(
+          'UNTRUSTED_SESSION_FILE',
+          `${filePath} 首行超过 ${MAX_JSONL_LINE_BYTES} bytes`,
+        );
       }
       if (newline >= 0) break;
     }

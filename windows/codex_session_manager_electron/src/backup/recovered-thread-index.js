@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const { ensureRecoveredThreadsInStateDatabase } = require('./live-state-database');
+const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
 function collapseWhitespace(value) {
   return String(value || '').split(/\s+/).filter(Boolean).join(' ');
@@ -31,8 +32,16 @@ function firstUserMessage(object) {
   return '';
 }
 
-async function extractRecoveredThreadMetadata(record, recoveredPath, codexRoot) {
-  const lines = await firstRecoveredJsonlLines(recoveredPath);
+async function extractRecoveredThreadMetadata(
+  record,
+  recoveredPath,
+  codexRoot,
+  { maxLineBytes = MAX_JSONL_LINE_BYTES, readBufferBytes = 1024 * 1024 } = {},
+) {
+  const lines = await firstRecoveredJsonlLines(recoveredPath, 400, {
+    maxLineBytes,
+    readBufferBytes,
+  });
   let firstTimestamp = null;
   let lastTimestamp = null;
   let userMessage = '';
@@ -111,13 +120,23 @@ async function extractRecoveredThreadMetadata(record, recoveredPath, codexRoot) 
   };
 }
 
-async function firstRecoveredJsonlLines(filePath, limit = 400) {
+async function firstRecoveredJsonlLines(
+  filePath,
+  limit = 400,
+  { maxLineBytes = MAX_JSONL_LINE_BYTES, readBufferBytes = 1024 * 1024 } = {},
+) {
+  const lineLimit = Number.isSafeInteger(maxLineBytes) && maxLineBytes >= 0
+    ? maxLineBytes
+    : MAX_JSONL_LINE_BYTES;
+  const bufferSize = Number.isSafeInteger(readBufferBytes) && readBufferBytes > 0
+    ? readBufferBytes
+    : 1024 * 1024;
   const handle = await fs.promises.open(filePath, 'r');
   const lines = [];
   let pending = [];
   let pendingLength = 0;
   let position = 0;
-  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  const buffer = Buffer.allocUnsafe(bufferSize);
   try {
     while (lines.length < limit) {
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
@@ -132,6 +151,9 @@ async function firstRecoveredJsonlLines(filePath, limit = 400) {
           pending.push(segment);
           pendingLength += segment.length;
         }
+        if (pendingLength > lineLimit) {
+          throw new Error(`Recovered JSONL line exceeds ${lineLimit} bytes.`);
+        }
         if (pendingLength > 0) {
           lines.push(Buffer.concat(pending, pendingLength).toString('utf8'));
         }
@@ -144,8 +166,8 @@ async function firstRecoveredJsonlLines(filePath, limit = 400) {
         const segment = Buffer.from(chunk.subarray(start));
         pending.push(segment);
         pendingLength += segment.length;
-        if (pendingLength > 32 * 1024 * 1024) {
-          throw new Error('Recovered JSONL line exceeds 32 MiB.');
+        if (pendingLength > lineLimit) {
+          throw new Error(`Recovered JSONL line exceeds ${lineLimit} bytes.`);
         }
       }
     }

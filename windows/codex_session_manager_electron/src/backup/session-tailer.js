@@ -1,7 +1,8 @@
 const fs = require('node:fs');
+const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
 const NEWLINE_BYTE = 0x0A;
-const DEFAULT_MAX_LINE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_LINE_BYTES = MAX_JSONL_LINE_BYTES;
 const MAX_PENDING_PARTIAL_BYTES = 64 * 1024;
 
 function readNewCompleteLines(
