@@ -38,7 +38,7 @@
 - `windows/codex_session_manager_electron/scripts/build-employee-guide.js` — 使用 Electron 生成 A4 PDF。
 - `windows/codex_session_manager_electron/test/employee-guide-markdown.test.js` — 文档转换和 HTML 转义测试。
 - `docs/员工安装与使用说明.md` — PDF 的受版本控制内容源。
-- `docs/assets/employee-guide/*.png` — 匿名化的最终界面截图。
+- `docs/assets/employee-guide/*.png` — 匿名化的最终界面截图，或在安全隔离条件不足时使用最终标签制作的离线示意图。
 - `scripts/build_employee_guide.sh` — PDF 构建入口。
 - `scripts/assemble_internal_release.sh` — 汇总双端安装包、PDF 和校验信息。
 
@@ -1443,10 +1443,12 @@ Use the following exact source; replace screenshot files only after their UI lab
 
 本软件会把 Codex 会话持续备份到公司 NAS，并在上传后回读校验。首次使用只需连接 NAS、选择部门和姓名，不要手工选择备份目录。
 
+内部资料，更新日期：2026-07-18。本文图片为按 1.0.14 最终界面标签制作的匿名示意图，使用示例部门和演示员工；不同系统版本的安全提示外观可能略有差异。
+
 ## 1. 选择正确版本
 
-- Apple Silicon Mac 下载 `Codex会话管理-macOS-arm64.dmg`。
-- Windows 10/11 64 位电脑下载 `Codex会话管理-Windows-x64.exe`。
+- Apple Silicon（M 系列）Mac 下载管理员提供的 macOS DMG 安装包；Intel Mac 暂不适用。
+- Windows 10/11 64 位电脑下载管理员提供的 Windows EXE 安装包。
 - 普通员工不需要打开 `安装包校验信息.txt`；该文件仅供管理员核对安装包。
 
 ## 2. 安装与首次启动
@@ -1487,11 +1489,11 @@ Use the following exact source; replace screenshot files only after their UI lab
 
 ### 更换电脑或会话丢失
 
-打开“快照恢复”，选择 NAS 备份设备，再选择缺失会话恢复。全新电脑上没有旧的 Codex 目录也可以恢复；软件会在写入前校验备份完整性。
+打开“快照恢复”。在“恢复来源”中选择“备份恢复”（macOS）或“NAS 备份恢复”（Windows），选择“NAS 备份设备”，再选择状态为“可恢复”的缺失会话，点击“恢复这个缺失会话”或“恢复选中”。恢复完成后重启 Codex。全新电脑没有旧的 Codex 目录也可以恢复；软件会在写入前校验备份完整性。
 
 ### NAS 断开
 
-重新连接“文件中转站”，回到软件点“重新检测 NAS”。仍失败时，打开错误详情截图并联系管理员，不要手动删除备份文件。
+重新连接“文件中转站”，回到软件点击“重新检测 NAS”（配置页）或“重新检测”（状态卡）。仍失败时打开“查看错误详情”，确认画面中没有账号、用户名或本机路径后再截图联系管理员。不要手动删除备份文件。
 
 ### 部门或姓名选错
 
@@ -1499,12 +1501,12 @@ Use the following exact source; replace screenshot files only after their UI lab
 
 ### 退出软件
 
-软件需要常驻才能持续备份。需要退出时，使用软件的明确“退出”命令；首次备份尚未完成时，按页面提示确认。
+软件需要常驻才能持续备份。Windows 关闭窗口只会隐藏到托盘，需要退出时从托盘菜单选择“退出”；macOS 使用系统应用菜单中的退出命令。首次备份尚未完成时，按页面提示确认。
 ```
 
-- [ ] **Step 5: Capture and anonymize screenshots**
+- [ ] **Step 5: Capture or safely illustrate and anonymize the final UI**
 
-Capture the five named PNG files from final builds. Use synthetic department/name and session titles; crop desktop notifications, usernames, account fingerprints and unrelated windows. Visually inspect each image before adding it.
+Prefer capturing the five named PNG files from final builds. If capture would start production backup, access the real NAS/user data, or create uncontrolled resource pressure, use offline illustrations that reproduce the same release version's labels and layout and identify them as illustrations in the guide. Use synthetic department/name and session titles; crop or omit desktop notifications, usernames, account fingerprints and unrelated windows. Visually inspect each image before adding it. Illustrations are documentation aids and must not be presented as evidence that a real NAS backup completed.
 
 - [ ] **Step 6: Build PDF with existing Electron**
 

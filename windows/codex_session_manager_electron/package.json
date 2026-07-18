@@ -7,6 +7,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test",
+    "guide:pdf": "electron scripts/build-employee-guide.js",
     "prepare:sqlite-win": "bash ../../scripts/prepare_windows_sqlite.sh",
     "package:win": "npm run prepare:sqlite-win && electron-packager . codex_session_manager --platform=win32 --arch=x64 --out=../../dist/win10-exe --overwrite --prune=true",
     "dist:win": "npm run prepare:sqlite-win && electron-builder --win nsis --x64 --publish never",
