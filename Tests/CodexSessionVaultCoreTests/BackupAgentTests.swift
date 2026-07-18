@@ -268,7 +268,7 @@ func twoAppendReadbackFailuresRollbackToLastVerifiedLength() throws {
         try fixture.makeAgent(fileCommitter: committer).performOneShotScan()
     }
 
-    #expect(syncCount == 3)
+    #expect(syncCount == 2)
     #expect(try Data(contentsOf: target) == targetBefore)
     #expect(try Data(contentsOf: fixture.paths.manifestURL) == manifestBefore)
     #expect(try Data(contentsOf: fixture.paths.cursorDatabaseURL) == cursorBefore)
@@ -1764,7 +1764,7 @@ func oversizedLineBeyondLimitSetsErrorStatusAndContinuesOtherSessions() throws {
     defer { fixture.cleanup() }
     let blockedSessionID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     let healthySessionID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-    let blockedLine = String(repeating: "x", count: 33_554_433)
+    let blockedLine = String(repeating: "x", count: 65)
     try fixture.writeSession(named: "\(blockedSessionID).jsonl", contents: blockedLine)
     try fixture.writeSession(
         named: "\(healthySessionID).jsonl",
@@ -1772,7 +1772,8 @@ func oversizedLineBeyondLimitSetsErrorStatusAndContinuesOtherSessions() throws {
     )
     let validations = LockedInvocationCounter()
     let agent = fixture.makeAgent(
-        targetValidator: BackupTargetValidator { validations.increment() }
+        targetValidator: BackupTargetValidator { validations.increment() },
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 64)
     )
     defer { agent.stop() }
 
@@ -1797,7 +1798,8 @@ func oversizedLineBeyondLimitSetsErrorStatusAndContinuesOtherSessions() throws {
 
     validations.reset()
     agent.requestImmediateScan(.timer)
-    #expect(validations.wait(for: 1))
+    Thread.sleep(forTimeInterval: 0.2)
+    #expect(validations.value == 0)
     #expect(agent.stopAndAwaitQuiescence(timeout: 10))
 }
 
@@ -1838,6 +1840,165 @@ func corruptedManifestBackupPathOutsideBackupRootIsRepairedWithoutWritingOutside
     let repaired = try #require(fixture.loadManifest().sessions[sessionID])
     #expect(repaired.backupPath == "sessions/\(sessionID).jsonl")
     #expect(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("outside.jsonl").path) == false)
+}
+
+@Test
+func lowerPolicyBlockResumesVerifiedPrefixUnderHigherLimitWithoutRebuild() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    let prefix = #"{"role":"user","content":"ok"}"# + "\n"
+    let largeLine = #"{"role":"assistant","content":""# + String(repeating: "x", count: 70) + #""}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: prefix + largeLine)
+    try fixture.makeAgent(
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 64)
+    ).performOneShotScan()
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    let oldOffset = Int64(Data(prefix.utf8).count)
+    let store = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try store.open()
+    let blocked = try #require(try store.cursor(sourcePath: record.sourcePath))
+    #expect(blocked.lastByteOffset == oldOffset)
+    #expect(blocked.blockedLineLimitBytes == 64)
+    #expect(try Data(contentsOf: target) == Data(prefix.utf8))
+    fixture.resetSpies()
+
+    try fixture.makeAgent(
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 128)
+    ).performOneShotScan()
+
+    let repaired = try #require(try store.cursor(sourcePath: record.sourcePath))
+    #expect(repaired.lastError == nil)
+    #expect(repaired.blockedLineLimitBytes == nil)
+    #expect(try Data(contentsOf: target) == Data((prefix + largeLine).utf8))
+    #expect(fixture.sourceBodyReadRanges.contains(oldOffset..<Int64(Data((prefix + largeLine).utf8).count)))
+    #expect(!fixture.sourceBodyReadRanges.contains(0..<Int64(Data((prefix + largeLine).utf8).count)))
+    #expect(try Data(contentsOf: source) == Data(contentsOf: target))
+}
+
+@Test
+func lowerPolicyBlockWithIdentityMismatchForcesAtomicRebuild() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+    let prefix = #"{"role":"user","content":"ok"}"# + "\n"
+    let largeLine = #"{"role":"assistant","content":""# + String(repeating: "x", count: 70) + #""}"# + "\n"
+    let source = try fixture.writeSession(named: "\(sessionID).jsonl", contents: prefix + largeLine)
+    try fixture.makeAgent(
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 64)
+    ).performOneShotScan()
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let store = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try store.open()
+    var blocked = try #require(try store.cursor(sourcePath: record.sourcePath))
+    blocked.sourceFileIdentity = "stale:identity"
+    try store.upsert(blocked)
+    fixture.resetSpies()
+
+    try fixture.makeAgent(
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 128)
+    ).performOneShotScan()
+
+    let sourceSize = Int64(try Data(contentsOf: source).count)
+    #expect(fixture.sourceBodyReadRanges.contains(0..<sourceSize))
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    #expect(try Data(contentsOf: target) == Data(contentsOf: source))
+}
+
+@Test
+func lowerPolicyBlockWithAnchorMismatchForcesAtomicRebuild() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "abababab-abab-abab-abab-abababababab"
+    let originalPrefix = #"{"role":"user","content":"ok"}"# + "\n"
+    let rewrittenPrefix = #"{"role":"user","content":"no"}"# + "\n"
+    let largeLine = #"{"role":"assistant","content":""# + String(repeating: "x", count: 70) + #""}"# + "\n"
+    let source = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: originalPrefix + largeLine
+    )
+    try fixture.makeAgent(
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 64)
+    ).performOneShotScan()
+    let originalMetadata = try BackupFileCommitter().inspectSource(source)
+    try Data((rewrittenPrefix + largeLine).utf8).write(to: source)
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date(timeIntervalSince1970: originalMetadata.modifiedAt)],
+        ofItemAtPath: source.path
+    )
+    fixture.resetSpies()
+
+    try fixture.makeAgent(
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 128)
+    ).performOneShotScan()
+
+    let sourceSize = Int64(try Data(contentsOf: source).count)
+    #expect(fixture.sourceBodyReadRanges.contains(0..<sourceSize))
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let target = fixture.paths.backupRoot.appendingPathComponent(record.backupPath)
+    #expect(try Data(contentsOf: target) == Data(contentsOf: source))
+}
+
+@Test
+func currentPolicyBlockIsSettledForTimerTicksButStatusStaysError() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let sessionID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    let source = try fixture.writeSession(
+        named: "\(sessionID).jsonl",
+        contents: String(repeating: "x", count: 65)
+    )
+    let scans = LockedInvocationCounter()
+    let agent = fixture.makeAgent(
+        targetValidator: BackupTargetValidator { scans.increment() },
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 64)
+    )
+    defer { agent.stop() }
+    try agent.performOneShotScan()
+    let record = try #require(fixture.loadManifest().sessions[sessionID])
+    let store = BackupCursorStore(databaseURL: fixture.paths.cursorDatabaseURL)
+    try store.open()
+    let cursor = try #require(try store.cursor(sourcePath: record.sourcePath))
+    #expect(cursor.blockedLineLimitBytes == 64)
+    #expect(try fixture.loadStatus().status == .error)
+    fixture.resetSpies()
+    scans.reset()
+
+    agent.requestImmediateScan(.timer)
+    Thread.sleep(forTimeInterval: 0.2)
+
+    #expect(scans.value == 0)
+    #expect(fixture.sourceBodyReadCount == 0)
+    #expect(try Data(contentsOf: source).count == 65)
+    #expect(try fixture.loadStatus().status == .error)
+}
+
+@Test
+func blockedSessionsIncrementFailureProgressWithoutChangingProcessedCount() throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    try fixture.writeSession(
+        named: "11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl",
+        contents: String(repeating: "x", count: 65)
+    )
+    try fixture.writeSession(
+        named: "22222222-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl",
+        contents: #"{"role":"user","content":"ok"}"# + "\n"
+    )
+    var progressEvents: [BackupProgress] = []
+
+    try fixture.makeAgent(
+        progressHandler: { progressEvents.append($0) },
+        sessionBackupStreamer: SessionBackupStreamer(chunkSize: 16, maxLineBytes: 64)
+    ).performOneShotScan()
+
+    let final = try #require(progressEvents.last)
+    #expect(final.totalFiles == 2)
+    #expect(final.completedFiles == 2)
+    #expect(final.failedFiles == 1)
+    #expect(final.pendingFiles == 0)
+    #expect(try fixture.loadStatus().status == .error)
 }
 
 }
@@ -1920,6 +2081,7 @@ private final class BackupAgentFixture {
         remoteStatusWriter: ((Data, URL) throws -> Void)? = nil,
         healthCheckInterval: TimeInterval = 300,
         remoteHeartbeatInterval: TimeInterval = 1_800,
+        sessionBackupStreamer: SessionBackupStreamer = SessionBackupStreamer(chunkSize: 1_048_576),
         integrityAuditorFactory: ((BackupPaths) -> BackupIntegrityAuditor)? = nil
     ) -> BackupAgent {
         BackupAgent(
@@ -1937,7 +2099,7 @@ private final class BackupAgentFixture {
             remoteHeartbeatInterval: remoteHeartbeatInterval,
             auditDelayProvider: auditDelayProvider,
             auditTimerScheduler: auditTimerScheduler,
-            sessionBackupStreamer: SessionBackupStreamer(chunkSize: 1_048_576),
+            sessionBackupStreamer: sessionBackupStreamer,
             cursorStoreFactory: { [weak self] databaseURL in
                 BackupCursorStore(databaseURL: databaseURL, sqliteRunner: { arguments, input in
                     guard let self else { throw BackupAgentFixtureError.fixtureReleased }

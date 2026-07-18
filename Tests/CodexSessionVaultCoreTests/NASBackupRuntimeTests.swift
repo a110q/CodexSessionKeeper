@@ -388,6 +388,33 @@ struct NASBackupRuntimeTests {
     }
 
     @Test
+    func failedProgressCountReachesSnapshotAndFinalStatusRemainsError() async throws {
+        let fixture = try NASRuntimeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.activateStoredConfiguration()
+        let runtime = fixture.makeRuntime()
+        try runtime.initialize()
+        let agent = try #require(fixture.agentFactory.agents.first)
+
+        agent.publishProgress(BackupProgress(
+            totalFiles: 2,
+            completedFiles: 2,
+            pendingFiles: 0,
+            phase: .scanning,
+            failedFiles: 1
+        ))
+        await Task.yield()
+        #expect(runtime.setupSnapshot().completedCount == 2)
+        #expect(runtime.setupSnapshot().failedCount == 1)
+
+        agent.publishStatus(fixture.status(health: .error, message: "blocked line detail"))
+        await Task.yield()
+        #expect(runtime.setupSnapshot().state == .error)
+        #expect(runtime.setupSnapshot().failedCount == 1)
+        #expect(runtime.setupSnapshot().lastError == "blocked line detail")
+    }
+
+    @Test
     func failedReconfigurationRestartsPreviousValidatedTarget() throws {
         let fixture = try NASRuntimeFixture()
         defer { fixture.cleanup() }

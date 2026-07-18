@@ -28,6 +28,7 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
     public let pendingCount: Int
     public let completedCount: Int
     public let totalCount: Int
+    public let failedCount: Int
     public let lastBackupAt: Date?
     public let lastError: String?
     public let lastAuditAt: Date?
@@ -35,12 +36,28 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
     public let lastRepairAt: Date?
     public let repairCount: Int?
 
+    private enum CodingKeys: String, CodingKey {
+        case state
+        case configuration
+        case pendingCount
+        case completedCount
+        case totalCount
+        case failedCount
+        case lastBackupAt
+        case lastError
+        case lastAuditAt
+        case lastAuditResult
+        case lastRepairAt
+        case repairCount
+    }
+
     public init(
         state: NASSetupState,
         configuration: NASBackupConfiguration? = nil,
         pendingCount: Int = 0,
         completedCount: Int = 0,
         totalCount: Int = 0,
+        failedCount: Int = 0,
         lastBackupAt: Date? = nil,
         lastError: String? = nil,
         lastAuditAt: Date? = nil,
@@ -53,12 +70,36 @@ public struct NASSetupSnapshot: Codable, Equatable, Sendable {
         self.pendingCount = pendingCount
         self.completedCount = completedCount
         self.totalCount = totalCount
+        self.failedCount = failedCount
         self.lastBackupAt = lastBackupAt
         self.lastError = lastError
         self.lastAuditAt = lastAuditAt
         self.lastAuditResult = lastAuditResult
         self.lastRepairAt = lastRepairAt
         self.repairCount = repairCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        state = try container.decode(NASSetupState.self, forKey: .state)
+        configuration = try container.decodeIfPresent(NASBackupConfiguration.self, forKey: .configuration)
+        pendingCount = try container.decodeIfPresent(Int.self, forKey: .pendingCount) ?? 0
+        completedCount = try container.decodeIfPresent(Int.self, forKey: .completedCount) ?? 0
+        totalCount = try container.decodeIfPresent(Int.self, forKey: .totalCount) ?? 0
+        failedCount = try container.decodeIfPresent(Int.self, forKey: .failedCount) ?? 0
+        lastBackupAt = try container.decodeIfPresent(Date.self, forKey: .lastBackupAt)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        lastAuditAt = try container.decodeIfPresent(Date.self, forKey: .lastAuditAt)
+        lastAuditResult = try container.decodeIfPresent(String.self, forKey: .lastAuditResult)
+        lastRepairAt = try container.decodeIfPresent(Date.self, forKey: .lastRepairAt)
+        repairCount = try container.decodeIfPresent(Int.self, forKey: .repairCount)
+    }
+
+    public var progressSummary: String {
+        if failedCount == 0 {
+            return "已发现 \(totalCount) · 已检查 \(completedCount) · 待处理 \(pendingCount)"
+        }
+        return "已发现 \(totalCount) · 成功 \(max(0, completedCount - failedCount)) · 异常 \(failedCount) · 待处理 \(pendingCount)"
     }
 }
 
@@ -368,6 +409,7 @@ public final class NASBackupRuntime {
             pendingCount: progress.pendingFiles,
             completedCount: progress.completedFiles,
             totalCount: progress.totalFiles,
+            failedCount: progress.failedFiles,
             lastBackupAt: snapshot.lastBackupAt,
             lastError: snapshot.lastError,
             lastAuditAt: snapshot.lastAuditAt,
@@ -417,6 +459,7 @@ public final class NASBackupRuntime {
             pendingCount: snapshot.pendingCount,
             completedCount: snapshot.completedCount,
             totalCount: snapshot.totalCount,
+            failedCount: snapshot.failedCount,
             lastBackupAt: snapshot.lastBackupAt,
             lastError: error.localizedDescription,
             lastAuditAt: snapshot.lastAuditAt,
@@ -473,6 +516,7 @@ public final class NASBackupRuntime {
             pendingCount: snapshot.pendingCount,
             completedCount: snapshot.completedCount,
             totalCount: snapshot.totalCount,
+            failedCount: snapshot.failedCount,
             lastBackupAt: status?.lastBackupAt ?? snapshot.lastBackupAt,
             lastError: status?.lastError,
             lastAuditAt: status?.lastAuditAt ?? snapshot.lastAuditAt,

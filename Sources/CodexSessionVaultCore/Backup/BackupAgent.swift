@@ -11,6 +11,21 @@ public struct BackupProgress: Equatable, Sendable {
     public let completedFiles: Int
     public let pendingFiles: Int
     public let phase: BackupProgressPhase
+    public let failedFiles: Int
+
+    public init(
+        totalFiles: Int,
+        completedFiles: Int,
+        pendingFiles: Int,
+        phase: BackupProgressPhase,
+        failedFiles: Int = 0
+    ) {
+        self.totalFiles = totalFiles
+        self.completedFiles = completedFiles
+        self.pendingFiles = pendingFiles
+        self.phase = phase
+        self.failedFiles = failedFiles
+    }
 }
 
 struct BackupAgentInstrumentation {
@@ -316,13 +331,15 @@ public final class BackupAgent: @unchecked Sendable {
         var staleCursorSourcePaths: [String] = []
         var scanErrors: [String] = []
         var completed = 0
+        var failed = 0
         var interrupted = false
         var remainingSources: [URL] = []
         lastKnownProgress = BackupProgress(
             totalFiles: sources.count,
             completedFiles: 0,
             pendingFiles: sources.count,
-            phase: phase
+            phase: phase,
+            failedFiles: 0
         )
         for (sourceIndex, sourceURL) in sources.enumerated() {
             if shouldStopBetweenSessionAtomicSteps() {
@@ -350,7 +367,8 @@ public final class BackupAgent: @unchecked Sendable {
                             totalFiles: sources.count,
                             completedFiles: completed,
                             pendingFiles: max(0, sources.count - completed),
-                            phase: .verifying
+                            phase: .verifying,
+                            failedFiles: failed
                         )
                         self.lastKnownProgress = progress
                         self.progressHandler?(progress)
@@ -368,13 +386,15 @@ public final class BackupAgent: @unchecked Sendable {
             }
             if let lastError = result.lastError {
                 scanErrors.append(lastError)
+                failed += 1
             }
             completed += 1
             let progress = BackupProgress(
                 totalFiles: sources.count,
                 completedFiles: completed,
                 pendingFiles: max(0, sources.count - completed),
-                phase: phase
+                phase: phase,
+                failedFiles: failed
             )
             lastKnownProgress = progress
             progressHandler?(progress)
@@ -421,11 +441,9 @@ public final class BackupAgent: @unchecked Sendable {
             includeRemote: true
         )
         try writePendingSources([])
-        if scanErrors.isEmpty {
-            stateLock.lock()
-            settledSourceSnapshot = nextSettledSourceSnapshot
-            stateLock.unlock()
-        }
+        stateLock.lock()
+        settledSourceSnapshot = nextSettledSourceSnapshot
+        stateLock.unlock()
     }
 
     private func interruptedPendingSources(
@@ -874,7 +892,9 @@ public final class BackupAgent: @unchecked Sendable {
             relativeBackupPath: relativeBackupPath,
             chunkSize: verification.chunkSize
         )
-        if recordHasTrustedVerification, scanIsStrictlyUnchanged(
+        if recordHasTrustedVerification,
+           !shouldRetryBlockedLine(cursor: currentCursor),
+           scanIsStrictlyUnchanged(
             sourcePath: sourcePath,
             relativeBackupPath: relativeBackupPath,
             sourceMetadata: sourceMetadata,
@@ -896,10 +916,15 @@ public final class BackupAgent: @unchecked Sendable {
         let recordedOffset = baselineCursor?.lastByteOffset ?? 0
         let recordedLineCount = baselineCursor?.lineCount ?? existingRecord?.lineCount ?? 0
         let metadataAgrees = baselineCursor.map {
-            sourceMetadata.byteCount > $0.lastSourceSize
+            (sourceMetadata.byteCount > $0.lastSourceSize
                 && sourceMetadata.byteCount >= $0.lastByteOffset
                 && existingRecord?.bytesBackedUp == $0.lastByteOffset
-                && existingRecord?.lineCount == $0.lineCount
+                && existingRecord?.lineCount == $0.lineCount)
+                || (shouldRetryBlockedLine(cursor: $0)
+                    && sourceMetadata.byteCount == $0.lastSourceSize
+                    && sourceMetadata.modifiedAt == $0.lastSourceModifiedAt
+                    && existingRecord?.bytesBackedUp == $0.lastByteOffset
+                    && existingRecord?.lineCount == $0.lineCount)
         } ?? false
         let pathAgrees = baselineCursor?.backupPath == relativeBackupPath
             && existingRecord?.backupPath == relativeBackupPath
@@ -914,7 +939,8 @@ public final class BackupAgent: @unchecked Sendable {
                 || baselineCursor?.sourceFileIdentity == sourceMetadata.fileIdentity
             let anchorsMatch = if identityMatches, let existingVerification {
                 (try? BackupFileVerifier(
-                    chunkSize: verification.chunkSize
+                    chunkSize: verification.chunkSize,
+                    maxLineBytes: sessionBackupStreamer.effectiveMaxLineBytes
                 ).verifyAppendAnchors(
                     source: sourceURL,
                     previous: existingVerification,
@@ -990,7 +1016,8 @@ public final class BackupAgent: @unchecked Sendable {
                 if appended.appendedByteCount > 0 {
                     verificationProgress()
                     updatedVerification = try BackupFileVerifier(
-                        chunkSize: verificationChunkSize
+                        chunkSize: verificationChunkSize,
+                        maxLineBytes: sessionBackupStreamer.effectiveMaxLineBytes
                     ).verifyChangedChunks(
                         source: sourceURL,
                         target: targetURL,
@@ -1041,32 +1068,7 @@ public final class BackupAgent: @unchecked Sendable {
                     to: recordedOffset,
                     under: paths.backupRoot
                 )
-                instrumentation.sourceBodyRead(sourceURL, 0, sourceMetadata.byteCount)
-                let (streamed, verified) = try verifiedRebuild(
-                    sourceURL: sourceURL,
-                    targetURL: targetURL,
-                    chunkSize: verificationChunkSize,
-                    attempts: 1,
-                    verificationProgress: verificationProgress
-                )
-                verification.sessions[sessionID] = BackupSessionVerification(
-                    backupPath: relativeBackupPath,
-                    byteCount: verified.byteCount,
-                    lineCount: verified.lineCount,
-                    chunkHashes: verified.chunkHashes,
-                    verifiedAt: scanDate
-                )
-                finalStats = BackupFileStats(
-                    byteCount: streamed.committedByteCount,
-                    lineCount: streamed.lineCount
-                )
-                finalOffset = streamed.committedByteCount
-                pendingPartialLine = streamed.pendingPartialLine
-                blockedError = streamed.blockedError
-                appendedLineCount = streamed.lineCount - recordedLineCount
-                wroteData = true
-                contentHash = streamed.contentHash
-                fallbackTitle = streamed.firstTitle
+                throw error
             }
 
             if finalOffset > recordedOffset {
@@ -1114,7 +1116,10 @@ public final class BackupAgent: @unchecked Sendable {
             status: Self.activeStatus,
             lastError: blockedError,
             updatedAt: scanDate.timeIntervalSince1970,
-            sourceFileIdentity: sourceMetadata.fileIdentity
+            sourceFileIdentity: sourceMetadata.fileIdentity,
+            blockedLineLimitBytes: blockedError == nil
+                ? nil
+                : sessionBackupStreamer.effectiveMaxLineBytes
         )
         return ProcessSessionFileResult(
             manifestChanged: manifestChanged,
@@ -1200,6 +1205,11 @@ public final class BackupAgent: @unchecked Sendable {
         return cursor.pendingPartialLine.isEmpty && cursor.lastError == nil
     }
 
+    private func shouldRetryBlockedLine(cursor: BackupCursor?) -> Bool {
+        guard let blockedLineLimitBytes = cursor?.blockedLineLimitBytes else { return false }
+        return blockedLineLimitBytes < sessionBackupStreamer.effectiveMaxLineBytes
+    }
+
     private func verificationMatches(
         _ verification: BackupSessionVerification?,
         record: BackupSessionRecord?,
@@ -1244,7 +1254,10 @@ public final class BackupAgent: @unchecked Sendable {
                     under: paths.backupRoot,
                     using: sessionBackupStreamer,
                     verifyTemporary: { temporaryURL, expected in
-                        verification = try BackupFileVerifier(chunkSize: chunkSize).verifyFull(
+                        verification = try BackupFileVerifier(
+                            chunkSize: chunkSize,
+                            maxLineBytes: self.sessionBackupStreamer.effectiveMaxLineBytes
+                        ).verifyFull(
                             temporaryURL,
                             expectedByteCount: expected.committedByteCount,
                             expectedLineCount: expected.lineCount,

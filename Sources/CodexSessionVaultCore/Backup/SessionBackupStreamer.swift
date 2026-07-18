@@ -88,7 +88,7 @@ public struct SessionBackupStreamer: Sendable {
     private static let newline = Data([newlineByte])
 
     private let chunkSize: Int
-    private let maxLineBytes: Int
+    let effectiveMaxLineBytes: Int
     private let maxPendingPartialBytes: Int
 
     public init(
@@ -97,7 +97,7 @@ public struct SessionBackupStreamer: Sendable {
         maxPendingPartialBytes: Int = 65_536
     ) {
         self.chunkSize = min(max(1, chunkSize), Self.maximumChunkSize)
-        self.maxLineBytes = max(0, maxLineBytes)
+        self.effectiveMaxLineBytes = max(0, maxLineBytes)
         self.maxPendingPartialBytes = max(0, maxPendingPartialBytes)
     }
 
@@ -176,10 +176,10 @@ public struct SessionBackupStreamer: Sendable {
                     if segmentStart < newlineIndex {
                         pendingLine.append(contentsOf: chunk[segmentStart..<newlineIndex])
                     }
-                    guard pendingLine.count <= maxLineBytes else {
+                    guard pendingLine.count <= effectiveMaxLineBytes else {
                         blockedError = Self.blockedErrorMessage(
                             for: source,
-                            maxLineBytes: maxLineBytes,
+                            maxLineBytes: effectiveMaxLineBytes,
                             lineOffset: lineOffset
                         )
                         pendingLine.removeAll(keepingCapacity: false)
@@ -205,10 +205,10 @@ public struct SessionBackupStreamer: Sendable {
 
                 if segmentStart < chunk.endIndex {
                     pendingLine.append(contentsOf: chunk[segmentStart..<chunk.endIndex])
-                    guard pendingLine.count <= maxLineBytes else {
+                    guard pendingLine.count <= effectiveMaxLineBytes else {
                         blockedError = Self.blockedErrorMessage(
                             for: source,
-                            maxLineBytes: maxLineBytes,
+                            maxLineBytes: effectiveMaxLineBytes,
                             lineOffset: lineOffset
                         )
                         pendingLine.removeAll(keepingCapacity: false)
@@ -271,10 +271,10 @@ public struct SessionBackupStreamer: Sendable {
                 if segmentStart < newlineIndex {
                     pendingLine.append(contentsOf: chunk[segmentStart..<newlineIndex])
                 }
-                guard pendingLine.count <= maxLineBytes else {
+                guard pendingLine.count <= effectiveMaxLineBytes else {
                     blockedError = Self.blockedErrorMessage(
                         for: source,
-                        maxLineBytes: maxLineBytes,
+                        maxLineBytes: effectiveMaxLineBytes,
                         lineOffset: sourceOffset + appendedByteCount
                     )
                     pendingLine.removeAll(keepingCapacity: false)
@@ -297,10 +297,10 @@ public struct SessionBackupStreamer: Sendable {
 
             if segmentStart < chunk.endIndex {
                 pendingLine.append(contentsOf: chunk[segmentStart..<chunk.endIndex])
-                guard pendingLine.count <= maxLineBytes else {
+                guard pendingLine.count <= effectiveMaxLineBytes else {
                     blockedError = Self.blockedErrorMessage(
                         for: source,
-                        maxLineBytes: maxLineBytes,
+                        maxLineBytes: effectiveMaxLineBytes,
                         lineOffset: sourceOffset + appendedByteCount
                     )
                     pendingLine.removeAll(keepingCapacity: false)

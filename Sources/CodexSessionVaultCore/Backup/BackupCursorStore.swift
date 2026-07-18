@@ -12,6 +12,7 @@ public struct BackupCursor: Equatable, Sendable {
     public var pendingPartialLine: Data
     public var status: String
     public var lastError: String?
+    public var blockedLineLimitBytes: Int?
     public var updatedAt: TimeInterval
 
     public init(
@@ -26,7 +27,8 @@ public struct BackupCursor: Equatable, Sendable {
         status: String,
         lastError: String?,
         updatedAt: TimeInterval,
-        sourceFileIdentity: String? = nil
+        sourceFileIdentity: String? = nil,
+        blockedLineLimitBytes: Int? = nil
     ) {
         self.sessionId = sessionId
         self.sourcePath = sourcePath
@@ -39,6 +41,7 @@ public struct BackupCursor: Equatable, Sendable {
         self.pendingPartialLine = pendingPartialLine
         self.status = status
         self.lastError = lastError
+        self.blockedLineLimitBytes = blockedLineLimitBytes
         self.updatedAt = updatedAt
     }
 }
@@ -106,6 +109,7 @@ public final class BackupCursorStore {
             pending_partial_line TEXT NOT NULL,
             status TEXT NOT NULL,
             last_error TEXT,
+            blocked_line_limit_bytes INTEGER,
             updated_at REAL NOT NULL
         );
         """
@@ -113,8 +117,29 @@ public final class BackupCursorStore {
             let columns = try cursorColumnNames()
             if columns.isEmpty {
                 try execute(createTable)
-            } else if !columns.contains("source_file_identity") {
-                try execute("ALTER TABLE backup_cursors ADD COLUMN source_file_identity TEXT;")
+            } else {
+                var migrations: [String] = []
+                if !columns.contains("source_file_identity") {
+                    migrations.append("ALTER TABLE backup_cursors ADD COLUMN source_file_identity TEXT;")
+                }
+                if !columns.contains("blocked_line_limit_bytes") {
+                    migrations.append("ALTER TABLE backup_cursors ADD COLUMN blocked_line_limit_bytes INTEGER;")
+                    migrations.append("""
+                    UPDATE backup_cursors
+                    SET blocked_line_limit_bytes = 33554432
+                    WHERE blocked_line_limit_bytes IS NULL
+                      AND last_error LIKE 'Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset %';
+                    """)
+                }
+                if !migrations.isEmpty {
+                    try execute("""
+                    .bail on
+                    .timeout 5000
+                    BEGIN IMMEDIATE;
+                    \(migrations.joined(separator: "\n"))
+                    COMMIT;
+                    """)
+                }
             }
         } else {
             try execute(createTable)
@@ -144,6 +169,7 @@ public final class BackupCursorStore {
             pending_partial_line,
             status,
             last_error,
+            blocked_line_limit_bytes,
             updated_at
         FROM backup_cursors
         ORDER BY source_path COLLATE BINARY ASC;
@@ -215,6 +241,7 @@ public final class BackupCursorStore {
             pending_partial_line,
             status,
             last_error,
+            blocked_line_limit_bytes,
             updated_at
         ) VALUES (
             \(Self.sqlText(cursor.sourcePath)),
@@ -228,6 +255,7 @@ public final class BackupCursorStore {
             \(Self.sqlText(pendingPartialLine)),
             \(Self.sqlText(cursor.status)),
             \(Self.sqlNullableText(cursor.lastError)),
+            \(Self.sqlNullableInt(cursor.blockedLineLimitBytes)),
             \(cursor.updatedAt)
         )
         ON CONFLICT(source_path) DO UPDATE SET
@@ -241,6 +269,7 @@ public final class BackupCursorStore {
             pending_partial_line = excluded.pending_partial_line,
             status = excluded.status,
             last_error = excluded.last_error,
+            blocked_line_limit_bytes = excluded.blocked_line_limit_bytes,
             updated_at = excluded.updated_at;
         """
     }
@@ -344,6 +373,10 @@ public final class BackupCursorStore {
         }
         return sqlText(value)
     }
+
+    private static func sqlNullableInt(_ value: Int?) -> String {
+        value.map(String.init) ?? "NULL"
+    }
 }
 
 private struct CursorRow: Decodable {
@@ -358,6 +391,7 @@ private struct CursorRow: Decodable {
     var pendingPartialLine: String
     var status: String
     var lastError: String?
+    var blockedLineLimitBytes: Int?
     var updatedAt: TimeInterval
 
     enum CodingKeys: String, CodingKey {
@@ -372,6 +406,7 @@ private struct CursorRow: Decodable {
         case pendingPartialLine = "pending_partial_line"
         case status
         case lastError = "last_error"
+        case blockedLineLimitBytes = "blocked_line_limit_bytes"
         case updatedAt = "updated_at"
     }
 
@@ -392,7 +427,8 @@ private struct CursorRow: Decodable {
             status: status,
             lastError: lastError,
             updatedAt: updatedAt,
-            sourceFileIdentity: sourceFileIdentity
+            sourceFileIdentity: sourceFileIdentity,
+            blockedLineLimitBytes: blockedLineLimitBytes
         )
     }
 }

@@ -46,9 +46,7 @@ struct EmployeeStateCard: View {
                         value: Double(snapshot.completedCount),
                         total: Double(snapshot.totalCount)
                     )
-                    Text(
-                        "已发现 \(snapshot.totalCount) · 已完成 \(snapshot.completedCount) · 待处理 \(snapshot.pendingCount)"
-                    )
+                    Text(snapshot.progressSummary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }

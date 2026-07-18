@@ -180,7 +180,20 @@ func cursorStoreMigratesLegacySchemaWithoutLosingRows() throws {
             1,
             '',
             'active',
-            NULL,
+            'Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset 9: /tmp/legacy.jsonl',
+            1700000001
+        );
+        INSERT INTO backup_cursors VALUES (
+            '/tmp/unrelated.jsonl',
+            'unrelated-session',
+            'sessions/unrelated.jsonl',
+            4,
+            8,
+            1700000000,
+            1,
+            '',
+            'active',
+            'NAS volume unavailable',
             1700000001
         );
         """,
@@ -194,10 +207,14 @@ func cursorStoreMigratesLegacySchemaWithoutLosingRows() throws {
     #expect(migrated.sessionId == "legacy-session")
     #expect(migrated.lastByteOffset == 9)
     #expect(migrated.sourceFileIdentity == nil)
+    #expect(migrated.blockedLineLimitBytes == 33_554_432)
+    #expect(try store.cursor(sourcePath: "/tmp/unrelated.jsonl")?.blockedLineLimitBytes == nil)
 
     migrated.sourceFileIdentity = "42:99"
+    migrated.blockedLineLimitBytes = 67_108_864
     try store.upsert(migrated)
     #expect(try store.cursor(sourcePath: migrated.sourcePath)?.sourceFileIdentity == "42:99")
+    #expect(try store.cursor(sourcePath: migrated.sourcePath)?.blockedLineLimitBytes == 67_108_864)
 }
 
 @Test

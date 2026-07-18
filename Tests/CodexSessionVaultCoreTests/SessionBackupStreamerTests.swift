@@ -67,7 +67,7 @@ struct SessionBackupStreamerTests {
     }
 
     @Test
-    func rebuildAcceptsLegalThirtyTwoMiBLineAcrossChunks() throws {
+    func rebuildAcceptsLegalSixtyFourMiBLineAcrossChunks() throws {
         var sourceData = Data(repeating: 0x78, count: SessionTailer.defaultMaxLineBytes)
         sourceData.append(0x0A)
         let fixture = try StreamerFixture(source: sourceData, chunkSize: chunkSize)
@@ -161,7 +161,7 @@ struct SessionBackupStreamerTests {
     }
 
     @Test
-    func appendTitleFallbackStopsAtThirtyTwoMiBLineBound() throws {
+    func appendTitleFallbackStopsAtSixtyFourMiBLineBound() throws {
         var sourceData = Data(repeating: 0x78, count: SessionTailer.defaultMaxLineBytes + 1)
         sourceData.append(0x0A)
         sourceData.append(Data(#"{"role":"user","content":"must not be reached"}"#.utf8))

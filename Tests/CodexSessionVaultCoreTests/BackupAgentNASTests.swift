@@ -111,7 +111,7 @@ struct BackupAgentNASTests {
     }
 
     @Test
-    func queuedIncrementalScanInterruptsRepairTemporaryStreamAndThenCatchesUp() throws {
+    func interruptedRepairWithCorruptPrefixRollsBackQueuedAppendWithoutAdvancingMetadata() throws {
         let fixture = try DirectNASBackupFixture()
         defer { fixture.cleanup() }
         let initial = String(repeating: fixture.line("bulk"), count: 45_000)
@@ -163,10 +163,12 @@ struct BackupAgentNASTests {
         #expect(scanDone.wait(timeout: .now() + 10) == .success)
 
         #expect(try auditResult.get() == .interrupted)
-        _ = try scanResult.get()
-        #expect(try String(contentsOf: target, encoding: .utf8).hasSuffix(fixture.line("new")))
-        let expectedByteCount = Int64((initial + fixture.line("new")).utf8.count)
-        #expect(try fixture.loadCursor(sourcePath: source.path)?.lastByteOffset == expectedByteCount)
+        #expect(throws: BackupFileVerificationError.self) {
+            _ = try scanResult.get()
+        }
+        #expect(try String(contentsOf: target, encoding: .utf8).hasSuffix(fixture.line("new")) == false)
+        #expect(try target.resourceValues(forKeys: [.fileSizeKey]).fileSize == initial.utf8.count)
+        #expect(try fixture.loadCursor(sourcePath: source.path)?.lastByteOffset == Int64(initial.utf8.count))
     }
 
     @Test

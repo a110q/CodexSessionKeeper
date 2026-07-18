@@ -363,7 +363,7 @@ public enum TrustedSessionFileResolver {
             }
             line.append(chunk)
             guard line.count <= SessionJSONLScanner.maximumLineBytes else {
-                throw untrusted(fileURL, "首行超过 32 MiB")
+                throw untrusted(fileURL, "首行超过 \(SessionJSONLScanner.maximumLineBytes) bytes")
             }
         }
         if line.last == 0x0D { line.removeLast() }
@@ -429,7 +429,7 @@ public enum TrustedSessionFileResolver {
 }
 
 enum SessionJSONLScanner {
-    static let maximumLineBytes = 32 * 1024 * 1024
+    static let maximumLineBytes = SessionJSONLPolicy.maximumLineBytes
 
     struct Result {
         let fingerprint: SessionFileFingerprint
@@ -474,7 +474,7 @@ enum SessionJSONLScanner {
                 throw SessionJSONLValidationError(
                     fileURL: fileURL,
                     lineNumber: lineNumber,
-                    reason: "单行超过 32 MiB"
+                    reason: "单行超过 \(maximumLineBytes) bytes"
                 )
             }
             try autoreleasepool {
@@ -501,7 +501,7 @@ enum SessionJSONLScanner {
                 throw SessionJSONLValidationError(
                     fileURL: fileURL,
                     lineNumber: lineNumber + 1,
-                    reason: "单行超过 32 MiB"
+                    reason: "单行超过 \(maximumLineBytes) bytes"
                 )
             }
         }

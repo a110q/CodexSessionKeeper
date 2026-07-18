@@ -20,7 +20,7 @@ public struct TailReadResult: Equatable, Sendable {
 }
 
 public final class SessionTailer {
-    public static let defaultMaxLineBytes = 32 * 1_024 * 1_024
+    public static let defaultMaxLineBytes = SessionJSONLPolicy.maximumLineBytes
 
     private let maxReadBytes: Int
     private let maxPendingPartialBytes: Int
