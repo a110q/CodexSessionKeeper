@@ -5,6 +5,21 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Invoke-CheckedNative {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Description,
+    [Parameter(Mandatory = $true)]
+    [scriptblock]$Command
+  )
+
+  & $Command
+  $ExitCode = $LASTEXITCODE
+  if ($ExitCode -ne 0) {
+    throw "$Description failed with exit code $ExitCode"
+  }
+}
+
 if (-not [Environment]::Is64BitOperatingSystem -or $env:OS -ne "Windows_NT") {
   throw "Windows x64 is required"
 }
@@ -21,13 +36,14 @@ $Dist = Join-Path $Root "dist\windows"
 
 Push-Location $App
 try {
-  npm ci
+  Invoke-CheckedNative "npm ci" { npm ci }
+  Invoke-CheckedNative "prepare Windows SQLite" { npm run prepare:sqlite-win }
   $env:CODEX_RELEASE_VERSION = $Version
   $env:CODEX_RELEASE_BUILD = "$Build"
-  node -e "const fs=require('fs');const p=require('./package.json');p.version=process.env.CODEX_RELEASE_VERSION;p.updateBuild=Number(process.env.CODEX_RELEASE_BUILD);fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
-  npm install --package-lock-only --ignore-scripts
-  npm test
-  npm run package:win
+  Invoke-CheckedNative "set release metadata" { node -e "const fs=require('fs');const p=require('./package.json');p.version=process.env.CODEX_RELEASE_VERSION;p.updateBuild=Number(process.env.CODEX_RELEASE_BUILD);fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')" }
+  Invoke-CheckedNative "update package lock" { npm install --package-lock-only --ignore-scripts }
+  Invoke-CheckedNative "npm test" { npm test }
+  Invoke-CheckedNative "package Windows installer" { npm run package:win }
 } finally {
   Pop-Location
 }

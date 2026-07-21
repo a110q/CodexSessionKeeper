@@ -331,5 +331,6 @@ module.exports = {
   mergeSingleSessionStateDb,
   repairStateDatabaseRolloutPaths,
   replaceStateDatabase,
+  resolveSqlitePath,
   runSQLite,
 };

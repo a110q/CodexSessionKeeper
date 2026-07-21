@@ -12,9 +12,10 @@ const {
   mergeSingleSessionStateDb,
   repairStateDatabaseRolloutPaths,
   replaceStateDatabase,
+  resolveSqlitePath,
 } = require('../../src/backup/live-state-database');
 
-const sqlitePath = '/usr/bin/sqlite3';
+const sqlitePath = resolveSqlitePath();
 
 async function makeFixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'live-state-database-'));
