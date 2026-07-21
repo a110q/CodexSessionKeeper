@@ -44,3 +44,16 @@ test('all production JSONL consumers share the dependency-free 64 MiB policy', (
     .join('\n');
   assert.doesNotMatch(production, /32\s*\*\s*1024\s*\*\s*1024|33554432|32 MiB/);
 });
+
+test('large verification uses the fixed one-use Worker boundary without a main-process fallback', () => {
+  const verifier = fs.readFileSync(path.join(sourceRoot, 'backup', 'backup-file-verifier.js'), 'utf8');
+  const isolation = fs.readFileSync(path.join(sourceRoot, 'backup', 'isolated-backup-verifier.js'), 'utf8');
+  const worker = fs.readFileSync(path.join(sourceRoot, 'backup', 'backup-verification-worker.js'), 'utf8');
+
+  assert.match(isolation, /8\s*\*\s*1024\s*\*\s*1024/);
+  assert.match(isolation, /new Worker\(WORKER_PATH/);
+  assert.match(verifier, /stats\.size\s*>=\s*ISOLATED_VERIFICATION_THRESHOLD_BYTES/);
+  assert.match(worker, /verifyFullBackupFileInProcess/);
+  assert.match(worker, /verifyChangedBackupChunksInProcess/);
+  assert.doesNotMatch(isolation, /verifyFullBackupFile|verifyChangedBackupChunks/);
+});

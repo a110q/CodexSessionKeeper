@@ -119,6 +119,14 @@ function multiChunkJSONL(minimumBytes) {
   return Buffer.from(record.repeat(Math.ceil(minimumBytes / Buffer.byteLength(record))));
 }
 
+function jsonStringRecord(totalBytes) {
+  const record = Buffer.alloc(totalBytes, 0x78);
+  record[0] = 0x22;
+  record[totalBytes - 2] = 0x22;
+  record[totalBytes - 1] = 0x0A;
+  return record;
+}
+
 test('catalog classifies missing and existing backup sessions', async (t) => {
   const { paths } = await makeFixture(t);
   const missing = await addBackup(paths, 'missing');
@@ -198,6 +206,50 @@ test('restore streams a file larger than three verification chunks', async (t) =
   assert.ok(restored.chunkHashes.length > 3);
   assert.ok(readSizes.length > 3);
   assert.ok(readSizes.every((size) => size > 0 && size <= VERIFICATION_CHUNK_SIZE));
+});
+
+test('restore validates and publishes one legal 9 MiB JSONL record byte for byte', async (t) => {
+  const { paths } = await makeFixture(t);
+  const content = jsonStringRecord(9 * 1024 * 1024);
+  const selected = await addBackup(paths, 'large-record', content);
+  await writeManifest(paths, { 'large-record': selected });
+
+  const preflight = await preflightIncrementalRecovery({
+    paths,
+    sessionIds: ['large-record'],
+  });
+  const result = await restoreIncrementalSessions({ paths, preflight });
+  const recoveredPath = result.recoveredFiles['large-record'];
+
+  assert.deepEqual(await fs.readFile(recoveredPath), content);
+  assert.equal(result.records.length, 1);
+  assert.equal(result.records[0].sessionId, 'large-record');
+});
+
+test('large same-length corruption fails preflight before creating a fresh codex root', async (t) => {
+  const { paths } = await makeFixture(t);
+  const content = jsonStringRecord(9 * 1024 * 1024);
+  const selected = await addBackup(paths, 'large-corrupt', content);
+  await writeManifest(paths, { 'large-corrupt': selected });
+  const sourcePath = path.join(paths.backupRoot, selected.backupPath);
+  const handle = await fs.open(sourcePath, 'r+');
+  try {
+    await handle.write(Buffer.from('y'), 0, 1, 1024);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fs.rm(paths.codexRoot, { recursive: true, force: true });
+
+  await assert.rejects(
+    preflightIncrementalRecovery({ paths, sessionIds: ['large-corrupt'] }),
+  );
+
+  assert.equal(fsSync.existsSync(paths.codexRoot), false);
+  assert.equal(
+    fsSync.existsSync(path.join(paths.codexRoot, 'sessions', 'recovered', 'large-corrupt.jsonl')),
+    false,
+  );
 });
 
 test('restore revalidates every preflight source and never overwrites a destination', async (t) => {
