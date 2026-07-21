@@ -1578,7 +1578,7 @@ test('fresh cursor reconciliation compares an existing target prefix without who
   assert.equal(await fs.readFile(targetPath, 'utf8'), first + second);
 });
 
-test('initial matching unverified target is rebuilt and gains a verification sidecar', async (t) => {
+test('initial matching unverified target is rebuilt with two bounded source passes', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'existing-seed-hash.jsonl');
   const assistant = jsonLine({ role: 'assistant', content: 'x'.repeat(3 * 1024 * 1024 + 17) });
@@ -1601,7 +1601,7 @@ test('initial matching unverified target is rebuilt and gains a verification sid
   assert.equal(record.contentHash, crypto.createHash('sha256').update(contents).digest('hex'));
   assert.equal(
     ranges.get(sourcePath).reduce((total, range) => total + range.end - range.start, 0),
-    Buffer.byteLength(contents),
+    Buffer.byteLength(contents) * 2,
   );
   assert.equal(ranges.get(targetPath).length, 0);
   assert.ok([...ranges.values()].flat().every(({ requested }) => requested <= 1024 * 1024));

@@ -13,6 +13,7 @@ const {
   rebuildCompleteLines,
   rebuildSessionCompleteLines,
   rangesMatch,
+  verifyCompletePrefix,
 } = require('../../src/backup/session-backup-streamer');
 
 const ONE_MIB = 1024 * 1024;
@@ -113,6 +114,14 @@ function manySmallRecords(minimumBytes) {
   return Buffer.from(record.repeat(Math.ceil(minimumBytes / Buffer.byteLength(record))));
 }
 
+function jsonStringRecord(lineBytes) {
+  const record = Buffer.alloc(lineBytes + 1, 0x78);
+  record[0] = 0x22;
+  record[lineBytes - 1] = 0x22;
+  record[lineBytes] = 0x0A;
+  return record;
+}
+
 test('rebuild streams several chunks, excludes a partial record, and hashes committed bytes', async (t) => {
   const chunkSize = 7;
   const source = Buffer.from('a'.repeat(chunkSize * 4 + 3) + '\nsecond\npartial');
@@ -135,7 +144,7 @@ test('rebuild streams several chunks, excludes a partial record, and hashes comm
   assert.ok(readSizes.every((size) => size <= chunkSize));
 });
 
-test('rebuild reuses one scanner buffer independent of chunk count', async (t) => {
+test('rebuild reuses bounded buffers across both passes independent of chunk count', async (t) => {
   const source = Buffer.from(Array.from(
     { length: 80 },
     (_, index) => `${JSON.stringify({ index, value: 'crosses reads' })}\n`,
@@ -149,11 +158,11 @@ test('rebuild reuses one scanner buffer independent of chunk count', async (t) =
   }));
 
   assert.ok(readBuffers.length > 40);
-  assert.equal(new Set(readBuffers).size, 1);
+  assert.ok(new Set(readBuffers).size <= 2);
   assert.deepEqual(await fs.readFile(targetPath), source);
 });
 
-test('rebuild uses one spanning-line accumulator without a full-line concat', async (t) => {
+test('rebuild scans a spanning line without a full-line concat', async (t) => {
   const source = Buffer.from(`${JSON.stringify({ value: 'x'.repeat(80) })}\n`);
   const { sourcePath, targetPath } = await makeFixture(t, source);
 
@@ -167,6 +176,31 @@ test('rebuild uses one spanning-line accumulator without a full-line concat', as
   assert.equal(result.lineCount, 1);
   assert.equal(concatCalls, 0);
   assert.deepEqual(await fs.readFile(targetPath), source);
+});
+
+test('rebuild scans and copies a 9 MiB record without a main-process allocation over 1 MiB', async (t) => {
+  const source = jsonStringRecord(9 * ONE_MIB);
+  const { sourcePath, targetPath } = await makeFixture(t, source);
+
+  const { result: trackedReads, allocationSizes } = await withTrackedUnsafeAllocations(
+    () => withTrackedReadSizes(sourcePath, () => rebuildCompleteLines({
+      sourcePath,
+      targetPath,
+    })),
+  );
+
+  assert.deepEqual(await fs.readFile(targetPath), source);
+  assert.deepEqual(trackedReads.result, {
+    committedByteCount: source.length,
+    lineCount: 1,
+    contentHash: sha256(source),
+  });
+  assert.ok(trackedReads.readSizes.every((size) => size <= ONE_MIB));
+  assert.ok(
+    trackedReads.readSizes.reduce((total, size) => total + size, 0) >= source.length * 2,
+  );
+  assert.ok(allocationSizes.length > 0);
+  assert.ok(allocationSizes.every((size) => size <= ONE_MIB));
 });
 
 test('a short partial tail does not reserve the full 64 MiB line budget', async (t) => {
@@ -305,6 +339,51 @@ test('append batches many small records into positioned one MiB writes', async (
   assert.ok(writes.length <= Math.ceil(appended.length / ONE_MIB));
   assert.ok(writes.every(({ length }) => length > 0 && length <= ONE_MIB));
   assert.equal(writes[0].position, prefix.length);
+});
+
+test('append scans and copies a 9 MiB record with bounded allocations and positioned writes', async (t) => {
+  const prefix = Buffer.from('{"existing":true}\n');
+  const appended = jsonStringRecord(9 * ONE_MIB);
+  const source = Buffer.concat([prefix, appended]);
+  const { sourcePath, targetPath } = await makeFixture(t, source);
+  await fs.writeFile(targetPath, prefix);
+
+  const { result: trackedWrites, allocationSizes } = await withTrackedUnsafeAllocations(
+    () => withTrackedWriteSizes(targetPath, () => appendCompleteLines({
+      sourcePath,
+      sourceOffset: prefix.length,
+      targetPath,
+    })),
+  );
+
+  assert.deepEqual(await fs.readFile(targetPath), source);
+  assert.equal(trackedWrites.result.lineCount, 1);
+  assert.equal(trackedWrites.result.appendedByteCount, appended.length);
+  assert.equal(trackedWrites.writes[0].position, prefix.length);
+  assert.ok(trackedWrites.writes.every(({ length }) => length <= ONE_MIB));
+  assert.ok(allocationSizes.length > 0);
+  assert.ok(allocationSizes.every((size) => size <= ONE_MIB));
+});
+
+test('verifyCompletePrefix checks a 9 MiB line without concatenating the record', async (t) => {
+  const source = jsonStringRecord(9 * ONE_MIB);
+  const { sourcePath, targetPath } = await makeFixture(t, source);
+  await fs.writeFile(targetPath, source);
+
+  const { result, concatCalls } = await withTrackedBufferConcats(() => verifyCompletePrefix({
+    sourcePath,
+    targetPath,
+    targetByteCount: source.length,
+  }));
+
+  assert.deepEqual(result, {
+    matches: true,
+    byteCount: source.length,
+    lineCount: 1,
+    contentHash: sha256(source),
+    firstTitle: null,
+  });
+  assert.equal(concatCalls, 0);
 });
 
 test('rebuild accepts a legal 32 MiB line spanning bounded chunks', async (t) => {

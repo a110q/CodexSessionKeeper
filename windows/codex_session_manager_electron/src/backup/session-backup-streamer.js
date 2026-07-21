@@ -4,7 +4,6 @@ const crypto = require('node:crypto');
 const fsp = require('node:fs/promises');
 
 const { durableReplaceWithWriter } = require('./durable-write');
-const { createBoundedLineAccumulator } = require('./jsonl-line-accumulator');
 const { titleFromJsonLine } = require('./session-identity');
 const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
@@ -17,7 +16,6 @@ const MAX_PENDING_PARTIAL_BYTES = 64 * 1024;
 const MAX_TITLE_RECORD_BYTES = 64 * 1024;
 const MAX_TITLE_SCAN_BYTES = 256 * 1024;
 const MAX_TITLE_SCAN_RECORDS = 256;
-const NEWLINE = Buffer.from([NEWLINE_BYTE]);
 
 function normalizedChunkSize(chunkSize) {
   const parsed = Number(chunkSize ?? DEFAULT_CHUNK_SIZE);
@@ -35,21 +33,92 @@ function createTitleScanner() {
   let recordCount = 0;
   let exhausted = false;
   return {
-    consider(line) {
+    finishRecord(line, recordByteCount, captureOverflow) {
       if (title !== null || exhausted || recordCount >= MAX_TITLE_SCAN_RECORDS) return;
       recordCount += 1;
-      if (line.length > MAX_TITLE_RECORD_BYTES) return;
-      if (parsedBytes + line.length > MAX_TITLE_SCAN_BYTES) {
+      if (captureOverflow || recordByteCount > MAX_TITLE_RECORD_BYTES) return;
+      if (parsedBytes + recordByteCount > MAX_TITLE_SCAN_BYTES) {
         exhausted = true;
         return;
       }
-      parsedBytes += line.length;
+      parsedBytes += recordByteCount;
       title = titleFromJsonLine(line.toString('utf8'));
     },
     get title() {
       return title;
     },
   };
+}
+
+function createRecordBoundaryScanner({
+  sourcePath,
+  startOffset = 0,
+  maxLineBytes = DEFAULT_MAX_LINE_BYTES,
+}) {
+  const lineLimit = normalizedLineLimit(maxLineBytes);
+  const partial = Buffer.allocUnsafe(Math.min(
+    MAX_PENDING_PARTIAL_BYTES,
+    Math.max(1, lineLimit),
+  ));
+  const titleScanner = createTitleScanner();
+  let committedByteCount = 0;
+  let lineCount = 0;
+  let currentLineBytes = 0;
+  let partialLength = 0;
+  let partialOverflow = false;
+  let blockedError = null;
+
+  function consume(chunk) {
+    for (let index = 0; index < chunk.length; index += 1) {
+      const byte = chunk[index];
+      if (byte === NEWLINE_BYTE) {
+        titleScanner.finishRecord(
+          partial.subarray(0, partialLength),
+          currentLineBytes,
+          partialOverflow,
+        );
+        committedByteCount += currentLineBytes + 1;
+        lineCount += 1;
+        currentLineBytes = 0;
+        partialLength = 0;
+        partialOverflow = false;
+        continue;
+      }
+
+      currentLineBytes += 1;
+      if (currentLineBytes > lineLimit) {
+        blockedError = blockedErrorMessage(
+          sourcePath,
+          lineLimit,
+          startOffset + committedByteCount,
+        );
+        return false;
+      }
+      if (partialLength < partial.length) {
+        partial[partialLength] = byte;
+        partialLength += 1;
+      } else {
+        partialOverflow = true;
+      }
+    }
+    return true;
+  }
+
+  function result() {
+    return Object.freeze({
+      committedByteCount,
+      lineCount,
+      pendingPartialLine: blockedError || currentLineBytes === 0
+        ? ''
+        : partialOverflow
+          ? '\0'
+          : partial.subarray(0, partialLength).toString('utf8'),
+      blockedError,
+      firstTitle: titleScanner.title,
+    });
+  }
+
+  return { consume, result };
 }
 
 async function writeAll(handle, buffer, position = null) {
@@ -105,7 +174,7 @@ function createBufferedBackupWriter({
   return { append, appendByte, flush };
 }
 
-async function scanCompleteRecords({
+async function scanCompleteRecordBoundaries({
   sourceHandle,
   sourcePath,
   startOffset = 0,
@@ -114,20 +183,14 @@ async function scanCompleteRecords({
   maxLineBytes,
   interruptionRequested = () => false,
   onChunk = null,
-  onRecord,
 }) {
   const boundedChunkSize = normalizedChunkSize(chunkSize);
-  const lineLimit = normalizedLineLimit(maxLineBytes);
   let position = startOffset;
   let remaining = maximumByteCount;
-  let committedByteCount = 0;
-  let lineCount = 0;
-  const pending = createBoundedLineAccumulator(lineLimit);
-  let blockedError = null;
   let scannerBuffer = null;
-  const titleScanner = createTitleScanner();
+  const scanner = createRecordBoundaryScanner({ sourcePath, startOffset, maxLineBytes });
 
-  readLoop: while (remaining === null || remaining > 0) {
+  while (remaining === null || remaining > 0) {
     if (interruptionRequested()) throw interruptedError();
     const requested = remaining === null
       ? boundedChunkSize
@@ -137,61 +200,53 @@ async function scanCompleteRecords({
     const { bytesRead } = await sourceHandle.read(scannerBuffer, 0, requested, position);
     if (bytesRead === 0) break;
     const chunk = scannerBuffer.subarray(0, bytesRead);
-    await onChunk?.(position, bytesRead);
+    await onChunk?.(position, bytesRead, chunk);
     if (interruptionRequested()) throw interruptedError();
     position += bytesRead;
     if (remaining !== null) remaining -= bytesRead;
-
-    let segmentStart = 0;
-    for (let index = 0; index < chunk.length; index += 1) {
-      if (chunk[index] !== NEWLINE_BYTE) continue;
-      const segment = chunk.subarray(segmentStart, index);
-      const lineLength = pending.length + segment.length;
-      if (lineLength > lineLimit) {
-        blockedError = blockedErrorMessage(sourcePath, lineLimit, startOffset + committedByteCount);
-        pending.reset();
-        break readLoop;
-      }
-
-      let line = segment;
-      if (pending.length > 0) {
-        pending.append(segment);
-        line = pending.view();
-      }
-      titleScanner.consider(line);
-      await onRecord(line);
-      committedByteCount += line.length + 1;
-      lineCount += 1;
-      pending.reset();
-      segmentStart = index + 1;
-    }
-
-    if (segmentStart < chunk.length) {
-      const segment = chunk.subarray(segmentStart);
-      if (!pending.append(segment)) {
-        blockedError = blockedErrorMessage(sourcePath, lineLimit, startOffset + committedByteCount);
-        pending.reset();
-        break;
-      }
-    }
+    if (!scanner.consume(chunk)) break;
   }
 
-  let pendingPartialLine = '';
-  if (!blockedError && pending.length > 0) {
-    if (pending.length <= MAX_PENDING_PARTIAL_BYTES) {
-      pendingPartialLine = pending.view().toString('utf8');
-    } else {
-      pendingPartialLine = '\0';
+  return scanner.result();
+}
+
+async function copyCompleteByteRange({
+  sourceHandle,
+  startOffset,
+  byteCount,
+  chunkSize = DEFAULT_CHUNK_SIZE,
+  writeChunk,
+  interruptionRequested = () => false,
+}) {
+  const boundedChunkSize = normalizedChunkSize(chunkSize);
+  const scratch = Buffer.allocUnsafe(boundedChunkSize);
+  const digest = crypto.createHash('sha256');
+  let copied = 0;
+
+  while (copied < byteCount) {
+    if (interruptionRequested()) throw interruptedError();
+    const requested = Math.min(boundedChunkSize, byteCount - copied);
+    const { bytesRead } = await sourceHandle.read(
+      scratch,
+      0,
+      requested,
+      startOffset + copied,
+    );
+    if (bytesRead !== requested) {
+      throw new Error(
+        `Source changed during streamed backup: expected ${requested}, got ${bytesRead}.`,
+      );
     }
+    const chunk = scratch.subarray(0, bytesRead);
+    await writeChunk(chunk);
+    digest.update(chunk);
+    copied += bytesRead;
   }
 
-  return {
-    committedByteCount,
-    lineCount,
-    pendingPartialLine,
-    blockedError,
-    firstTitle: titleScanner.title,
-  };
+  return Object.freeze({
+    copiedByteCount: copied,
+    contentHash: digest.digest('hex'),
+  });
 }
 
 async function rebuildSessionCompleteLines({
@@ -210,29 +265,28 @@ async function rebuildSessionCompleteLines({
   }
 
   const sourceHandle = await fsp.open(sourcePath, 'r');
-  const digest = crypto.createHash('sha256');
-  let scanResult;
   try {
+    const scanResult = await scanCompleteRecordBoundaries({
+      sourceHandle,
+      sourcePath,
+      maximumByteCount: maximumOffset,
+      chunkSize,
+      maxLineBytes,
+      interruptionRequested,
+      onChunk,
+    });
+    let copyResult = null;
     await durableReplaceWithWriter(targetPath, async (targetHandle) => {
       const bufferedWriter = createBufferedBackupWriter({
         writeChunk: (chunk) => writeAll(targetHandle, chunk),
       });
-      scanResult = await scanCompleteRecords({
+      copyResult = await copyCompleteByteRange({
         sourceHandle,
-        sourcePath,
-        maximumByteCount: maximumOffset,
+        startOffset: 0,
+        byteCount: scanResult.committedByteCount,
         chunkSize,
-        maxLineBytes,
         interruptionRequested,
-        onChunk,
-        onRecord: async (line) => {
-          if (line.length > 0) {
-            await bufferedWriter.append(line);
-            digest.update(line);
-          }
-          await bufferedWriter.appendByte(NEWLINE_BYTE);
-          digest.update(NEWLINE);
-        },
+        writeChunk: (chunk) => bufferedWriter.append(chunk),
       });
       await bufferedWriter.flush();
     }, {
@@ -240,18 +294,18 @@ async function rebuildSessionCompleteLines({
       verifyTemporary: verifyTemporary
         ? (temporaryPath) => verifyTemporary(temporaryPath, {
           ...scanResult,
-          contentHash: digest.copy().digest('hex'),
+          contentHash: copyResult.contentHash,
         })
         : null,
     });
+
+    return {
+      ...scanResult,
+      contentHash: copyResult.contentHash,
+    };
   } finally {
     await sourceHandle.close();
   }
-
-  return {
-    ...scanResult,
-    contentHash: digest.digest('hex'),
-  };
 }
 
 function interruptedError() {
@@ -284,6 +338,13 @@ async function appendCompleteLines({
   const sourceHandle = await fsp.open(sourcePath, 'r');
   let targetHandle;
   try {
+    const scanResult = await scanCompleteRecordBoundaries({
+      sourceHandle,
+      sourcePath,
+      startOffset: sourceOffset,
+      chunkSize,
+      maxLineBytes,
+    });
     targetHandle = await fsp.open(targetPath, 'r+');
     const targetStats = await targetHandle.stat();
     if (targetStats.size !== sourceOffset) {
@@ -296,18 +357,12 @@ async function appendCompleteLines({
         writePosition += chunk.length;
       },
     });
-    const scanResult = await scanCompleteRecords({
+    await copyCompleteByteRange({
       sourceHandle,
-      sourcePath,
       startOffset: sourceOffset,
+      byteCount: scanResult.committedByteCount,
       chunkSize,
-      maxLineBytes,
-      onRecord: async (line) => {
-        if (line.length > 0) {
-          await bufferedWriter.append(line);
-        }
-        await bufferedWriter.appendByte(NEWLINE_BYTE);
-      },
+      writeChunk: (chunk) => bufferedWriter.append(chunk),
     });
     await bufferedWriter.flush();
     if (scanResult.committedByteCount > 0) {
@@ -400,15 +455,11 @@ async function verifyCompletePrefix({
   }
 
   const boundedChunkSize = normalizedChunkSize(chunkSize);
-  const lineLimit = normalizedLineLimit(maxLineBytes);
   const digest = crypto.createHash('sha256');
+  const scanner = createRecordBoundaryScanner({ sourcePath: targetPath, maxLineBytes });
   const sourceHandle = await fsp.open(sourcePath, 'r');
   let targetHandle;
   let compared = 0;
-  let lineCount = 0;
-  let pendingChunks = [];
-  let pendingLength = 0;
-  let firstTitle = null;
   try {
     targetHandle = await fsp.open(targetPath, 'r');
     while (compared < targetByteCount) {
@@ -421,41 +472,20 @@ async function verifyCompletePrefix({
         return { matches: false };
       }
       digest.update(target);
-
-      let segmentStart = 0;
-      for (let index = 0; index < target.length; index += 1) {
-        if (target[index] !== NEWLINE_BYTE) continue;
-        if (segmentStart < index) {
-          const segment = target.subarray(segmentStart, index);
-          pendingChunks.push(segment);
-          pendingLength += segment.length;
-        }
-        if (pendingLength > lineLimit) return { matches: false };
-        const line = pendingLength === 0
-          ? Buffer.alloc(0)
-          : Buffer.concat(pendingChunks, pendingLength);
-        if (firstTitle === null) firstTitle = titleFromJsonLine(line.toString('utf8'));
-        lineCount += 1;
-        pendingChunks = [];
-        pendingLength = 0;
-        segmentStart = index + 1;
-      }
-      if (segmentStart < target.length) {
-        const segment = target.subarray(segmentStart);
-        pendingChunks.push(segment);
-        pendingLength += segment.length;
-        if (pendingLength > lineLimit) return { matches: false };
-      }
+      if (!scanner.consume(target)) return { matches: false };
       compared += requested;
     }
 
-    if (pendingLength !== 0) return { matches: false };
+    const scanResult = scanner.result();
+    if (scanResult.blockedError || scanResult.pendingPartialLine !== '') {
+      return { matches: false };
+    }
     return {
       matches: true,
       byteCount: targetByteCount,
-      lineCount,
+      lineCount: scanResult.lineCount,
       contentHash: digest.digest('hex'),
-      firstTitle,
+      firstTitle: scanResult.firstTitle,
     };
   } finally {
     await targetHandle?.close().catch(() => {});
