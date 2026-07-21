@@ -54,6 +54,26 @@ class BackupAgent {
     this.pollingTimer = null;
   }
 
+  async stopAndDrain(timeoutMs = 5000) {
+    this.stopPolling();
+    const active = this.scanPromise;
+    if (!active) {
+      return true;
+    }
+
+    let timer;
+    try {
+      return await Promise.race([
+        active.then(() => true, () => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async performOneShotScan() {
     if (this.scanPromise) {
       this.scanQueued = true;

@@ -86,6 +86,32 @@ function makeClock() {
   return () => new Date(Date.UTC(2026, 0, 2, 3, 4, tick++));
 }
 
+test('stopAndDrain waits for the in-flight scan', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const agent = new BackupAgent({ paths, now: makeClock() });
+  let release;
+  agent.performOneShotScanLocked = () => new Promise((resolve) => {
+    release = resolve;
+  });
+
+  const scan = agent.performOneShotScan();
+  assert.equal(typeof release, 'function');
+  const draining = agent.stopAndDrain(500);
+  release();
+
+  assert.equal(await draining, true);
+  await scan;
+});
+
+test('stopAndDrain returns false at its deadline', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const agent = new BackupAgent({ paths, now: makeClock() });
+  agent.performOneShotScanLocked = () => new Promise(() => {});
+
+  void agent.performOneShotScan();
+  assert.equal(await agent.stopAndDrain(20), false);
+});
+
 test('initial scan backs up existing jsonl and records manifest title and line count', async (t) => {
   const { paths } = await makeTestPaths(t);
   const sourcePath = path.join(paths.codexRoot, 'sessions', 'alpha.jsonl');
