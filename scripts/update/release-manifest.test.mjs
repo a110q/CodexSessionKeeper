@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -12,6 +19,8 @@ import {
   validateManifest,
   verifyManifest,
 } from './release-manifest.mjs';
+import { assembleRelease } from './build-release-manifest.mjs';
+import { verifyReleaseDirectory } from './verify-release-directory.mjs';
 
 function fixture() {
   return {
@@ -171,5 +180,186 @@ test('hashes a release artifact and reports its exact size', async () => {
     });
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+function ephemeralKey() {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  return {
+    privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    publicKeyBase64: publicKey.export({ type: 'spki', format: 'der' })
+      .subarray(-32)
+      .toString('base64'),
+  };
+}
+
+function signedAppcast({ version, build, zipName, zipBytes, privateKeyPem }) {
+  const enclosureSignature = signManifest(zipBytes, privateKeyPem);
+  const prefix = Buffer.from(
+    `<?xml version="1.0" standalone="yes"?><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item><title>${version}</title><sparkle:version>${build}</sparkle:version><sparkle:shortVersionString>${version}</sparkle:shortVersionString><enclosure url="http://192.168.10.99:18080/codex-session-keeper/stable/macos/${zipName}" length="${zipBytes.length}" type="application/octet-stream" sparkle:edSignature="${enclosureSignature}"></enclosure></item></channel></rss>`,
+  );
+  const feedSignature = signManifest(prefix, privateKeyPem);
+  return Buffer.concat([
+    prefix,
+    Buffer.from(`<!-- sparkle-signatures:\nedSignature: ${feedSignature}\nlength: ${prefix.length}\n-->\n`),
+  ]);
+}
+
+async function makeReleaseFixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-release-directory-'));
+  const stableRoot = path.join(root, 'codex-session-keeper', 'stable');
+  const macDirectory = path.join(stableRoot, 'macos');
+  const windowsDirectory = path.join(stableRoot, 'windows');
+  await mkdir(macDirectory, { recursive: true });
+  await mkdir(windowsDirectory, { recursive: true });
+
+  const manifestKey = ephemeralKey();
+  const sparkleKey = ephemeralKey();
+  const macName = 'CodexSessionKeeper-1.1.0-macos-arm64.zip';
+  const windowsName = 'CodexSessionKeeper-1.1.0-windows-x64-Setup.exe';
+  const macZip = path.join(macDirectory, macName);
+  const windowsInstaller = path.join(windowsDirectory, windowsName);
+  const macBytes = Buffer.from('mac archive');
+  const windowsBytes = Buffer.from('windows installer');
+  await writeFile(macZip, macBytes);
+  await writeFile(windowsInstaller, windowsBytes);
+  await writeFile(
+    path.join(macDirectory, 'appcast.xml'),
+    signedAppcast({
+      version: '1.1.0',
+      build: 10100,
+      zipName: macName,
+      zipBytes: macBytes,
+      privateKeyPem: sparkleKey.privateKeyPem,
+    }),
+  );
+  await writeFile(
+    path.join(windowsDirectory, 'latest.yml'),
+    `version: 1.1.0\nfiles:\n  - url: ${windowsName}\n    size: ${windowsBytes.length}\npath: ${windowsName}\n`,
+  );
+
+  const manifest = validateManifest({
+    ...fixture(),
+    platforms: {
+      'macos-arm64': { url: `macos/${macName}`, ...(await sha256File(macZip)) },
+      'windows-x64': { url: `windows/${windowsName}`, ...(await sha256File(windowsInstaller)) },
+    },
+  });
+  const bytes = stableManifestBytes(manifest);
+  await writeFile(path.join(stableRoot, 'release.json'), bytes);
+  await writeFile(
+    path.join(stableRoot, 'release.json.sig'),
+    `${signManifest(bytes, manifestKey.privateKeyPem)}\n`,
+  );
+  return {
+    manifestKey,
+    root,
+    sparkleKey,
+    stableRoot,
+    windowsInstaller,
+  };
+}
+
+test('assembles signed release metadata with actual artifact hashes', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-release-assembly-'));
+  try {
+    const inputs = path.join(root, 'inputs');
+    await mkdir(inputs);
+    const macZip = path.join(inputs, 'CodexSessionKeeper-1.1.0-macos-arm64.zip');
+    const windowsExe = path.join(inputs, 'CodexSessionKeeper-1.1.0-windows-x64-Setup.exe');
+    const windowsYml = path.join(inputs, 'latest.yml');
+    const notesFile = path.join(inputs, 'notes.json');
+    await writeFile(macZip, 'mac archive');
+    await writeFile(windowsExe, 'windows installer');
+    await writeFile(windowsYml, `version: 1.1.0\npath: ${path.basename(windowsExe)}\nfiles:\n  - url: ${path.basename(windowsExe)}\n`);
+    await writeFile(notesFile, JSON.stringify(['新增公司内网更新功能']));
+
+    const manifestKey = ephemeralKey();
+    const sparkleKey = ephemeralKey();
+    const output = path.join(root, 'output');
+    const result = await assembleRelease({
+      build: 10100,
+      generateAppcast: async ({ macDirectory, zipName, zipBytes }) => {
+        await writeFile(
+          path.join(macDirectory, 'appcast.xml'),
+          signedAppcast({
+            version: '1.1.0',
+            build: 10100,
+            zipName,
+            zipBytes,
+            privateKeyPem: sparkleKey.privateKeyPem,
+          }),
+        );
+      },
+      macZip,
+      manifestPrivateKeyPem: manifestKey.privateKeyPem,
+      manifestPublicKeyBase64: manifestKey.publicKeyBase64,
+      notesFile,
+      output,
+      publishedAt: '2026-07-21T00:00:00Z',
+      sparklePublicKeyBase64: sparkleKey.publicKeyBase64,
+      version: '1.1.0',
+      windowsExe,
+      windowsYml,
+    });
+    const manifest = JSON.parse(await readFile(path.join(result.stableRoot, 'release.json')));
+    assert.equal(manifest.platforms['macos-arm64'].url, 'macos/CodexSessionKeeper-1.1.0-macos-arm64.zip');
+    assert.equal(manifest.platforms['windows-x64'].url, 'windows/CodexSessionKeeper-1.1.0-windows-x64-Setup.exe');
+    assert.deepEqual(await verifyReleaseDirectory(
+      result.stableRoot,
+      manifestKey.publicKeyBase64,
+      { sparklePublicKeyBase64: sparkleKey.publicKeyBase64 },
+    ), { verified: true, version: '1.1.0', build: 10100 });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('release verifier detects artifact tampering', async () => {
+  const release = await makeReleaseFixture();
+  try {
+    await verifyReleaseDirectory(release.stableRoot, release.manifestKey.publicKeyBase64, {
+      sparklePublicKeyBase64: release.sparkleKey.publicKeyBase64,
+    });
+    await appendFile(release.windowsInstaller, Buffer.from([0]));
+    await assert.rejects(
+      () => verifyReleaseDirectory(release.stableRoot, release.manifestKey.publicKeyBase64, {
+        sparklePublicKeyBase64: release.sparkleKey.publicKeyBase64,
+      }),
+      /sha256 mismatch/,
+    );
+  } finally {
+    await rm(release.root, { recursive: true, force: true });
+  }
+});
+
+test('release verifier rejects mismatched Electron and Sparkle metadata', async () => {
+  const release = await makeReleaseFixture();
+  try {
+    const latestPath = path.join(release.stableRoot, 'windows', 'latest.yml');
+    await writeFile(latestPath, 'version: 1.1.1\npath: wrong.exe\n');
+    await assert.rejects(
+      () => verifyReleaseDirectory(release.stableRoot, release.manifestKey.publicKeyBase64, {
+        sparklePublicKeyBase64: release.sparkleKey.publicKeyBase64,
+      }),
+      /latest\.yml/,
+    );
+
+    const refreshed = await makeReleaseFixture();
+    try {
+      const appcastPath = path.join(refreshed.stableRoot, 'macos', 'appcast.xml');
+      const appcast = await readFile(appcastPath, 'utf8');
+      await writeFile(appcastPath, appcast.replaceAll('1.1.0', '1.1.1'));
+      await assert.rejects(
+        () => verifyReleaseDirectory(refreshed.stableRoot, refreshed.manifestKey.publicKeyBase64, {
+          sparklePublicKeyBase64: refreshed.sparkleKey.publicKeyBase64,
+        }),
+        /appcast|Sparkle/i,
+      );
+    } finally {
+      await rm(refreshed.root, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(release.root, { recursive: true, force: true });
   }
 });
