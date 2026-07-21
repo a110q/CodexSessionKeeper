@@ -27,7 +27,8 @@ let package = Package(
         .library(name: "CodexSessionVaultCore", targets: ["CodexSessionVaultCore"])
     ],
     dependencies: [
-        .package(url: "https://github.com/swiftlang/swift-testing.git", revision: "937120cbc281cf29727fdfb8734482158508b4fc")
+        .package(url: "https://github.com/swiftlang/swift-testing.git", revision: "937120cbc281cf29727fdfb8734482158508b4fc"),
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.4")
     ],
     targets: [
         .target(
@@ -36,8 +37,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "CodexSessionVault",
-            dependencies: ["CodexSessionVaultCore"],
-            path: "Sources/CodexSessionVault"
+            dependencies: [
+                "CodexSessionVaultCore",
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
+            path: "Sources/CodexSessionVault",
+            swiftSettings: [.unsafeFlags(["-parse-as-library"])]
         ),
         .testTarget(
             name: "CodexSessionVaultCoreTests",

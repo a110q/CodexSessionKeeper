@@ -576,11 +576,16 @@ final class VaultModel: ObservableObject {
 
         let drained = await agent.stopAndDrain(timeout: timeout)
         if !drained {
-            agent.startPolling(intervalSeconds: 10)
-            refreshLocalBackupStatus()
-            startLocalBackupStatusPolling()
+            resumeBackupAfterCancelledUpdate()
         }
         return drained
+    }
+
+    func resumeBackupAfterCancelledUpdate() {
+        guard let agent = localBackupAgent else { return }
+        agent.startPolling(intervalSeconds: 10)
+        refreshLocalBackupStatus()
+        startLocalBackupStatusPolling()
     }
 
     private func refreshLocalBackupStatus() {
@@ -4629,23 +4634,42 @@ private enum ConversationLogParser {
 
 @main
 struct CodexSessionVaultApp: App {
-    @StateObject private var model = VaultModel(refreshOnInit: CommandLine.arguments.dropFirst().first != "--worker")
+    @StateObject private var model: VaultModel
+    @StateObject private var updateCoordinator: MacUpdateCoordinator
 
     init() {
         _ = VaultWorkerProcess.runFromCommandLine(arguments: CommandLine.arguments)
+        let model = VaultModel(refreshOnInit: CommandLine.arguments.dropFirst().first != "--worker")
+        _model = StateObject(wrappedValue: model)
+        _updateCoordinator = StateObject(wrappedValue: MacUpdateCoordinator(model: model))
     }
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
+                .environmentObject(updateCoordinator)
                 .frame(minWidth: 1280, minHeight: 760)
+                .sheet(
+                    isPresented: Binding(
+                        get: { updateCoordinator.isPresented },
+                        set: { presented in
+                            if !presented { updateCoordinator.remindLater() }
+                        }
+                    )
+                ) {
+                    UpdatePromptView()
+                        .environmentObject(updateCoordinator)
+                }
+                .task { updateCoordinator.start() }
         }
         .windowStyle(.titleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("创建快照") { model.createManualSnapshot() }
                     .keyboardShortcut("s", modifiers: [.command])
+                Divider()
+                Button("检查更新…") { updateCoordinator.checkNow() }
             }
         }
     }
