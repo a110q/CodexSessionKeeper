@@ -558,6 +558,61 @@ func corruptedManifestBackupPathOutsideBackupRootThrowsClearError() throws {
     }
 }
 
+@Test
+func stopAndDrainWaitsForActiveScanToFinish() async throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let clock = BlockingBackupClock(date: fixture.now)
+    let agent = BackupAgent(paths: fixture.paths, now: clock.now)
+    let scan = Task.detached { try agent.performOneShotScan() }
+    #expect(await Task.detached { clock.waitUntilEntered() }.value)
+
+    let drain = Task { await agent.stopAndDrain(timeout: .seconds(1)) }
+    clock.release()
+
+    #expect(await drain.value)
+    try await scan.value
+}
+
+@Test
+func stopAndDrainReturnsAtDeadlineWithoutAbandoningActiveScan() async throws {
+    let fixture = try BackupAgentFixture()
+    defer { fixture.cleanup() }
+    let clock = BlockingBackupClock(date: fixture.now)
+    let agent = BackupAgent(paths: fixture.paths, now: clock.now)
+    let scan = Task.detached { try agent.performOneShotScan() }
+    #expect(await Task.detached { clock.waitUntilEntered() }.value)
+
+    #expect(await agent.stopAndDrain(timeout: .milliseconds(50)) == false)
+    clock.release()
+    try await scan.value
+    #expect(await agent.stopAndDrain(timeout: .seconds(1)))
+}
+
+}
+
+private final class BlockingBackupClock: @unchecked Sendable {
+    private let date: Date
+    private let entered = DispatchSemaphore(value: 0)
+    private let releaseScan = DispatchSemaphore(value: 0)
+
+    init(date: Date) {
+        self.date = date
+    }
+
+    func now() -> Date {
+        entered.signal()
+        releaseScan.wait()
+        return date
+    }
+
+    func waitUntilEntered() -> Bool {
+        entered.wait(timeout: .now() + 1) == .success
+    }
+
+    func release() {
+        releaseScan.signal()
+    }
 }
 
 private struct BackupAgentFixture {

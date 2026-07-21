@@ -355,7 +355,9 @@ final class VaultModel: ObservableObject {
     private let fileManager = FileManager.default
     private let metadataFile = "snapshot.json"
     private let dataDir = "data"
-    private let appVersion = "1.0.13"
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+    }
     private var didRunLaunchAutoRestore = false
     private var conversationLoadID = UUID()
     private var sessionSearchTask: Task<Void, Never>?
@@ -548,10 +550,10 @@ final class VaultModel: ObservableObject {
 
         agent.startPolling(intervalSeconds: 10)
         refreshLocalBackupStatus()
-        startLocalBackupStatusRefreshLoop()
+        startLocalBackupStatusPolling()
     }
 
-    private func startLocalBackupStatusRefreshLoop() {
+    private func startLocalBackupStatusPolling() {
         localBackupStatusTask?.cancel()
         localBackupStatusTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -563,6 +565,22 @@ final class VaultModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func prepareForUpdate(timeout: Duration = .seconds(5)) async -> Bool {
+        localBackupStatusTask?.cancel()
+        localBackupStatusTask = nil
+        guard let agent = localBackupAgent else {
+            return true
+        }
+
+        let drained = await agent.stopAndDrain(timeout: timeout)
+        if !drained {
+            agent.startPolling(intervalSeconds: 10)
+            refreshLocalBackupStatus()
+            startLocalBackupStatusPolling()
+        }
+        return drained
     }
 
     private func refreshLocalBackupStatus() {

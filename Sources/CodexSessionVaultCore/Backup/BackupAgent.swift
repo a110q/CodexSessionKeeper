@@ -15,6 +15,38 @@ public final class BackupAgent: @unchecked Sendable {
     private var pollingTask: Task<Void, Never>?
     private var pollingStartedAt: Date?
 
+    private final class DrainGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Bool, Never>?
+        private var result: Bool?
+
+        func wait() async -> Bool {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let result {
+                    lock.unlock()
+                    continuation.resume(returning: result)
+                } else {
+                    self.continuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func finish(_ value: Bool) {
+            lock.lock()
+            guard result == nil else {
+                lock.unlock()
+                return
+            }
+            result = value
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(returning: value)
+        }
+    }
+
     private struct ProcessSessionFileResult {
         var manifestChanged: Bool
         var lastError: String?
@@ -122,6 +154,9 @@ public final class BackupAgent: @unchecked Sendable {
                     guard let agent = self else {
                         return
                     }
+                    guard !Task.isCancelled else {
+                        return
+                    }
                     try agent.performOneShotScan()
                 } catch {
                     guard let agent = self else {
@@ -150,6 +185,27 @@ public final class BackupAgent: @unchecked Sendable {
         taskLock.unlock()
 
         task?.cancel()
+    }
+
+    public func stopAndDrain(timeout: Duration = .seconds(5)) async -> Bool {
+        stop()
+        let gate = DrainGate()
+        DispatchQueue.global(qos: .utility).async { [scanLock] in
+            scanLock.lock()
+            scanLock.unlock()
+            gate.finish(true)
+        }
+        let timeoutTask = Task.detached {
+            do {
+                try await Task.sleep(for: timeout)
+                gate.finish(false)
+            } catch {
+                return
+            }
+        }
+        let result = await gate.wait()
+        timeoutTask.cancel()
+        return result
     }
 
     private func ensureBackupDirectoriesExist() throws {
