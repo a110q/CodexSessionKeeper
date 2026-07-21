@@ -40,14 +40,13 @@ trap cleanup EXIT
 /usr/bin/security find-generic-password \
   -a release \
   -s "CodexSessionKeeper Update Manifest Ed25519" \
-  -w > "$KEY_BACKUP_TMP/manifest-private.pem"
+  -w > "$KEY_BACKUP_TMP/manifest-private.pkcs8.b64"
 "$SPARKLE_KEY_TOOL" \
   --account local.codex.session-manager \
   -x "$KEY_BACKUP_TMP/sparkle-private.key"
 
-tar -C "$KEY_BACKUP_TMP" -cf - manifest-private.pem sparkle-private.key \
+tar -C "$KEY_BACKUP_TMP" -cf - manifest-private.pkcs8.b64 sparkle-private.key \
   | openssl enc -aes-256-cbc -salt -pbkdf2 -out "$ENCRYPTED_TMP"
 chmod 600 "$ENCRYPTED_TMP"
 mv "$ENCRYPTED_TMP" "$OUTPUT_PATH"
 echo "$OUTPUT_PATH"
-

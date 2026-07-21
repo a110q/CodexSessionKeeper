@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync } from 'node:crypto';
+import { createPrivateKey, generateKeyPairSync } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +21,12 @@ function generatedKey() {
       .subarray(-32)
       .toString('base64'),
   };
+}
+
+function storedPrivateKey(privateKeyPem) {
+  return createPrivateKey(privateKeyPem)
+    .export({ type: 'pkcs8', format: 'der' })
+    .toString('base64');
 }
 
 test('reuses an existing manifest key without replacing it', () => {
@@ -70,8 +76,30 @@ test('creates and stores a manifest key only when Keychain has no item', () => {
     '-a', MANIFEST_KEY_ACCOUNT,
     '-s', MANIFEST_KEY_SERVICE,
     '-l', MANIFEST_KEY_SERVICE,
-    '-w', generated.privateKeyPem,
+    '-w', storedPrivateKey(generated.privateKeyPem),
   ]);
+});
+
+test('migrates macOS security hex output to printable base64 DER', () => {
+  const existing = generatedKey();
+  const securityHexOutput = Buffer.from(existing.privateKeyPem, 'utf8').toString('hex');
+  const calls = [];
+
+  const result = ensureManifestKey({
+    runSecurity(args) {
+      calls.push(args);
+      if (args[0] === 'find-generic-password') return securityHexOutput;
+      return '';
+    },
+  });
+
+  assert.equal(result.created, false);
+  assert.equal(result.privateKeyPem, existing.privateKeyPem);
+  assert.equal(result.publicKeyBase64, existing.publicKeyBase64);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].at(-2), '-w');
+  assert.equal(calls[1].at(-1), storedPrivateKey(existing.privateKeyPem));
+  assert.doesNotMatch(calls[1].at(-1), /PRIVATE KEY|\n/);
 });
 
 test('writes only validated public keys to tracked configuration', async () => {
