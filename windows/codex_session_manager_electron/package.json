@@ -11,10 +11,11 @@
     "package:win": "npm run prepare:sqlite-win && electron-packager . codex_session_manager --platform=win32 --arch=x64 --out=../../dist/win10-exe --overwrite --prune=true"
   },
   "dependencies": {
+    "electron-updater": "6.8.9",
     "sql.js": "^1.10.3"
   },
   "devDependencies": {
-    "@electron/packager": "^18.3.6",
-    "electron": "^43.1.0"
+    "electron": "^43.1.0",
+    "electron-builder": "26.15.3"
   }
 }
