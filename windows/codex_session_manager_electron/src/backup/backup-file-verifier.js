@@ -6,6 +6,10 @@ const { TextDecoder } = require('node:util');
 
 const { DEFAULT_VERIFICATION_CHUNK_SIZE } = require('./verification-store');
 const { createBoundedLineAccumulator } = require('./jsonl-line-accumulator');
+const {
+  ISOLATED_VERIFICATION_THRESHOLD_BYTES,
+  runIsolatedBackupVerification,
+} = require('./isolated-backup-verifier');
 const { MAX_JSONL_LINE_BYTES } = require('../jsonl-policy');
 
 const DEFAULT_MAX_LINE_BYTES = MAX_JSONL_LINE_BYTES;
@@ -69,7 +73,7 @@ function createJSONLValidator(maxLineBytes) {
   };
 }
 
-async function verifyFullBackupFile({
+async function verifyFullBackupFileInProcess({
   filePath,
   chunkSize = DEFAULT_VERIFICATION_CHUNK_SIZE,
   maxLineBytes = DEFAULT_MAX_LINE_BYTES,
@@ -168,7 +172,7 @@ async function verifyAppendSourceAnchors({
   }
 }
 
-async function verifyChangedBackupChunks({
+async function verifyChangedBackupChunksInProcess({
   sourcePath,
   targetPath,
   previous,
@@ -234,10 +238,59 @@ async function verifyChangedBackupChunks({
   };
 }
 
+async function verifyFullBackupFile(options) {
+  const {
+    signal = null,
+    isolationRunner = runIsolatedBackupVerification,
+    ...payload
+  } = options;
+  const stats = await fsp.lstat(payload.filePath);
+  if (stats.size >= ISOLATED_VERIFICATION_THRESHOLD_BYTES) {
+    try {
+      return await isolationRunner({ operation: 'verifyFull', payload, signal });
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      throw new BackupFileVerificationError(error?.message || String(error));
+    }
+  }
+  return verifyFullBackupFileInProcess(payload);
+}
+
+async function verifyChangedBackupChunks(options) {
+  const {
+    signal = null,
+    isolationRunner = runIsolatedBackupVerification,
+    ...payload
+  } = options;
+  const chunkSize = payload.chunkSize ?? DEFAULT_VERIFICATION_CHUNK_SIZE;
+  const previousBytes = Number(payload.previous?.byteCount);
+  const committedBytes = Number(payload.committedByteCount);
+  const startOffset = Number.isSafeInteger(previousBytes)
+      && Number.isSafeInteger(committedBytes)
+      && Number.isSafeInteger(chunkSize)
+      && chunkSize > 0
+    ? Math.floor(previousBytes / chunkSize) * chunkSize
+    : committedBytes;
+  const changedBytes = Number.isSafeInteger(committedBytes)
+    ? Math.max(0, committedBytes - startOffset)
+    : 0;
+  if (changedBytes >= ISOLATED_VERIFICATION_THRESHOLD_BYTES) {
+    try {
+      return await isolationRunner({ operation: 'verifyChangedChunks', payload, signal });
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      throw new BackupFileVerificationError(error?.message || String(error));
+    }
+  }
+  return verifyChangedBackupChunksInProcess(payload);
+}
+
 module.exports = {
   BackupFileVerificationError,
   DEFAULT_MAX_LINE_BYTES,
   verifyAppendSourceAnchors,
   verifyChangedBackupChunks,
+  verifyChangedBackupChunksInProcess,
   verifyFullBackupFile,
+  verifyFullBackupFileInProcess,
 };

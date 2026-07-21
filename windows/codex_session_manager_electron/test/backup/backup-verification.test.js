@@ -14,6 +14,9 @@ const {
   verifyFullBackupFile,
 } = require('../../src/backup/backup-file-verifier');
 const {
+  ISOLATED_VERIFICATION_THRESHOLD_BYTES,
+} = require('../../src/backup/isolated-backup-verifier');
+const {
   emptyVerificationDocument,
   loadVerification,
   saveVerification,
@@ -21,6 +24,14 @@ const {
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function jsonStringRecord(totalBytes) {
+  const record = Buffer.alloc(totalBytes, 0x78);
+  record[0] = 0x22;
+  record[totalBytes - 2] = 0x22;
+  record[totalBytes - 1] = 0x0A;
+  return record;
 }
 
 async function fixture(t) {
@@ -148,6 +159,56 @@ test('full verification uses one spanning-line accumulator without a full-line c
 
   assert.equal(result.lineCount, 1);
   assert.equal(concatCalls, 0);
+});
+
+test('full verification isolates exactly 8 MiB while keeping smaller files in process', async (t) => {
+  const root = await fixture(t);
+  const belowPath = path.join(root, 'below-threshold.jsonl');
+  const exactPath = path.join(root, 'exact-threshold.jsonl');
+  const below = jsonStringRecord(ISOLATED_VERIFICATION_THRESHOLD_BYTES - 1);
+  const exact = jsonStringRecord(ISOLATED_VERIFICATION_THRESHOLD_BYTES);
+  await fs.writeFile(belowPath, below);
+  await fs.writeFile(exactPath, exact);
+  const calls = [];
+  const isolationRunner = async (request) => {
+    calls.push(request);
+    return {
+      byteCount: exact.length,
+      lineCount: 1,
+      contentHash: sha256(exact),
+      chunkHashes: [],
+    };
+  };
+
+  const belowResult = await verifyFullBackupFile({
+    filePath: belowPath,
+    isolationRunner,
+  });
+  assert.equal(belowResult.byteCount, below.length);
+  assert.equal(calls.length, 0);
+
+  const exactResult = await verifyFullBackupFile({
+    filePath: exactPath,
+    isolationRunner,
+  });
+  assert.equal(exactResult.byteCount, exact.length);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].operation, 'verifyFull');
+  assert.equal(calls[0].payload.filePath, exactPath);
+  assert.equal('isolationRunner' in calls[0].payload, false);
+});
+
+test('large isolated JSON failure remains a BackupFileVerificationError', async (t) => {
+  const root = await fixture(t);
+  const filePath = path.join(root, 'invalid-large.jsonl');
+  const invalid = Buffer.alloc(ISOLATED_VERIFICATION_THRESHOLD_BYTES, 0x78);
+  invalid[invalid.length - 1] = 0x0A;
+  await fs.writeFile(filePath, invalid);
+
+  await assert.rejects(
+    verifyFullBackupFile({ filePath }),
+    BackupFileVerificationError,
+  );
 });
 
 test('full verification accepts exact maxLineBytes and rejects max plus one', async (t) => {
@@ -278,6 +339,68 @@ test('changed verification reuses exactly one source and one target scratch buff
   assert.equal(new Set(sourceReads).size, 1);
   assert.equal(new Set(targetReads).size, 1);
   assert.equal(new Set([...sourceReads, ...targetReads]).size, 2);
+});
+
+test('changed verification isolates an exact 8 MiB changed range but not one byte less', async (t) => {
+  const root = await fixture(t);
+  const belowSourcePath = path.join(root, 'below-source.jsonl');
+  const belowTargetPath = path.join(root, 'below-target.jsonl');
+  const exactSourcePath = path.join(root, 'exact-source.jsonl');
+  const exactTargetPath = path.join(root, 'exact-target.jsonl');
+  const below = jsonStringRecord(ISOLATED_VERIFICATION_THRESHOLD_BYTES - 1);
+  const exact = jsonStringRecord(ISOLATED_VERIFICATION_THRESHOLD_BYTES);
+  await Promise.all([
+    fs.writeFile(belowSourcePath, below),
+    fs.writeFile(belowTargetPath, below),
+    fs.writeFile(exactSourcePath, exact),
+    fs.writeFile(exactTargetPath, exact),
+  ]);
+  const previous = {
+    backupPath: 'sessions/threshold.jsonl',
+    byteCount: 0,
+    lineCount: 0,
+    chunkHashes: [],
+    verifiedAt: '2026-07-15T00:00:00.000Z',
+  };
+  const calls = [];
+  const isolatedResult = {
+    backupPath: previous.backupPath,
+    byteCount: exact.length,
+    lineCount: 1,
+    chunkHashes: [],
+    verifiedAt: '2026-07-15T00:01:00.000Z',
+  };
+  const isolationRunner = async (request) => {
+    calls.push(request);
+    return isolatedResult;
+  };
+
+  const belowResult = await verifyChangedBackupChunks({
+    sourcePath: belowSourcePath,
+    targetPath: belowTargetPath,
+    previous,
+    backupPath: previous.backupPath,
+    committedByteCount: below.length,
+    lineCount: 1,
+    verifiedAt: isolatedResult.verifiedAt,
+    isolationRunner,
+  });
+  assert.equal(belowResult.byteCount, below.length);
+  assert.equal(calls.length, 0);
+
+  const exactResult = await verifyChangedBackupChunks({
+    sourcePath: exactSourcePath,
+    targetPath: exactTargetPath,
+    previous,
+    backupPath: previous.backupPath,
+    committedByteCount: exact.length,
+    lineCount: 1,
+    verifiedAt: isolatedResult.verifiedAt,
+    isolationRunner,
+  });
+  assert.deepEqual(exactResult, isolatedResult);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].operation, 'verifyChangedChunks');
 });
 
 test('empty and exact four MiB boundary files produce canonical chunks', async (t) => {
