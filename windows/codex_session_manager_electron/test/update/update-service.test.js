@@ -265,6 +265,29 @@ test('writes the pending marker before invoking quitAndInstall', async () => {
   ]);
 });
 
+test('restores backup polling and clears the marker if installation cannot start', async () => {
+  const calls = [];
+  const backupAgent = {
+    async stopAndDrain(timeout) { calls.push(['drain', timeout]); return true; },
+    startPolling(interval) { calls.push(['poll', interval]); },
+  };
+  const stateStore = new FakeStateStore();
+  const updater = new FakeUpdater();
+  updater.quitAndInstall = () => {
+    throw new Error('installer launch failed');
+  };
+  const setup = makeService({ backupAgent, stateStore, updater });
+  setup.service.setReadyForTest('1.1.0');
+
+  await setup.service.restartAndInstall();
+
+  assert.deepEqual(calls, [['drain', 5000], ['poll', 10000]]);
+  assert.equal(stateStore.value.pendingVersion, null);
+  assert.deepEqual(setup.service.getState(), {
+    phase: 'failed', message: '更新失败，请稍后重试',
+  });
+});
+
 test('state store atomically consumes a matching completion marker once', async (t) => {
   const vaultRoot = await makeTempDir(t);
   const store = new UpdateStateStore({ vaultRoot });

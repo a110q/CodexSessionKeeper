@@ -294,7 +294,13 @@ class UpdateService {
       this.setState({ phase: 'failed', message: UPDATE_FAILURE_MESSAGE });
       return this.getState();
     }
-    this.autoUpdater.quitAndInstall(false, true);
+    try {
+      await this.autoUpdater.quitAndInstall(false, true);
+    } catch {
+      await this.stateStore.write({ pendingVersion: null }).catch(() => {});
+      this.backupAgent.startPolling(10000);
+      this.setState({ phase: 'failed', message: UPDATE_FAILURE_MESSAGE });
+    }
     return this.getState();
   }
 

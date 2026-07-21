@@ -93,3 +93,11 @@ test('uses numeric versions and rejects downgrades', () => {
     message: '更新信息验证失败，请联系管理员',
   });
 });
+
+test('rejects version components above the safe integer range', () => {
+  const signed = signedManifest(fixture({ version: '9007199254740992.0.0' }));
+  assert.throws(
+    () => parseAndVerifyManifest(signed.bytes, signed.signature, signed.publicKeyBase64),
+    /version/i,
+  );
+});

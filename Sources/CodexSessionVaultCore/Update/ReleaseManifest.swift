@@ -159,6 +159,10 @@ public struct ReleaseManifest: Codable, Equatable, Sendable {
         return artifact
     }
 
+    public func matchesSparkleItem(displayVersion: String, buildVersion: String) -> Bool {
+        displayVersion == version && buildVersion == String(build)
+    }
+
     private func validate() throws {
         guard schemaVersion == 1 else {
             throw ReleaseManifestError.invalid("schemaVersion must be 1")
@@ -264,4 +268,3 @@ private func formatPublishedAt(_ value: Date) -> String {
     formatter.formatOptions = [.withInternetDateTime]
     return formatter.string(from: value)
 }
-

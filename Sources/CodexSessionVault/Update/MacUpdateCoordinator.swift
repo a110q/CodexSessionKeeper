@@ -27,7 +27,7 @@ final class MacUpdateCoordinator: ObservableObject {
     private var checkInProgress = false
     private var didStart = false
     private var updaterStartError: String?
-    private var targetVersion: String?
+    private var targetManifest: ReleaseManifest?
     private var downloadReceived: UInt64 = 0
     private var downloadTotal: UInt64?
     private var checkCancellation: (() -> Void)?
@@ -35,8 +35,11 @@ final class MacUpdateCoordinator: ObservableObject {
     private var readyReply: ((SPUUserUpdateChoice) -> Void)?
     private var retryTermination: (() -> Void)?
     private var installRequested = false
+    private var installWhenReady = false
     private var deferredReady = false
     private var backupDrainedForInstall = false
+
+    private var targetVersion: String? { targetManifest?.version }
 
     init(model: VaultModel, bundle: Bundle = .main) {
         self.model = model
@@ -139,8 +142,12 @@ final class MacUpdateCoordinator: ObservableObject {
             transition(.failed(message: "更新功能配置失败，请联系管理员"), present: true)
             return
         }
-        targetVersion = version
+        guard targetManifest?.version == version else {
+            transition(.failed(message: "更新版本不匹配，请联系管理员"), present: true)
+            return
+        }
         installRequested = true
+        installWhenReady = false
         deferredReady = false
         updater.checkForUpdates()
     }
@@ -176,9 +183,11 @@ final class MacUpdateCoordinator: ObservableObject {
         deferredReady = false
         if let reply = readyReply {
             readyReply = nil
+            installWhenReady = false
             reply(.install)
         } else {
             installRequested = true
+            installWhenReady = true
             updater.checkForUpdates()
         }
     }
@@ -215,12 +224,13 @@ final class MacUpdateCoordinator: ObservableObject {
         )
         switch result {
         case .available(let manifest, _):
-            targetVersion = manifest.version
+            targetManifest = manifest
             transition(
                 .found(version: manifest.version, notes: manifest.notes),
                 present: true
             )
         case .upToDate:
+            targetManifest = nil
             if silentUnavailable {
                 if case .checking = state { transition(.dismiss) }
             } else {
@@ -233,6 +243,7 @@ final class MacUpdateCoordinator: ObservableObject {
                 transition(.failed(message: "暂时无法连接公司更新服务器，请稍后重试"), present: true)
             }
         case .invalid(let message):
+            targetManifest = nil
             transition(.failed(message: message), present: true)
         }
     }
@@ -265,13 +276,21 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
     }
 
     func acceptSparkleItem(
-        version: String,
+        displayVersion: String,
+        buildVersion: String,
         reply: @escaping (SPUUserUpdateChoice) -> Void
     ) {
         checkCancellation = nil
-        guard installRequested, version == targetVersion else {
+        guard installRequested,
+              let targetManifest,
+              targetManifest.matchesSparkleItem(
+                displayVersion: displayVersion,
+                buildVersion: buildVersion
+              ) else {
             installRequested = false
+            installWhenReady = false
             reply(.dismiss)
+            resumeBackupIfNeeded()
             transition(.failed(message: "更新版本不匹配，请联系管理员"), present: true)
             return
         }
@@ -281,6 +300,8 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
 
     func sparkleUpdateNotFound() {
         checkCancellation = nil
+        installRequested = false
+        installWhenReady = false
         resumeBackupIfNeeded()
         transition(.upToDate(version: currentVersion), present: true)
     }
@@ -290,6 +311,8 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         downloadCancellation = nil
         readyReply = nil
         retryTermination = nil
+        installRequested = false
+        installWhenReady = false
         resumeBackupIfNeeded()
         transition(.failed(message: "更新失败，请稍后重试"), present: true)
     }
@@ -338,6 +361,12 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
             readyReply = nil
             previous(.dismiss)
         }
+        if installWhenReady && backupDrainedForInstall {
+            installWhenReady = false
+            transition(.installStarted(version: targetVersion ?? currentVersion), present: true)
+            reply(.install)
+            return
+        }
         readyReply = reply
         deferredReady = false
         transition(.downloadReady(version: targetVersion ?? currentVersion), present: true)
@@ -353,6 +382,7 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
 
     func sparkleInstallCompleted() {
         backupDrainedForInstall = false
+        installWhenReady = false
         transition(.completed(version: targetVersion ?? currentVersion), present: true)
     }
 
@@ -361,6 +391,11 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         downloadCancellation = nil
         readyReply = nil
         retryTermination = nil
+        let abandonedInstall = installWhenReady
+        installWhenReady = false
+        if abandonedInstall {
+            resumeBackupIfNeeded()
+        }
         if deferredReady {
             transition(.downloadReady(version: targetVersion ?? currentVersion), present: false)
             return

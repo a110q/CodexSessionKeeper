@@ -29,6 +29,16 @@ struct ReleaseManifestTests {
     }
 
     @Test
+    func matchesOnlyTheExactSparkleVersionAndBuildIdentity() throws {
+        let manifest = try ReleaseManifest.decodeValidated(from: try manifestData())
+
+        #expect(manifest.matchesSparkleItem(displayVersion: "1.1.0", buildVersion: "10100"))
+        #expect(!manifest.matchesSparkleItem(displayVersion: "1.1.0", buildVersion: "10099"))
+        #expect(!manifest.matchesSparkleItem(displayVersion: "1.1.1", buildVersion: "10100"))
+        #expect(!manifest.matchesSparkleItem(displayVersion: "1.1.0", buildVersion: "010100"))
+    }
+
+    @Test
     func rejectsUnknownFieldsAndForcedUpdates() throws {
         var value = manifestObject()
         value["extra"] = true
@@ -99,4 +109,3 @@ func manifestData(
         options: [.sortedKeys]
     )
 }
-

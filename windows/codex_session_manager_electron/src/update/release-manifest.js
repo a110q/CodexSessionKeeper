@@ -33,7 +33,11 @@ function parseVersion(value) {
   if (typeof value !== 'string' || !VERSION.test(value)) {
     throw invalid('version must use numeric X.Y.Z format');
   }
-  return value.split('.').map(Number);
+  const components = value.split('.').map(Number);
+  if (components.some((component) => !Number.isSafeInteger(component))) {
+    throw invalid('version components must be safe integers');
+  }
+  return components;
 }
 
 function validatePublishedAt(value) {

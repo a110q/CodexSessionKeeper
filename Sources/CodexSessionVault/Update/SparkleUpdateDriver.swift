@@ -4,7 +4,11 @@ import Sparkle
 @MainActor
 protocol SparkleUpdateDriverDelegate: AnyObject {
     func sparkleCheckStarted(cancellation: @escaping () -> Void)
-    func acceptSparkleItem(version: String, reply: @escaping (SPUUserUpdateChoice) -> Void)
+    func acceptSparkleItem(
+        displayVersion: String,
+        buildVersion: String,
+        reply: @escaping (SPUUserUpdateChoice) -> Void
+    )
     func sparkleUpdateNotFound()
     func sparkleUpdaterFailed()
     func sparkleDownloadStarted(cancellation: @escaping () -> Void)
@@ -42,7 +46,11 @@ final class SparkleUpdateDriver: NSObject, SPUUserDriver {
         state: SPUUserUpdateState,
         reply: @escaping (SPUUserUpdateChoice) -> Void
     ) {
-        delegate?.acceptSparkleItem(version: appcastItem.displayVersionString, reply: reply)
+        delegate?.acceptSparkleItem(
+            displayVersion: appcastItem.displayVersionString,
+            buildVersion: appcastItem.versionString,
+            reply: reply
+        )
     }
 
     func showUpdateReleaseNotes(with downloadData: SPUDownloadData) {}
