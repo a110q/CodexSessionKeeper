@@ -8,6 +8,7 @@ const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
+const { isMainThread, parentPort, Worker, workerData } = require('node:worker_threads');
 
 const REPOSITORY_ROOT = path.resolve(__dirname, '..', '..');
 const ELECTRON_ROOT = path.join(REPOSITORY_ROOT, 'windows', 'codex_session_manager_electron');
@@ -92,6 +93,14 @@ async function writeSyntheticFixture(filePath) {
   return Object.freeze({ following, totalBytes: LINE_BYTES + 1 + following.length });
 }
 
+function countNewlines(buffer) {
+  let count = 0;
+  for (let index = 0; index < buffer.length; index += 1) {
+    if (buffer[index] === 0x0A) count += 1;
+  }
+  return count;
+}
+
 async function hashAndChunks(filePath, chunkSize = 4 * 1024 * 1024) {
   const full = crypto.createHash('sha256');
   const chunkHashes = [];
@@ -101,7 +110,7 @@ async function hashAndChunks(filePath, chunkSize = 4 * 1024 * 1024) {
     byteCount += chunk.length;
     full.update(chunk);
     chunkHashes.push(crypto.createHash('sha256').update(chunk).digest('hex'));
-    for (const byte of chunk) if (byte === 0x0A) lineCount += 1;
+    lineCount += countNewlines(chunk);
   }
   return Object.freeze({ byteCount, lineCount, contentHash: full.digest('hex'), chunkHashes });
 }
@@ -339,6 +348,31 @@ async function runElectronSynthetic() {
   }
 }
 
+function loadElectronRealDependencies() {
+  const { BackupAgent } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'backup-agent'));
+  const { CursorStore } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'cursor-store'));
+  const { backupPaths } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'paths'));
+  const { loadVerification } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'verification-store'));
+  const { preflightIncrementalRecovery, restoreIncrementalSessions } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'incremental-recovery'));
+  return {
+    BackupAgent,
+    CursorStore,
+    backupPaths,
+    loadVerification,
+    preflightIncrementalRecovery,
+    restoreIncrementalSessions,
+  };
+}
+
+async function initializeElectronWorkerForMeasurement({
+  loadDependencies,
+  captureBaseline,
+}) {
+  const dependencies = loadDependencies();
+  await captureBaseline();
+  return dependencies;
+}
+
 async function runElectronReal() {
   const sourcePath = process.env.CODEX_REAL_LARGE_JSONL_SOURCE;
   if (!sourcePath) throw new Error('CODEX_REAL_LARGE_JSONL_SOURCE is required for real-source acceptance.');
@@ -348,12 +382,11 @@ async function runElectronReal() {
   if (!realSourcePhasePlan('electron').some((entry) => entry.phase === phase)) {
     throw new Error('real-source acceptance phase must be prepare, repair, or recover');
   }
-  await waitForStartupBaselineCapture();
-  const { BackupAgent } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'backup-agent'));
-  const { CursorStore } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'cursor-store'));
-  const { backupPaths } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'paths'));
-  const { loadVerification } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'verification-store'));
-  const { preflightIncrementalRecovery, restoreIncrementalSessions } = require(path.join(ELECTRON_ROOT, 'src', 'backup', 'incremental-recovery'));
+  const dependencies = await initializeElectronWorkerForMeasurement({
+    loadDependencies: loadElectronRealDependencies,
+    captureBaseline: waitForStartupBaselineCapture,
+  });
+  const { backupPaths } = dependencies;
 
   const before = await validateKnownSource(sourcePath);
   const root = path.resolve(rootValue);
@@ -364,13 +397,6 @@ async function runElectronReal() {
   const recoveryRoot = path.join(root, 'recovered-codex');
   const paths = backupPaths({ homeDir: root, codexRoot, backupRoot, stateRoot, pathImpl: path });
   const fixture = { root, codexRoot, isolatedSource, backupRoot, recoveryRoot, paths };
-  const dependencies = {
-    BackupAgent,
-    CursorStore,
-    loadVerification,
-    preflightIncrementalRecovery,
-    restoreIncrementalSessions,
-  };
   let phaseReport;
   if (phase === 'prepare') {
     phaseReport = await prepareElectronRealSource({ sourcePath, fixture, dependencies });
@@ -412,11 +438,92 @@ async function validateKnownSource(sourcePath) {
   return before;
 }
 
-function assertKnownFingerprint(fingerprint, label) {
-  assert.equal(fingerprint.byteCount, EXPECTED_REAL_BYTES, `${label} byte count mismatch`);
-  assert.equal(fingerprint.lineCount, EXPECTED_REAL_LINE_COUNT, `${label} line count mismatch`);
-  assert.equal(fingerprint.contentHash, EXPECTED_REAL_SHA256, `${label} SHA-256 mismatch`);
-  assert.equal(fingerprint.chunkHashes.length, EXPECTED_REAL_CHUNK_COUNT, `${label} chunk count mismatch`);
+async function validateCopyFingerprints({
+  sourcePath,
+  fingerprintPaths = [],
+  byteEqualPaths = [],
+  expectedFingerprint = null,
+  followingOffset = null,
+}) {
+  const sourceFingerprint = await hashAndChunks(sourcePath);
+  if (expectedFingerprint) {
+    assert.equal(sourceFingerprint.byteCount, expectedFingerprint.byteCount, 'known source byte count mismatch');
+    assert.equal(sourceFingerprint.lineCount, expectedFingerprint.lineCount, 'known source line count mismatch');
+    assert.equal(sourceFingerprint.contentHash, expectedFingerprint.contentHash, 'known source SHA-256 mismatch');
+    assert.equal(sourceFingerprint.chunkHashes.length, expectedFingerprint.chunkCount, 'known source chunk count mismatch');
+  }
+
+  for (const copyPath of fingerprintPaths) {
+    const copyFingerprint = await hashAndChunks(copyPath);
+    assert.deepEqual(copyFingerprint, sourceFingerprint, `fingerprint mismatch: ${copyPath}`);
+  }
+  for (const copyPath of byteEqualPaths) {
+    assert.equal(await filesEqual(sourcePath, copyPath), true, `byte mismatch: ${copyPath}`);
+  }
+  if (followingOffset !== null) {
+    const sourceFollowing = await readLineAt(sourcePath, followingOffset);
+    JSON.parse(sourceFollowing.toString('utf8'));
+    for (const copyPath of byteEqualPaths) {
+      assert.deepEqual(
+        await readLineAt(copyPath, followingOffset),
+        sourceFollowing,
+        `following JSONL record mismatch: ${copyPath}`,
+      );
+    }
+  }
+  return sourceFingerprint;
+}
+
+function validateCopiesInIsolatedWorker(options) {
+  const worker = new Worker(__filename, {
+    workerData: { operation: 'validate-copy-fingerprints', options },
+  });
+  return new Promise((resolve, reject) => {
+    let response = null;
+    let workerFailure = null;
+    worker.once('message', (message) => { response = message; });
+    worker.once('error', (error) => { workerFailure = error; });
+    worker.once('exit', (code) => {
+      if (workerFailure) {
+        reject(workerFailure);
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(`Fingerprint validation Worker exited with code ${code}.`));
+        return;
+      }
+      if (!response) {
+        reject(new Error('Fingerprint validation Worker exited without a response.'));
+        return;
+      }
+      if (!response.ok) {
+        const error = new Error(response.error?.message || 'Fingerprint validation Worker failed.');
+        error.name = response.error?.name || 'Error';
+        error.stack = response.error?.stack || error.stack;
+        reject(error);
+        return;
+      }
+      resolve(response.result);
+    });
+  });
+}
+
+async function runFingerprintValidationWorker() {
+  try {
+    const result = await validateCopyFingerprints(workerData.options);
+    parentPort.postMessage({ ok: true, result });
+  } catch (error) {
+    parentPort.postMessage({
+      ok: false,
+      error: {
+        name: error?.name || 'Error',
+        message: error?.message || String(error),
+        stack: error?.stack || null,
+      },
+    });
+  } finally {
+    parentPort.close();
+  }
 }
 
 async function prepareElectronRealSource({ sourcePath, fixture, dependencies }) {
@@ -477,14 +584,18 @@ async function repairElectronRealSource({ sourcePath, fixture, dependencies }) {
   const record = manifest.sessions[SESSION_ID];
   assert.ok(record, 'real-source repaired manifest missing');
   const backupPath = path.join(fixture.backupRoot, ...String(record.backupPath).split(/[\\/]+/));
-  const [sourceVerified, backupVerified] = await Promise.all([
-    hashAndChunks(sourcePath),
-    hashAndChunks(backupPath),
-  ]);
-  assertKnownFingerprint(sourceVerified, 'known source');
-  assert.deepEqual(backupVerified, sourceVerified);
-  assert.equal(await filesEqual(sourcePath, fixture.isolatedSource), true);
-  assert.equal(await filesEqual(sourcePath, backupPath), true);
+  const sourceVerified = await validateCopiesInIsolatedWorker({
+    sourcePath,
+    fingerprintPaths: [backupPath],
+    byteEqualPaths: [fixture.isolatedSource, backupPath],
+    expectedFingerprint: {
+      byteCount: EXPECTED_REAL_BYTES,
+      lineCount: EXPECTED_REAL_LINE_COUNT,
+      contentHash: EXPECTED_REAL_SHA256,
+      chunkCount: EXPECTED_REAL_CHUNK_COUNT,
+    },
+    followingOffset: NEXT_RECORD_OFFSET,
+  });
   const verification = await loadVerification(fixture.paths.verificationPath);
   const sidecar = verification.sessions[SESSION_ID];
   assert.equal(record.bytesBackedUp, sourceVerified.byteCount);
@@ -492,10 +603,6 @@ async function repairElectronRealSource({ sourcePath, fixture, dependencies }) {
   assert.equal(sidecar.byteCount, sourceVerified.byteCount);
   assert.equal(sidecar.lineCount, sourceVerified.lineCount);
   assert.deepEqual(sidecar.chunkHashes, sourceVerified.chunkHashes);
-  const sourceFollowing = await readLineAt(sourcePath, NEXT_RECORD_OFFSET);
-  const backupFollowing = await readLineAt(backupPath, NEXT_RECORD_OFFSET);
-  assert.deepEqual(backupFollowing, sourceFollowing);
-  JSON.parse(sourceFollowing.toString('utf8'));
   await emitWorkerStage('backup-compared');
   return { blockedLimitBytes: LEGACY_LIMIT_BYTES, repairedCursorOffset: cursor.lastByteOffset };
 }
@@ -510,11 +617,18 @@ async function recoverElectronRealSource({ sourcePath, fixture, dependencies }) 
   const restored = await restoreIncrementalSessions({ paths: recoveryPaths, preflight });
   const recoveredPath = restored.recoveredFiles[SESSION_ID];
   await emitWorkerStage('recovery-complete');
-  const recoveredVerified = await hashAndChunks(recoveredPath);
-  assertKnownFingerprint(recoveredVerified, 'recovered source');
-  assert.equal(await filesEqual(sourcePath, recoveredPath), true);
-  const sourceFollowing = await readLineAt(sourcePath, NEXT_RECORD_OFFSET);
-  assert.deepEqual(await readLineAt(recoveredPath, NEXT_RECORD_OFFSET), sourceFollowing);
+  await validateCopiesInIsolatedWorker({
+    sourcePath,
+    fingerprintPaths: [recoveredPath],
+    byteEqualPaths: [recoveredPath],
+    expectedFingerprint: {
+      byteCount: EXPECTED_REAL_BYTES,
+      lineCount: EXPECTED_REAL_LINE_COUNT,
+      contentHash: EXPECTED_REAL_SHA256,
+      chunkCount: EXPECTED_REAL_CHUNK_COUNT,
+    },
+    followingOffset: NEXT_RECORD_OFFSET,
+  });
   await emitWorkerStage('recovery-compared');
   return { restoredSessionIDs: [SESSION_ID] };
 }
@@ -922,15 +1036,20 @@ async function main() {
 
 module.exports = {
   compactedLineLayout,
+  countNewlines,
   descendantProcessIds,
+  initializeElectronWorkerForMeasurement,
   memoryBudgetViolations,
   realSourcePhasePlan,
   summarizeProcessMemory,
+  validateCopiesInIsolatedWorker,
   swapGrowthBytes,
   footprintGrowthBytes,
 };
 
-if (require.main === module) {
+if (!isMainThread && workerData?.operation === 'validate-copy-fingerprints') {
+  void runFingerprintValidationWorker();
+} else if (require.main === module) {
   main().catch((error) => {
     console.error(error.stack || error.message || String(error));
     process.exitCode = 1;

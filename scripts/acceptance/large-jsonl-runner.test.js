@@ -1,14 +1,70 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fsp = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 
 const {
+  countNewlines,
+  initializeElectronWorkerForMeasurement,
   memoryBudgetViolations,
   realSourcePhasePlan,
+  validateCopiesInIsolatedWorker,
   swapGrowthBytes,
   footprintGrowthBytes,
 } = require('./large-jsonl-runner');
+
+test('Electron startup baseline is captured after persistent production dependencies load', async () => {
+  const events = [];
+  const dependencies = await initializeElectronWorkerForMeasurement({
+    loadDependencies: () => {
+      events.push('dependencies');
+      return { loaded: true };
+    },
+    captureBaseline: async () => { events.push('baseline'); },
+  });
+
+  assert.deepEqual(events, ['dependencies', 'baseline']);
+  assert.deepEqual(dependencies, { loaded: true });
+});
+
+test('acceptance fingerprinting counts newlines without Buffer iteration', () => {
+  assert.equal(countNewlines(Buffer.from('one\ntwo\nthree')), 2);
+  assert.equal(countNewlines(Buffer.alloc(4 * 1024 * 1024, 0x78)), 0);
+});
+
+test('postcondition fingerprinting exits its disposable worker and rejects changed copies', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'large-jsonl-fingerprint-test-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, 'source.jsonl');
+  const matchingPath = path.join(root, 'matching.jsonl');
+  const changedPath = path.join(root, 'changed.jsonl');
+  const content = Buffer.from('{"value":1}\n{"value":2}\n');
+  await Promise.all([
+    fsp.writeFile(sourcePath, content),
+    fsp.writeFile(matchingPath, content),
+    fsp.writeFile(changedPath, Buffer.from('{"value":1}\n{"value":3}\n')),
+  ]);
+
+  const fingerprint = await validateCopiesInIsolatedWorker({
+    sourcePath,
+    fingerprintPaths: [matchingPath],
+    byteEqualPaths: [matchingPath],
+  });
+  assert.equal(fingerprint.byteCount, content.length);
+  assert.equal(fingerprint.lineCount, 2);
+
+  await assert.rejects(
+    validateCopiesInIsolatedWorker({
+      sourcePath,
+      fingerprintPaths: [changedPath],
+      byteEqualPaths: [changedPath],
+    }),
+    /fingerprint mismatch|byte mismatch/,
+  );
+});
 
 test('swap growth is clamped to nonnegative bytes above the startup-ready baseline', () => {
   assert.equal(swapGrowthBytes(6_111_232, 7_274_496), 1_163_264);
