@@ -43,7 +43,7 @@
   └── Nginx Docker（静态文件、只读挂载、仅内网）
         │
         ├── release.json + release.json.sig
-        ├── macos/appcast.xml + zip
+        ├── macos/appcast.xml（内嵌 feed 签名）+ zip
         └── windows/latest.yml + NSIS.exe
                     ▲
                     │ 启动后检查，员工确认后下载
@@ -71,7 +71,6 @@ codex-updates/
         ├── release.json.sig
         ├── macos/
         │   ├── appcast.xml
-        │   ├── appcast.xml.sig
         │   └── CodexSessionKeeper-1.1.0-macos-arm64.zip
         └── windows/
             ├── latest.yml
@@ -122,7 +121,7 @@ codex-updates/
 
 - `release.json.sig` 是对 `release.json` 原始字节的 Ed25519 签名。
 - 客户端内置公钥，发布私钥保存在发布 Mac 的钥匙串中，并保留一份加密离线备份。
-- macOS 更新包额外使用 Sparkle EdDSA 签名；启用 `SUVerifyUpdateBeforeExtraction` 和 `SURequireSignedFeed`，对归档和 appcast 都进行验证。
+- macOS 更新包额外使用 Sparkle EdDSA 签名；启用 `SUVerifyUpdateBeforeExtraction` 和 `SURequireSignedFeed`，对归档和 appcast 都进行验证。Sparkle 2.9.4 的 feed 签名内嵌在 `appcast.xml` 的 `sparkle-signatures` 块中，不另存 `appcast.xml.sig`。
 - Windows 客户端先验证 `release.json.sig`，下载完成后再将安装包大小和 SHA-256 与签名清单对比；只有验证成功才允许 `quitAndInstall`。
 - `latest.yml` 仍由 Electron Builder 生成，供 `electron-updater` 使用，但不能单独作为信任来源。
 - 没有商业代码签名证书时，首次安装可能触发 macOS Gatekeeper 或 Windows SmartScreen 提示。应用内更新的真实性由 Ed25519 签名保证；以后增加平台证书不需要改变更新协议。
