@@ -19,3 +19,7 @@ windows/codex_session_manager_electron/node_modules/
 
 .env
 .env.*
+
+.release-staging/
+*.update-private-key.pem
+*.sparkle-private-key
