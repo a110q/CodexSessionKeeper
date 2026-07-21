@@ -464,6 +464,75 @@ test('rangesMatch compares only requested ranges with bounded reads', async (t) 
   assert.ok(readSizes.every((size) => size <= 2));
 });
 
+test('interruption during the boundary scan preserves the old rebuild target', async (t) => {
+  const source = Buffer.from('aa\nbb\n');
+  const { sourcePath, targetPath } = await makeFixture(t, source);
+  await fs.writeFile(targetPath, 'committed');
+  let checks = 0;
+
+  await assert.rejects(
+    rebuildSessionCompleteLines({
+      sourcePath,
+      targetPath,
+      chunkSize: 3,
+      interruptionRequested: () => {
+        checks += 1;
+        return checks === 3;
+      },
+    }),
+    (error) => error?.code === 'INTEGRITY_AUDIT_INTERRUPTED',
+  );
+
+  assert.equal(await fs.readFile(targetPath, 'utf8'), 'committed');
+});
+
+test('interruption during the second rebuild pass removes the partial temporary file', async (t) => {
+  const source = Buffer.from('aa\nbb\n');
+  const { root, sourcePath, targetPath } = await makeFixture(t, source);
+  await fs.writeFile(targetPath, 'committed');
+  let checks = 0;
+
+  await assert.rejects(
+    rebuildSessionCompleteLines({
+      sourcePath,
+      targetPath,
+      chunkSize: 3,
+      interruptionRequested: () => {
+        checks += 1;
+        return checks === 7;
+      },
+    }),
+    (error) => error?.code === 'INTEGRITY_AUDIT_INTERRUPTED',
+  );
+
+  assert.equal(await fs.readFile(targetPath, 'utf8'), 'committed');
+  assert.deepEqual((await fs.readdir(root)).sort(), ['source.jsonl', 'target.jsonl']);
+});
+
+test('interruption during append copy truncates the target to its original offset', async (t) => {
+  const prefix = Buffer.from('old\n');
+  const appended = Buffer.from('aa\nbb\n');
+  const { sourcePath, targetPath } = await makeFixture(t, Buffer.concat([prefix, appended]));
+  await fs.writeFile(targetPath, prefix);
+  let checks = 0;
+
+  await assert.rejects(
+    appendCompleteLines({
+      sourcePath,
+      sourceOffset: prefix.length,
+      targetPath,
+      chunkSize: 3,
+      interruptionRequested: () => {
+        checks += 1;
+        return checks === 7;
+      },
+    }),
+    (error) => error?.code === 'INTEGRITY_AUDIT_INTERRUPTED',
+  );
+
+  assert.deepEqual(await fs.readFile(targetPath), prefix);
+});
+
 test('failed streaming replacement preserves the old target and removes its temp file', async (t) => {
   const { root, targetPath } = await makeFixture(t);
   await fs.writeFile(targetPath, 'committed');

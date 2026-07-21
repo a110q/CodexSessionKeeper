@@ -2546,7 +2546,7 @@ test('concurrent triggers serialize one active scan and at most one queued follo
   assert.deepEqual(triggers, ['startup', 'wake', 'reconnect', 'timer', 'wake', 'reconnect', 'timer']);
 });
 
-test('replacement quiescence wait is bounded and succeeds after the active writer drains', async (t) => {
+test('replacement quiescence wait is bounded and observes cancellation after active work drains', async (t) => {
   const { paths } = await makeTestPaths(t);
   const entered = controlledPromise();
   const release = controlledPromise();
@@ -2566,12 +2566,74 @@ test('replacement quiescence wait is bounded and succeeds after the active write
   assert.equal(await agent.stopAndAwaitQuiescence(5), false);
   assert.ok(Date.now() - startedAt < 250);
   release.resolve();
-  await scan;
+  await assert.rejects(scan, (error) => error?.name === 'AbortError');
 
   assert.equal(await agent.stopAndAwaitQuiescence(1000), true);
 });
 
-test('stop between atomic session steps retains pending state and does not publish a complete seed', async (t) => {
+test('stop aborts active verification without publishing metadata or an error status', async (t) => {
+  const { paths } = await makeTestPaths(t);
+  const sourcePath = path.join(paths.codexRoot, 'sessions', 'cancel-verification.jsonl');
+  const original = Buffer.from(jsonLine({ role: 'user', content: 'verified original' }));
+  await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+  await fs.writeFile(sourcePath, original);
+  await new BackupAgent({ paths, now: makeClock() }).performOneShotScan();
+
+  const targetPath = paths.backupFilePath(sourcePath);
+  const manifestBefore = await fs.readFile(paths.manifestPath);
+  const verificationBefore = await fs.readFile(paths.verificationPath);
+  const localStatusBefore = await fs.readFile(paths.localStatusPath);
+  const targetBefore = await fs.readFile(targetPath);
+  await fs.writeFile(sourcePath, fixedSizeJSONLine(9 * 1024 * 1024, 0x61));
+
+  const entered = controlledPromise();
+  const release = controlledPromise();
+  const baseCommitter = createFileCommitter();
+  let rebuildCalls = 0;
+  const fileCommitter = {
+    ...baseCommitter,
+    async rebuildCompleteLines(
+      source,
+      target,
+      backupRoot,
+      verifyTemporary,
+      interruptionRequested,
+    ) {
+      rebuildCalls += 1;
+      return baseCommitter.rebuildCompleteLines(
+        source,
+        target,
+        backupRoot,
+        async (...verificationArguments) => {
+          entered.resolve();
+          await release.promise;
+          return verifyTemporary(...verificationArguments);
+        },
+        interruptionRequested,
+      );
+    },
+  };
+  const agent = new BackupAgent({ paths, fileCommitter, now: makeClock() });
+  t.after(() => {
+    release.resolve();
+    agent.stop();
+  });
+
+  const scan = agent.requestImmediateScan('startup');
+  await entered.promise;
+  agent.stop();
+  release.resolve();
+
+  await assert.rejects(scan, (error) => error?.name === 'AbortError');
+  assert.equal(await agent.stopAndAwaitQuiescence(1000), true);
+  assert.equal(rebuildCalls, 1);
+  assert.deepEqual(await fs.readFile(paths.manifestPath), manifestBefore);
+  assert.deepEqual(await fs.readFile(paths.verificationPath), verificationBefore);
+  assert.deepEqual(await fs.readFile(paths.localStatusPath), localStatusBefore);
+  assert.deepEqual(await fs.readFile(targetPath), targetBefore);
+});
+
+test('stop before the metadata batch leaves partial scan metadata unpublished', async (t) => {
   const { paths } = await makeTestPaths(t);
   const firstPath = path.join(paths.codexRoot, 'sessions', 'a-first.jsonl');
   const secondPath = path.join(paths.codexRoot, 'sessions', 'b-second.jsonl');
@@ -2596,16 +2658,15 @@ test('stop between atomic session steps retains pending state and does not publi
   await firstFinished.promise;
   agent.stop();
   releaseFirst.resolve();
-  await scan;
+  await assert.rejects(scan, (error) => error?.name === 'AbortError');
 
-  const manifest = JSON.parse(await fs.readFile(paths.manifestPath, 'utf8'));
-  assert.deepEqual(Object.keys(manifest.sessions), ['a-first']);
-  const status = JSON.parse(await fs.readFile(paths.localStatusPath, 'utf8'));
-  assert.equal(status.status, 'waiting');
-  const pending = JSON.parse(await fs.readFile(paths.pendingSourcesPath, 'utf8'));
-  assert.equal(pending.pending.length, 1);
-  assert.equal(pending.pending[0].sourcePath, secondPath);
+  assert.equal(await fileExists(paths.manifestPath), false);
+  assert.equal(await fileExists(paths.verificationPath), false);
+  assert.equal(await fileExists(paths.localStatusPath), false);
+  assert.equal(await fileExists(paths.pendingSourcesPath), false);
   assert.equal(await fileExists(paths.auditStatePath), false);
+  assert.equal(await fileExists(paths.backupFilePath(firstPath)), true);
+  assert.equal(await fileExists(paths.backupFilePath(secondPath)), false);
 });
 
 test('stopped agent preserves its interruption epoch and rejects later audit work', async (t) => {

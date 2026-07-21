@@ -89,6 +89,7 @@ class BackupAgent {
     this.pollingGeneration = 0;
     this.scanPromise = null;
     this.scanQueued = false;
+    this.activeScanAbortController = null;
     this.auditPromise = null;
     this.auditScanDeferred = null;
     this.timerPreflightPromise = null;
@@ -127,6 +128,7 @@ class BackupAgent {
   stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this.activeScanAbortController?.abort();
     this.scanQueued = false;
     this.requestAuditInterruption();
     this.stopAuditTimer();
@@ -279,10 +281,15 @@ class BackupAgent {
       return this.scanPromise;
     }
 
-    this.scanPromise = this.drainScanQueue();
+    const controller = new AbortController();
+    this.activeScanAbortController = controller;
+    this.scanPromise = this.drainScanQueue(controller.signal);
     try {
       return await this.scanPromise;
     } finally {
+      if (this.activeScanAbortController === controller) {
+        this.activeScanAbortController = null;
+      }
       this.scanPromise = null;
     }
   }
@@ -392,13 +399,15 @@ class BackupAgent {
     }
   }
 
-  async drainScanQueue() {
+  async drainScanQueue(signal) {
+    throwIfAborted(signal);
     let result;
     for (let scanIndex = 0; scanIndex < 2 && !this.stopped; scanIndex += 1) {
       this.scanQueued = false;
       try {
-        result = await this.performOneShotScanLocked();
+        result = await this.performOneShotScanLocked(signal);
       } catch (error) {
+        if (isAbortError(error)) throw error;
         await this.writeLocalErrorStatus(error).catch(() => {});
         throw error;
       }
@@ -408,19 +417,24 @@ class BackupAgent {
     return result;
   }
 
-  async performOneShotScanLocked() {
+  async performOneShotScanLocked(signal = null) {
+    throwIfAborted(signal);
     const scanDate = this.now();
 
     // Trust and availability must be established before any NAS mutation.
     await this.validateTarget(this.paths);
+    throwIfAborted(signal);
     await this.ensureStateDirectories();
+    throwIfAborted(signal);
     await this.ensureRemoteDirectories();
+    throwIfAborted(signal);
 
     const integrityAuditor = this.integrityAuditorFactory(this.paths);
     await integrityAuditor.recoverPendingRepairIfNeeded({
       now: scanDate,
       cleanupOrphans: !this.startupOrphanCleanupComplete,
     });
+    throwIfAborted(signal);
     this.startupOrphanCleanupComplete = true;
     const manifestExisted = await fileExists(this.paths.manifestPath);
     const cursorStore = new CursorStore({ paths: this.paths });
@@ -488,6 +502,7 @@ class BackupAgent {
           }),
           scanDate,
           sessionId,
+          signal,
           sourcePath,
         });
         if (!result.lastError || result.isLineLimitBlocked) {
@@ -521,6 +536,7 @@ class BackupAgent {
         }
       }
 
+      throwIfAborted(signal);
       if (JSON.stringify(verification) !== originalVerification) {
         await saveVerification(this.paths.verificationPath, verification);
       }
@@ -615,7 +631,13 @@ class BackupAgent {
     onVerifying,
     currentCursor,
     cursorMap,
+    signal = null,
   }) {
+    throwIfAborted(signal);
+    const interruptionRequested = () => {
+      throwIfAborted(signal);
+      return false;
+    };
     const sourceStats = await trustedSourceMetadata(sourcePath);
     const existingRecord = manifest.sessions[sessionId] || null;
     const migratedCursor = this.migratedCursor(existingRecord, sourcePath, cursorMap);
@@ -700,6 +722,7 @@ class BackupAgent {
           previous: existingVerification,
           chunkSize: verification.chunkSize,
         });
+        throwIfAborted(signal);
       } else {
         rebuild = true;
       }
@@ -714,12 +737,14 @@ class BackupAgent {
       let lastError = null;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         try {
+          throwIfAborted(signal);
           let attemptVerification = null;
           const attemptStream = await this.fileCommitter.rebuildCompleteLines(
             sourcePath,
             backupPath,
             this.paths.backupRoot,
             async (temporaryPath, expected) => {
+              throwIfAborted(signal);
               onVerifying?.();
               attemptVerification = await verifyFullBackupFile({
                 filePath: temporaryPath,
@@ -728,12 +753,17 @@ class BackupAgent {
                 expectedByteCount: expected.committedByteCount,
                 expectedLineCount: expected.lineCount,
                 expectedContentHash: expected.contentHash,
+                signal,
               });
+              throwIfAborted(signal);
             },
+            interruptionRequested,
           );
+          throwIfAborted(signal);
           if (!attemptVerification) throw new Error(`Backup readback verification did not run: ${backupPath}`);
           return { streamed: attemptStream, verified: attemptVerification };
         } catch (error) {
+          if (isAbortError(error)) throw error;
           lastError = error;
           if (attempt + 1 === attempts) {
             if (!(error instanceof BackupFileVerificationError)) throw error;
@@ -747,7 +777,9 @@ class BackupAgent {
       throw lastError || new Error(`Backup readback verification failed: ${backupPath}`);
     };
     if (rebuild) {
+      throwIfAborted(signal);
       const rebuilt = await rebuildAndVerify(2);
+      throwIfAborted(signal);
       streamed = rebuilt.streamed;
       finalOffset = streamed.committedByteCount;
       finalStats = { byteCount: finalOffset, lineCount: streamed.lineCount };
@@ -767,12 +799,15 @@ class BackupAgent {
         else delete verification.sessions[sessionId];
       };
       try {
+        throwIfAborted(signal);
         streamed = await this.fileCommitter.appendCompleteLines(
           sourcePath,
           backupPath,
           readOffset,
           this.paths.backupRoot,
+          interruptionRequested,
         );
+        throwIfAborted(signal);
         const attemptFinalOffset = streamed.committedByteCount;
         const attemptFinalLineCount = baseLineCount + streamed.lineCount;
         verification.sessions[sessionId] = attemptFinalOffset > existingVerification.byteCount
@@ -788,13 +823,16 @@ class BackupAgent {
               verifiedAt: scanDate,
               chunkSize: verification.chunkSize,
               maxLineBytes: this.maxLineBytes,
+              signal,
             });
           })()
           : existingVerification;
+        throwIfAborted(signal);
         const finalSourceStats = await trustedSourceMetadata(sourcePath);
         if (!sameSourceMetadata(sourceStats, finalSourceStats)) {
           throw sourceChangedDuringBackupError(sourcePath);
         }
+        throwIfAborted(signal);
       } catch (error) {
         restorePreviousVerification();
         await this.fileCommitter.truncateTarget(
@@ -871,6 +909,8 @@ class BackupAgent {
       blockedLineLimitBytes: streamed.blockedError ? this.maxLineBytes : null,
       updatedAt: scanDate.getTime() / 1000,
     };
+
+    throwIfAborted(signal);
 
     return {
       manifestChanged,
@@ -1072,23 +1112,37 @@ function createFileCommitter({
       return rangesMatch({ sourcePath, sourceOffset, targetPath, targetOffset, length });
     },
 
-    async appendCompleteLines(sourcePath, targetPath, sourceOffset, backupRoot) {
+    async appendCompleteLines(
+      sourcePath,
+      targetPath,
+      sourceOffset,
+      backupRoot,
+      interruptionRequested = () => false,
+    ) {
       await assertContainedTarget(backupRoot, targetPath);
       return appendCompleteLines({
         sourcePath,
         sourceOffset,
         targetPath,
         maxLineBytes: effectiveMaxLineBytes,
+        interruptionRequested,
         sync,
       });
     },
 
-    async rebuildCompleteLines(sourcePath, targetPath, backupRoot, verifyTemporary = null) {
+    async rebuildCompleteLines(
+      sourcePath,
+      targetPath,
+      backupRoot,
+      verifyTemporary = null,
+      interruptionRequested = () => false,
+    ) {
       await ensureContainedParent(backupRoot, targetPath);
       return rebuildSessionCompleteLines({
         sourcePath,
         targetPath,
         maxLineBytes: effectiveMaxLineBytes,
+        interruptionRequested,
         sync,
         verifyTemporary,
       });
@@ -1229,6 +1283,18 @@ function sourceChangedDuringBackupError(sourcePath, cause = null) {
   error.code = 'SOURCE_CHANGED_DURING_BACKUP';
   if (cause) error.cause = cause;
   return error;
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error('Backup scan was cancelled.');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  throw error;
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
 }
 
 function scanIsStrictlyUnchanged({

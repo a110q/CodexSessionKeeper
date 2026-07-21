@@ -292,10 +292,13 @@ async function rebuildSessionCompleteLines({
     }, {
       sync,
       verifyTemporary: verifyTemporary
-        ? (temporaryPath) => verifyTemporary(temporaryPath, {
-          ...scanResult,
-          contentHash: copyResult.contentHash,
-        })
+        ? async (temporaryPath) => {
+          await verifyTemporary(temporaryPath, {
+            ...scanResult,
+            contentHash: copyResult.contentHash,
+          });
+          if (interruptionRequested()) throw interruptedError();
+        }
         : null,
     });
 
@@ -314,6 +317,12 @@ function interruptedError() {
   return error;
 }
 
+function isInterruptionError(error) {
+  return error?.name === 'AbortError'
+    || error?.code === 'ABORT_ERR'
+    || error?.code === 'INTEGRITY_AUDIT_INTERRUPTED';
+}
+
 async function rebuildCompleteLines(options) {
   const result = await rebuildSessionCompleteLines(options);
   return {
@@ -329,6 +338,7 @@ async function appendCompleteLines({
   targetPath,
   chunkSize = DEFAULT_CHUNK_SIZE,
   maxLineBytes = DEFAULT_MAX_LINE_BYTES,
+  interruptionRequested = () => false,
   sync = (handle) => handle.sync(),
 }) {
   if (!Number.isSafeInteger(sourceOffset) || sourceOffset < 0) {
@@ -344,6 +354,7 @@ async function appendCompleteLines({
       startOffset: sourceOffset,
       chunkSize,
       maxLineBytes,
+      interruptionRequested,
     });
     targetHandle = await fsp.open(targetPath, 'r+');
     const targetStats = await targetHandle.stat();
@@ -362,6 +373,7 @@ async function appendCompleteLines({
       startOffset: sourceOffset,
       byteCount: scanResult.committedByteCount,
       chunkSize,
+      interruptionRequested,
       writeChunk: (chunk) => bufferedWriter.append(chunk),
     });
     await bufferedWriter.flush();
@@ -373,6 +385,12 @@ async function appendCompleteLines({
       appendedByteCount: scanResult.committedByteCount,
       committedByteCount: sourceOffset + scanResult.committedByteCount,
     };
+  } catch (error) {
+    if (targetHandle && isInterruptionError(error)) {
+      await targetHandle.truncate(sourceOffset);
+      await sync(targetHandle);
+    }
+    throw error;
   } finally {
     await targetHandle?.close().catch(() => {});
     await sourceHandle.close();
