@@ -25,6 +25,14 @@ function createTrustedIpcRegistrar({ ipcMain, getMainWindow, expectedURL }) {
   };
 }
 
+function strictZeroArgumentHandler(handler) {
+  if (typeof handler !== 'function') throw new TypeError('handler must be a function');
+  return async function handleZeroArgumentAction(_event, ...args) {
+    if (args.length !== 0) throw new TypeError('此操作不接受参数。');
+    return handler();
+  };
+}
+
 function installNavigationGuards(webContents, expectedURL) {
   const preventUnexpectedNavigation = (event, targetURL) => {
     if (targetURL !== expectedURL) event.preventDefault();
@@ -72,4 +80,5 @@ module.exports = {
   createTrustedIpcRegistrar,
   installNavigationGuards,
   resolveTrustedSessionFile,
+  strictZeroArgumentHandler,
 };

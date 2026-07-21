@@ -9,6 +9,7 @@ const {
   createTrustedIpcRegistrar,
   installNavigationGuards,
   resolveTrustedSessionFile,
+  strictZeroArgumentHandler,
 } = require('../../src/security');
 
 function trustedIpcFixture() {
@@ -183,6 +184,7 @@ test('trusted session file resolver rejects unsafe filesystem targets', async (t
 test('Electron source contract exposes no renderer-controlled filesystem path channel', () => {
   const sourceRoot = path.join(__dirname, '..', '..', 'src');
   const mainSource = fs.readFileSync(path.join(sourceRoot, 'main.js'), 'utf8');
+  const indexSource = fs.readFileSync(path.join(sourceRoot, 'index.html'), 'utf8');
   const preloadSource = fs.readFileSync(path.join(sourceRoot, 'preload.js'), 'utf8');
   const rendererSource = fs.readFileSync(path.join(sourceRoot, 'renderer.js'), 'utf8');
 
@@ -196,6 +198,30 @@ test('Electron source contract exposes no renderer-controlled filesystem path ch
   assert.match(rendererSource, /openSessionFile\(session\.id\)/);
   assert.match(rendererSource, /revealSessionFile\(session\.id\)/);
 
+  for (const channel of [
+    'update:get-state',
+    'update:check',
+    'update:download',
+    'update:defer-restart',
+    'update:install',
+  ]) {
+    assert.match(mainSource, new RegExp(`handleTrustedIpc\\('${channel.replace(':', '\\:')}'`));
+  }
+  assert.match(preloadSource, /ipcRenderer\.invoke\('update:install'\)/);
+  assert.doesNotMatch(preloadSource, /update:install'\s*,\s*(url|path|options)/);
+  assert.match(preloadSource, /ipcRenderer\.on\('update:state'/);
+  assert.match(indexSource, /role="dialog"[^>]+aria-modal="true"/);
+  for (const id of [
+    'updateLaterButton',
+    'updateNowButton',
+    'updateRestartLaterButton',
+    'updateInstallButton',
+  ]) {
+    assert.match(indexSource, new RegExp(`id="${id}"`));
+  }
+  assert.match(rendererSource, /function renderUpdate\(\)/);
+  assert.doesNotMatch(rendererSource, /updateNotes[^\n]*innerHTML/);
+
   const preloadChannels = [...preloadSource.matchAll(/ipcRenderer\.invoke\('([^']+)'/g)]
     .map((match) => match[1])
     .sort();
@@ -203,4 +229,37 @@ test('Electron source contract exposes no renderer-controlled filesystem path ch
     .map((match) => match[1])
     .sort();
   assert.deepEqual(mainChannels, preloadChannels);
+});
+
+test('zero-argument update handlers reject renderer-controlled options', async () => {
+  const fixture = trustedIpcFixture();
+  const calls = [];
+  for (const channel of [
+    'update:get-state',
+    'update:check',
+    'update:download',
+    'update:defer-restart',
+    'update:install',
+  ]) {
+    fixture.handleTrustedIpc(
+      channel,
+      strictZeroArgumentHandler(async () => {
+        calls.push(channel);
+        return { phase: 'idle' };
+      }),
+    );
+  }
+  const event = {
+    sender: fixture.webContents,
+    senderFrame: fixture.mainFrame,
+  };
+
+  for (const channel of fixture.handlers.keys()) {
+    assert.deepEqual(await fixture.handlers.get(channel)(event), { phase: 'idle' });
+    await assert.rejects(
+      fixture.handlers.get(channel)(event, { url: 'https://attacker.invalid/update.exe' }),
+      /不接受参数/,
+    );
+  }
+  assert.equal(calls.length, 5);
 });

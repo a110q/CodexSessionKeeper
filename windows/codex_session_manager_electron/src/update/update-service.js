@@ -61,6 +61,7 @@ class UpdateService {
     this.initialTimer = null;
     this.intervalTimer = null;
     this.disposed = false;
+    this.started = false;
 
     this.autoUpdater.autoDownload = false;
     this.autoUpdater.autoInstallOnAppQuit = false;
@@ -81,6 +82,8 @@ class UpdateService {
   }
 
   async start() {
+    if (this.started || this.disposed) return this.getState();
+    this.started = true;
     const completed = await this.stateStore.consumeCompletion(this.currentVersion);
     if (completed) this.setState(completed);
 

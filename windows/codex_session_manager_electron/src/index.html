@@ -56,6 +56,7 @@
           </div>
         </div>
         <div class="top-actions">
+          <button id="checkUpdatesButton" class="ghost-button">检查更新</button>
           <button id="refreshBtn" class="ghost-button">刷新</button>
           <div class="open-dir-wrap">
             <button id="openDirsBtn" class="ghost-button">打开目录</button>
@@ -178,6 +179,30 @@
       <p class="busy-footnote">请等待完成后再切换或关闭应用，避免快照和索引写入中断。</p>
       <div class="busy-actions">
         <button id="busyCancelBtn" class="ghost-button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="updateDialog" class="update-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="updateTitle">
+    <div class="update-card">
+      <h2 id="updateTitle">软件更新</h2>
+      <p id="updateVersion" class="update-version"></p>
+      <ul id="updateNotes" class="update-notes"></ul>
+      <div id="updateProgressBlock" class="update-progress-block hidden">
+        <progress id="updateProgress" max="100"></progress>
+        <p id="updateProgressText"></p>
+      </div>
+      <p id="updateError" class="update-error hidden"></p>
+      <div id="updateAvailableActions" class="update-actions hidden">
+        <button id="updateLaterButton" type="button" class="ghost-button">稍后提醒</button>
+        <button id="updateNowButton" type="button" class="primary primary-button">立即更新</button>
+      </div>
+      <div id="updateReadyActions" class="update-actions hidden">
+        <button id="updateRestartLaterButton" type="button" class="ghost-button">稍后重启</button>
+        <button id="updateInstallButton" type="button" class="primary primary-button">重启并更新</button>
+      </div>
+      <div id="updateAcknowledgeActions" class="update-actions hidden">
+        <button id="updateAcknowledgeButton" type="button" class="primary-button">知道了</button>
       </div>
     </div>
   </div>

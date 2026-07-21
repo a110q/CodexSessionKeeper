@@ -1,9 +1,11 @@
 const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { pathToFileURL } = require('node:url');
+const packageMetadata = require('../package.json');
 const { backupPaths } = require('./backup/paths');
 const { BackupAgent } = require('./backup/backup-agent');
 const {
@@ -34,12 +36,15 @@ const {
   createTrustedIpcRegistrar,
   installNavigationGuards,
   resolveTrustedSessionFile,
+  strictZeroArgumentHandler,
 } = require('./security');
+const { UpdateService } = require('./update/update-service');
+const { UpdateStateStore } = require('./update/update-state-store');
 
 let mainWindow;
 let sqlPromise;
+let updateService;
 
-const appVersion = '1.0.13';
 const codexRoot = path.join(os.homedir(), '.codex');
 const vaultRoot = path.join(os.homedir(), '.codex-session-vault');
 const snapshotRoot = path.join(vaultRoot, 'snapshots');
@@ -53,6 +58,27 @@ const handleTrustedIpc = createTrustedIpcRegistrar({
   getMainWindow: () => mainWindow,
   expectedURL: applicationPageURL,
 });
+
+function requireUpdateService() {
+  if (!updateService) throw new Error('更新服务尚未就绪。');
+  return updateService;
+}
+
+handleTrustedIpc('update:get-state', strictZeroArgumentHandler(
+  () => requireUpdateService().getState(),
+));
+handleTrustedIpc('update:check', strictZeroArgumentHandler(
+  () => requireUpdateService().check({ manual: true }),
+));
+handleTrustedIpc('update:download', strictZeroArgumentHandler(
+  () => requireUpdateService().download(),
+));
+handleTrustedIpc('update:defer-restart', strictZeroArgumentHandler(
+  () => requireUpdateService().deferRestart(),
+));
+handleTrustedIpc('update:install', strictZeroArgumentHandler(
+  () => requireUpdateService().restartAndInstall(),
+));
 
 const backupCandidates = [
   'config.toml',
@@ -131,18 +157,32 @@ function createWindow() {
   });
 
   installNavigationGuards(mainWindow.webContents, applicationPageURL);
+  mainWindow.webContents.once('did-finish-load', () => {
+    updateService?.start().catch((error) => {
+      writeUpdateDiagnostic(`Update service failed to start: ${error.message}`);
+    });
+  });
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
   mainWindow.loadFile(applicationPagePath);
 }
 
-app.whenReady().then(createWindow);
 app.whenReady().then(async () => {
+  try {
+    updateService = createUpdateService();
+  } catch (error) {
+    console.error('Update service configuration is invalid:', error);
+    dialog.showErrorBox('更新功能配置错误', '更新公钥或版本信息无效，请联系管理员。');
+    app.quit();
+    return;
+  }
+  createWindow();
   try {
     localBackupAgent.startPolling(10000);
   } catch (error) {
     console.error('Local incremental backup failed to start:', error);
   }
-});
-app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
 });
 
@@ -153,6 +193,54 @@ app.on('window-all-closed', () => {
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
+
+app.on('will-quit', () => {
+  updateService?.dispose();
+});
+
+function createUpdateService() {
+  const currentBuild = packageMetadata.updateBuild;
+  if (!Number.isSafeInteger(currentBuild) || currentBuild <= 0) {
+    throw new Error('package.json updateBuild must be a positive safe integer');
+  }
+  const keysPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'UpdateKeys.json')
+    : path.join(__dirname, '..', '..', '..', 'Config', 'UpdateKeys.json');
+  const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
+  const publicKey = Buffer.from(String(keys.manifestPublicKey || ''), 'base64');
+  if (publicKey.length !== 32 || publicKey.toString('base64') !== keys.manifestPublicKey) {
+    throw new Error('manifestPublicKey must contain exactly 32 bytes');
+  }
+
+  return new UpdateService({
+    autoUpdater,
+    backupAgent: localBackupAgent,
+    currentBuild,
+    currentVersion: app.getVersion(),
+    publicKeyBase64: keys.manifestPublicKey,
+    sendState: (state) => {
+      if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+      mainWindow.webContents.send('update:state', state);
+    },
+    stateStore: new UpdateStateStore({
+      vaultRoot,
+      logger: writeUpdateDiagnostic,
+    }),
+  });
+}
+
+function writeUpdateDiagnostic(message) {
+  try {
+    ensureDir(path.dirname(localBackupPaths.logPath));
+    fs.appendFileSync(
+      localBackupPaths.logPath,
+      `${new Date().toISOString()} [update] ${String(message).replaceAll('\n', ' ')}\n`,
+      'utf8',
+    );
+  } catch {
+    // Diagnostics must never interrupt the application lifecycle.
+  }
+}
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -930,7 +1018,7 @@ async function createSnapshot(name, reason, candidates = backupCandidates) {
     archivedSessionCount: sanitizedCounts?.archived ?? currentState.archivedSessionCount,
     sizeBytes: directorySize(dataPath),
     includedPaths,
-    appVersion: `win-exe-${appVersion}`,
+    appVersion: `win-exe-${app.getVersion()}`,
     warnings
   };
   fs.writeFileSync(path.join(snapshotPath, 'snapshot.json'), JSON.stringify(meta, null, 2), 'utf8');
@@ -1036,7 +1124,7 @@ async function createSessionProtectionSnapshot(name, reason, sessions) {
     archivedSessionCount: counts.archived,
     sizeBytes: directorySize(dataPath),
     includedPaths: [...includedPaths].sort(),
-    appVersion: `win-exe-${appVersion}`,
+    appVersion: `win-exe-${app.getVersion()}`,
     warnings
   };
   fs.writeFileSync(path.join(snapshotPath, 'snapshot.json'), JSON.stringify(meta, null, 2), 'utf8');

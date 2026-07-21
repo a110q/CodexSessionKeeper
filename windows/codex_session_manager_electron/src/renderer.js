@@ -29,7 +29,8 @@ const state = {
   sessionPreviewId: null,
   sessionPreviewMessages: [],
   sessionPreviewLoading: false,
-  sessionPreviewError: ''
+  sessionPreviewError: '',
+  update: { phase: 'idle' }
 };
 
 let sessionSearchTimer = null;
@@ -73,10 +74,28 @@ const els = {
   busyOverlay: $('#busyOverlay'),
   busyTitle: $('#busyTitle'),
   busyDetail: $('#busyDetail'),
-  busyCancelBtn: $('#busyCancelBtn')
+  busyCancelBtn: $('#busyCancelBtn'),
+  updateDialog: $('#updateDialog'),
+  updateTitle: $('#updateTitle'),
+  updateVersion: $('#updateVersion'),
+  updateNotes: $('#updateNotes'),
+  updateProgressBlock: $('#updateProgressBlock'),
+  updateProgress: $('#updateProgress'),
+  updateProgressText: $('#updateProgressText'),
+  updateError: $('#updateError'),
+  updateAvailableActions: $('#updateAvailableActions'),
+  updateReadyActions: $('#updateReadyActions'),
+  updateAcknowledgeActions: $('#updateAcknowledgeActions'),
+  updateLaterButton: $('#updateLaterButton'),
+  updateNowButton: $('#updateNowButton'),
+  updateRestartLaterButton: $('#updateRestartLaterButton'),
+  updateInstallButton: $('#updateInstallButton'),
+  updateAcknowledgeButton: $('#updateAcknowledgeButton')
 };
 
 let activeBusyController = null;
+let updateDialogDismissed = false;
+let removeUpdateStateListener = null;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -181,6 +200,105 @@ function showToast(message, isError = false) {
   els.toast.classList.remove('hidden');
   const textLength = String(message || '').length;
   setTimeout(() => els.toast.classList.add('hidden'), textLength > 80 ? 9000 : 3600);
+}
+
+function applyUpdateState(next, { reveal = true } = {}) {
+  if (!next || typeof next !== 'object' || typeof next.phase !== 'string') return;
+  state.update = next;
+  if (reveal) updateDialogDismissed = false;
+  renderUpdate();
+}
+
+function renderUpdate() {
+  const update = state.update || { phase: 'idle' };
+  const visible = !updateDialogDismissed && !['idle'].includes(update.phase);
+  els.updateDialog.classList.toggle('hidden', !visible);
+  if (!visible) return;
+
+  els.updateVersion.textContent = update.version ? `版本 ${update.version}` : '';
+  els.updateNotes.replaceChildren();
+  for (const note of Array.isArray(update.notes) ? update.notes : []) {
+    const item = document.createElement('li');
+    item.textContent = String(note);
+    els.updateNotes.append(item);
+  }
+  els.updateNotes.classList.toggle('hidden', els.updateNotes.childElementCount === 0);
+  els.updateProgressBlock.classList.add('hidden');
+  els.updateError.classList.add('hidden');
+  els.updateAvailableActions.classList.add('hidden');
+  els.updateReadyActions.classList.add('hidden');
+  els.updateAcknowledgeActions.classList.add('hidden');
+
+  if (update.phase === 'checking') {
+    els.updateTitle.textContent = '正在检查更新…';
+    els.updateProgressBlock.classList.remove('hidden');
+    els.updateProgress.removeAttribute('value');
+    els.updateProgressText.textContent = '正在连接公司内网更新服务器';
+    return;
+  }
+  if (update.phase === 'available') {
+    els.updateTitle.textContent = `发现新版本 ${update.version || ''}`.trim();
+    els.updateAvailableActions.classList.remove('hidden');
+    return;
+  }
+  if (update.phase === 'downloading') {
+    const percent = Math.min(100, Math.max(0, Number(update.percent) || 0));
+    els.updateTitle.textContent = '正在下载更新';
+    els.updateProgressBlock.classList.remove('hidden');
+    els.updateProgress.value = percent;
+    els.updateProgressText.textContent = update.total > 0
+      ? `${formatBytes(update.transferred)} / ${formatBytes(update.total)}（${percent.toFixed(0)}%）`
+      : '正在下载…';
+    return;
+  }
+  if (update.phase === 'verifying') {
+    els.updateTitle.textContent = '正在验证安装包';
+    els.updateProgressBlock.classList.remove('hidden');
+    els.updateProgress.removeAttribute('value');
+    els.updateProgressText.textContent = '正在核对文件大小和 SHA-256';
+    return;
+  }
+  if (update.phase === 'ready') {
+    els.updateTitle.textContent = '更新已准备好';
+    els.updateVersion.textContent = `版本 ${update.version}，重启应用即可完成更新。`;
+    els.updateReadyActions.classList.remove('hidden');
+    return;
+  }
+  if (update.phase === 'failed') {
+    els.updateTitle.textContent = '更新未完成';
+    els.updateError.textContent = String(update.message || '更新失败，请稍后重试');
+    els.updateError.classList.remove('hidden');
+    els.updateAcknowledgeActions.classList.remove('hidden');
+    return;
+  }
+  if (update.phase === 'up-to-date') {
+    els.updateTitle.textContent = '已是最新版本';
+    els.updateAcknowledgeActions.classList.remove('hidden');
+    return;
+  }
+  if (update.phase === 'completed') {
+    els.updateTitle.textContent = `已更新到 ${update.version}`;
+    els.updateAcknowledgeActions.classList.remove('hidden');
+  }
+}
+
+async function checkForUpdates() {
+  try {
+    applyUpdateState(await window.codexManager.checkForUpdates());
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
+}
+
+async function initializeUpdates() {
+  removeUpdateStateListener = window.codexManager.onUpdateState((next) => {
+    applyUpdateState(next);
+  });
+  try {
+    applyUpdateState(await window.codexManager.getUpdateState());
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
 }
 
 function showRestoreComplete(message) {
@@ -1437,6 +1555,7 @@ els.contextMenu.addEventListener('click', (event) => {
 });
 
 $('#refreshBtn').addEventListener('click', refresh);
+$('#checkUpdatesButton').addEventListener('click', checkForUpdates);
 $('#openDirsBtn').addEventListener('click', (event) => {
   event.stopPropagation();
   els.openDirsMenu.classList.toggle('hidden');
@@ -1528,6 +1647,42 @@ els.conversationRevealFile.addEventListener('click', async () => {
   if (session) await window.codexManager.revealSessionFile(session.id);
 });
 
-window.addEventListener('beforeunload', stopBackupStatusPolling);
+els.updateLaterButton.addEventListener('click', () => {
+  updateDialogDismissed = true;
+  renderUpdate();
+});
+els.updateNowButton.addEventListener('click', async () => {
+  try {
+    applyUpdateState(await window.codexManager.downloadUpdate());
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
+});
+els.updateRestartLaterButton.addEventListener('click', async () => {
+  updateDialogDismissed = true;
+  renderUpdate();
+  try {
+    await window.codexManager.deferUpdateRestart();
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
+});
+els.updateInstallButton.addEventListener('click', async () => {
+  try {
+    applyUpdateState(await window.codexManager.installUpdate());
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
+});
+els.updateAcknowledgeButton.addEventListener('click', () => {
+  updateDialogDismissed = true;
+  renderUpdate();
+});
+
+window.addEventListener('beforeunload', () => {
+  stopBackupStatusPolling();
+  removeUpdateStateListener?.();
+});
 startBackupStatusPolling();
+initializeUpdates();
 refresh();

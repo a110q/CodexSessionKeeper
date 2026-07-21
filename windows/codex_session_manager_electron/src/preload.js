@@ -23,5 +23,16 @@ contextBridge.exposeInMainWorld('codexManager', {
   openSessionFile: (sessionId) => ipcRenderer.invoke('open-session-file', sessionId),
   revealSessionFile: (sessionId) => ipcRenderer.invoke('reveal-session-file', sessionId),
   openCodexRoot: () => ipcRenderer.invoke('open-codex-root'),
-  openVaultRoot: () => ipcRenderer.invoke('open-vault-root')
+  openVaultRoot: () => ipcRenderer.invoke('open-vault-root'),
+  getUpdateState: () => ipcRenderer.invoke('update:get-state'),
+  checkForUpdates: () => ipcRenderer.invoke('update:check'),
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
+  deferUpdateRestart: () => ipcRenderer.invoke('update:defer-restart'),
+  installUpdate: () => ipcRenderer.invoke('update:install'),
+  onUpdateState: (listener) => {
+    if (typeof listener !== 'function') throw new TypeError('listener must be a function');
+    const wrapped = (_event, state) => listener(state);
+    ipcRenderer.on('update:state', wrapped);
+    return () => ipcRenderer.removeListener('update:state', wrapped);
+  }
 });
