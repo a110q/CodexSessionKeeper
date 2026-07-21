@@ -1,7 +1,7 @@
 {
   "name": "codex-session-manager-win10-electron",
-  "version": "1.0.13",
-  "updateBuild": 10013,
+  "version": "1.1.0",
+  "updateBuild": 10100,
   "description": "Codex session manager for Windows 10",
   "main": "src/main.js",
   "private": true,
@@ -9,7 +9,7 @@
     "start": "electron .",
     "test": "node --test",
     "prepare:sqlite-win": "bash ../../scripts/prepare_windows_sqlite.sh",
-    "package:win": "npm run prepare:sqlite-win && electron-packager . codex_session_manager --platform=win32 --arch=x64 --out=../../dist/win10-exe --overwrite --prune=true"
+    "package:win": "npm run prepare:sqlite-win && electron-builder --win nsis --x64"
   },
   "dependencies": {
     "electron-updater": "6.8.9",
@@ -18,5 +18,48 @@
   "devDependencies": {
     "electron": "^43.1.0",
     "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "local.codex.session-manager",
+    "productName": "codex_会话管理",
+    "artifactName": "CodexSessionKeeper-${version}-windows-${arch}-Setup.${ext}",
+    "directories": {
+      "output": "../../dist/windows"
+    },
+    "files": [
+      "src/**/*",
+      "vendor/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../../Config/UpdateKeys.json",
+        "to": "UpdateKeys.json"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "http://192.168.10.99:18080/codex-session-keeper/stable/windows/"
+      }
+    ]
   }
 }
