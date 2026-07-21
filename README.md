@@ -1,197 +1,128 @@
 # codex_会话管理
 
-`codex_会话管理` 是给 Codex 用户准备的本地会话管理、备份和恢复工具。它用来保护 `~/.codex` 里的会话、历史索引和线程状态，尤其适合频繁切换 Codex 账号、模型供应商或本地配置的人。
+`codex_会话管理` 是公司内部使用的本地 Codex 会话管理、增量备份和恢复工具。它保护当前用户目录中的会话、历史索引和线程状态，适合切换 Codex 账号、模型供应商或本地配置前后使用。
 
-工具只读写本机文件，不上传会话、账号或配置数据。
+会话、快照和账号配置不会上传。应用只在公司内网检查签名更新元数据，并在员工确认后下载安装包。
 
-## 当前版本状态
+## 版本状态
 
-| 位置 | 状态 |
-| --- | --- |
-| GitHub `main` | 已包含 Codex 新版 SQLite 表结构兼容修复，以及前一版 UI 改造。 |
-| GitHub Releases | 最新公开包为 `v1.0.13`，修复 Codex 更新后创建快照、恢复快照、删除会话等操作失败的问题。 |
-| 最新安装包 | 请优先下载 `v1.0.13` 的 macOS 或 Windows zip。 |
+`1.1.0 (10100)` 已完成自动更新代码和本机自动化验证，但目前仍是上线候选，不是员工正式下载版。以下发布门槛尚未全部完成：
 
-下载稳定版：
+- Windows x64 NSIS 安装包构建和标准用户演练。
+- macOS、Windows 各一次 `1.0.99 → 1.1.0` 真实设备演练。
+- 更新私钥的外置加密备份。
+- 经单独批准后在绿联 NAS 部署只读更新服务。
 
-[GitHub Releases](https://github.com/a110q/CodexSessionKeeper/releases)
+所有门槛完成前，不得把 `1.1.0` 放入员工下载目录，也不得把 `1.0.99` 放入正式更新目录。
 
-- macOS：下载 `codex_session_keeper_macos_v1.0.13.zip`，解压后运行 `codex_会话管理.app`。
-- Windows：下载 `codex_session_keeper_windows_v1.0.13.zip`，解压整个文件夹后运行 `codex_session_manager.exe`。
+## 员工安装和更新
 
-Windows 版本是免安装便携版。不要只拷贝单独的 exe 文件，Electron 运行时需要同目录下的 `resources`、`locales` 和 `.dll` 文件。
+首次安装：从公司 NAS 的员工下载目录安装 `1.1.0`。不要从聊天记录、个人网盘或未知链接下载安装包。
 
-## 适用场景
+发现新版后的操作：
 
-- 切换 Codex 账号或模型供应商前，想保留当前会话。
-- 切换配置后发现历史会话消失，需要从快照找回。
-- 想查看、搜索、清理或归档本地 Codex 会话。
-- 想从某个快照里只恢复一条或一批对话，而不覆盖当前登录态。
+- 选择“稍后提醒”不会下载安装包，可以继续工作。
+- 选择“立即更新”才开始下载，并显示进度。
+- 下载完成后选择“稍后重启”可以继续工作。
+- 选择“重启并更新”会先安全停止本地增量备份，确认没有备份写入后再安装并重启。
+- 不在公司内网时，定时检查会静默跳过，不影响会话管理、备份或恢复。
+
+当前公司内部版本没有 Apple/Windows 商业签名证书。首次安装如出现系统来源警告，只按公司管理员提供的安装说明确认；来源或文件名不一致时不要继续。
 
 ## 核心功能
 
-- 会话管理：扫描当前 `~/.codex` 下的活跃会话、归档会话、模型、工作目录、更新时间、文件大小和文件状态。
-- 会话搜索：按标题、目录、模型、来源、ID 或会话文件路径快速过滤。
-- 会话预览：选中会话后在详情页预览前 20 条消息，双击或点击按钮可查看完整对话。
-- 对话查看：支持查看用户/助手消息、打开原始会话文件、在文件夹中定位文件。
-- 创建快照：备份 Codex 关键数据，包括会话文件、历史索引、状态库和必要配置。
-- 本地增量备份：后台自动监听 Codex 会话 `.jsonl` 文件，只追加备份新增完整行，不需要手动创建快照。
-- 本地备份状态：显示最近备份时间、已备份会话数量、监听/轮询模式和最近错误，便于员工和 IT 排查。
-- 快照恢复：支持只恢复对话、完整恢复、单个会话恢复、批量恢复选中会话。
-- 归档恢复：快照内的归档会话也可以被识别和恢复。
-- 删除保护：删除会话前自动创建轻量保护快照，再清理会话文件、历史索引和 SQLite 线程记录。
-- 批量操作：支持批量删除会话、批量删除快照、批量恢复快照内会话。
-- 自动找回：默认关闭，用户手动开启后，启动时才检测是否需要从最新保护点找回会话。
-- 进度提示：恢复、删除、创建快照等慢操作会显示居中进度、原因说明和取消入口。
-
-## 界面改进
-
-`main` 分支已完成一轮 UI 改造：
-
-- Windows 端恢复左侧品牌栏和“当前 Codex 状态”卡片，可看到 provider、model、account 和会话数量。
-- “打开时自动找回”从顶部工具栏移动到侧栏设置区，降低主操作区噪音。
-- macOS 与 Windows 统一为浅渐变、半透明卡片、16px 圆角、系统蓝主按钮和更清晰的危险按钮。
-- Windows 端支持 `prefers-color-scheme: dark` 暗色模式。
-- 会话列表改为“状态点 + 标题 + 相对时间 + 文件大小/来源”的信息层级，缺文件会以红点和标签提示。
-- 详情面板默认展示会话预览，减少频繁打开弹窗的中断。
-- 完整对话窗口使用用户靠右、助手靠左的消息布局，更适合扫读长对话。
+- 扫描、搜索和预览活跃/归档 Codex 会话。
+- 打开完整对话、原始会话文件或文件所在目录。
+- 手动创建包含会话、历史和必要索引的快照。
+- 后台增量备份 `.jsonl` 中新增的完整行。
+- 从快照或本地增量备份恢复单条、批量或全部会话。
+- 默认使用“只恢复对话”，不覆盖当前 `auth.json`、`config.toml` 或登录态。
+- 删除会话前自动创建轻量保护快照。
+- 自动找回默认关闭，只在员工主动开启后运行。
+- macOS 和 Windows 均支持签名内网更新，更新不会强制安装。
 
 ## 数据位置
 
-默认 Codex 数据目录：
+macOS/Linux 风格路径：
 
 ```text
 ~/.codex
-```
-
-默认快照库目录：
-
-```text
 ~/.codex-session-vault/snapshots
+~/.codex-session-vault/incremental-backups
 ```
 
-Windows 使用当前用户目录下的等效路径：
+Windows：
 
 ```text
 %USERPROFILE%\.codex
 %USERPROFILE%\.codex-session-vault\snapshots
+%USERPROFILE%\.codex-session-vault\incremental-backups
 ```
 
-### 本地增量备份说明
+更新状态只记录最近检查时间和待完成版本，保存在本地快照库根目录的 `update-state.json`。
 
-本地增量备份会写入 `~/.codex-session-vault/incremental-backups`。第一阶段只保存到本机，不上传 NAS；NAS 汇总和企业监控将在后续阶段接入。备份内容为明文 `.jsonl` 新增行和最小 manifest。
+## 推荐恢复方式
 
-## 推荐使用方式
+切换账号、模型供应商或配置前，先创建手动快照。恢复时优先使用“只恢复对话”；只有明确要回滚登录态和 `config.toml` 时才选择“完整恢复”。
 
-切换账号、模型供应商或配置前，先创建一个手动快照。
+恢复或删除会话前建议退出 Codex。恢复完成后如果 Codex 已打开，请重启 Codex 再查看结果。
 
-恢复时优先使用“只恢复对话”。这个模式会合并恢复会话文件、历史记录和线程索引，不覆盖当前 `auth.json`、`config.toml`、账号登录态或模型供应商配置。
+如果 `state_5.sqlite` 正在写入、损坏或结构已经变化，工具会尽量降级为文件型快照。只要快照中仍有 `sessions` 或 `archived_sessions` 下的 `.jsonl`，会话文件仍可恢复；SQLite 索引失败会作为警告显示，不会删除已恢复文件。
 
-只有你明确想把账号、登录态和 `config.toml` 一起回滚到快照状态时，才使用“完整恢复”。
+## 从源码构建和测试
 
-恢复或删除会话前，建议先退出 Codex 客户端。恢复完成后如果 Codex 已经打开，请重启 Codex 再查看恢复结果。
-
-## 快照说明
-
-快照一般会同时保存会话文件、历史索引和 SQLite 线程索引。
-
-Codex 更新后，`state_5.sqlite` 里的线程相关表可能会变化。`v1.0.13` 起，工具会先检测表是否存在，再清洗或合并 SQLite 索引；如果新版 Codex 已移除 `thread_goals`、`stage1_outputs` 等旧表，不会再导致创建快照、恢复快照或删除会话整体失败。
-
-如果 Windows 环境下 Codex 正在写入 `state_5.sqlite`，或者这个数据库临时不可读，工具会自动降级创建“文件型快照”。文件型快照仍包含 `history.jsonl`、`session_index.jsonl`、`sessions` 和 `archived_sessions`，可以继续恢复会话文件；只是会跳过 SQLite 索引清洗。看到“已降级创建文件型快照”不是创建失败。
-
-如果你想创建包含完整 SQLite 索引的快照，先退出 Codex 客户端，再重新点击“创建快照”。
-
-## 从源码构建
-
-macOS App：
+macOS：
 
 ```bash
-./scripts/build_app.sh
+swift test
+APP_VERSION=1.1.0 APP_BUILD=10100 scripts/build_app.sh
 ```
 
-生成：
+输出：
 
 ```text
 dist/codex_会话管理.app
+dist/macos/CodexSessionKeeper-1.1.0-macos-arm64.zip
 ```
 
-Windows Electron 免安装版：
+Windows 安装包必须在 Windows x64 机器构建：
 
-```bash
-./scripts/build_windows_exe.sh
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows_installer.ps1 -Version 1.1.0 -Build 10100
 ```
 
-生成：
+输出：
 
 ```text
-~/Downloads/codex_session_manager_win10_portable
-~/Downloads/codex_session_manager_win10_portable.zip
+dist\windows\CodexSessionKeeper-1.1.0-windows-x64-Setup.exe
+dist\windows\latest.yml
 ```
 
-首次构建 Windows 版本会自动安装 Electron 依赖并下载运行时，耗时取决于网络。
+旧便携版构建已经停用，`scripts/build_windows_exe.sh` 会直接退出，防止生成无法自动更新的员工包。
 
-## 发布新版本
-
-发布源码：
+发布工具测试：
 
 ```bash
-git status
-git add README.md <changed-files>
-git commit -m "Update documentation"
-git push origin main
+node --test scripts/update/*.test.mjs
+cd windows/codex_session_manager_electron && npm test
 ```
 
-发布安装包：
+## 管理员发布
 
-1. 构建 macOS 与 Windows 产物。
-2. 为新版本创建 tag，例如 `v1.0.13`。
-3. 在 GitHub Releases 创建对应 release。
-4. 上传 macOS zip 和 Windows zip。
-5. 确认 Releases 侧栏的 `Latest` 指向新版本。
+管理员必须使用签名清单和原子发布脚本，不得手工替换 `release.json`：
 
-仅 `git push` 会更新源码，不会自动把本地 zip 上传到 GitHub Releases。上传 release assets 需要 GitHub 网页登录、GitHub CLI 登录，或有 `GITHUB_TOKEN` 的 API 权限。
+1. 构建 macOS ZIP、Windows Setup EXE 和 `latest.yml`。
+2. 使用 `scripts/update/build-release-manifest.mjs` 组装候选目录。
+3. 使用 `scripts/update/verify-release-directory.mjs` 独立验证签名、版本、大小和 SHA-256。
+4. 完成两平台真实设备演练。
+5. 经单独批准后使用 `scripts/update/publish-release.sh` 发布到 NAS；该脚本最后才替换 `release.json`。
 
-## 常见问题
+详细步骤见 [绿联 NAS 内网更新部署与发布](docs/NAS内网更新部署与发布.md) 和 [操作手册](docs/操作手册.md)。
 
-### Windows 提示 `database disk image is malformed`
+## 历史包应急恢复
 
-这通常说明 Codex 的 `state_5.sqlite` 在当时不可读，可能是 Codex 正在写入、WAL 文件还没合并，或者数据库文件已经损坏。
-
-`v1.0.10` 起不会因此中断创建快照，会自动降级为文件型快照。建议先退出 Codex 后再创建一次快照，如果仍反复出现，可以先使用文件型快照恢复重要会话。
-
-### Windows 提示 `EPERM: operation not permitted, lstat`
-
-这通常是某个会话 jsonl 文件被 Codex、杀毒软件、同步盘或权限策略临时锁住。`v1.0.11` 起创建快照会跳过单个不可访问文件，继续备份其他可读会话，并在成功提示里列出被跳过的文件。
-
-### 快照里没有 `state_5.sqlite` 还能恢复吗
-
-可以。只要快照里有 `sessions` 或 `archived_sessions` 下的 jsonl 会话文件，工具会从这些文件识别并恢复会话。恢复后建议重启 Codex。
-
-### Codex 更新后所有快照功能都失败
-
-如果错误里包含 `no such table: thread_goals` 或 `no such table: stage1_outputs`，说明 Codex 升级后本地 `state_5.sqlite` 表结构已经变化。请升级到 `v1.0.13` 或更新后的安装包；新版会跳过不存在的旧表，并继续处理仍存在的 `threads`、`thread_dynamic_tools`、`thread_spawn_edges` 和 `agent_job_items` 等线程索引。
-
-### Windows 打开 exe 没反应
-
-请确认解压了整个文件夹，不要只拷贝 `codex_session_manager.exe`。Electron 便携版必须和 `resources`、`locales`、`.dll` 等文件放在同一个目录。
-
-### 为什么 GitHub 代码更新了，但 Releases 还是旧包
-
-GitHub 的源码提交和 Releases 附件是两套流程。`git push origin main` 只会更新仓库源码；安装包 zip 需要另外在 GitHub Releases 上传。如果 Releases 仍显示旧版本，说明最新源码已推送，但最新包还没有发布成 release asset。
-
-## 技术结构
-
-- macOS：SwiftUI + Swift Package Manager。
-- Windows：Electron + `sql.js`，无需用户安装 `sqlite3.exe`。
-- SQLite 恢复：合并 `state_5.sqlite` 中的线程记录，并修复会话文件路径和归档状态。
-- 快照策略：手动快照和系统自动保护点分开标记，系统快照有保留数量限制，避免无限增长。
-
-## 文档
-
-- [操作手册](docs/操作手册.md)
-- [发布说明](docs/发布说明.md)
-- [UI 与功能改进建议](lqf/UI_功能改进建议.md)
+旧安装包只用于管理员在隔离测试机上读取历史快照或导出会话，不再作为员工安装源，也不得放入自动更新目录。Windows 历史便携包必须完整解压整个文件夹，不能单独复制 EXE；恢复出重要会话后，应改用正式 NSIS 安装版。
 
 ## 注意
 
-这个工具直接操作 Codex 本地数据目录。虽然删除和恢复前会自动创建保护快照，但仍建议在操作前退出 Codex，避免 Codex 正在写入同一批文件。
+这个工具会直接操作 Codex 本地数据目录。虽然删除和恢复前会创建保护快照，仍应避免在 Codex 正写入同一批文件时执行高风险恢复操作。任何来源不明、签名验证失败或版本号异常的更新都不要安装。
