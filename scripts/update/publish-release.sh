@@ -2,7 +2,7 @@
 set -euo pipefail
 
 [[ $# -eq 2 && "$1" = /* && "$2" = /* ]] || {
-  echo "usage: $0 /absolute/verified/stable/root /absolute/nas/stable/root" >&2
+  echo "usage: $0 /absolute/verified/stable/root /absolute/site/codex-session-keeper/stable" >&2
   exit 2
 }
 
@@ -165,6 +165,13 @@ publish_metadata "$INCOMING_ROOT/macos/appcast.xml" "$DESTINATION_ROOT/macos/app
 publish_metadata "$INCOMING_ROOT/windows/latest.yml" "$DESTINATION_ROOT/windows/latest.yml"
 publish_metadata "$INCOMING_ROOT/release.json.sig" "$DESTINATION_ROOT/release.json.sig"
 publish_metadata "$INCOMING_ROOT/release.json" "$DESTINATION_ROOT/release.json"
+SITE_ROOT="$(dirname "$DESTINATION_ROOT")"
+DOWNLOAD_PAGE="$INCOMING_ROOT/index.html"
+node "$SCRIPT_DIR/build-download-page.mjs" \
+  --stable-root "$DESTINATION_ROOT" \
+  --output "$DOWNLOAD_PAGE"
+fsync_file "$DOWNLOAD_PAGE"
+publish_metadata "$DOWNLOAD_PAGE" "$SITE_ROOT/index.html"
 sync
 
 echo "published $VERSION"
