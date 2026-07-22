@@ -115,9 +115,9 @@ cd windows/codex_session_manager_electron && npm test
 2. 使用 `scripts/update/build-release-manifest.mjs` 组装候选目录。
 3. 使用 `scripts/update/verify-release-directory.mjs` 独立验证签名、版本、大小和 SHA-256。
 4. 完成两平台真实设备演练。
-5. 经单独批准后使用 `scripts/update/publish-release.sh` 发布到 NAS；该脚本最后才替换 `release.json`。
+5. 经单独批准后使用 `scripts/update/publish-release.sh` 发布到固定内网 IP 为 `192.168.10.54` 的 Mac mini；该脚本最后才替换 `release.json`。
 
-详细步骤见 [绿联 NAS 内网更新部署与发布](docs/NAS内网更新部署与发布.md) 和 [操作手册](docs/操作手册.md)。
+详细步骤见 [Mac mini 内网更新部署与发布](docs/Mac-mini内网更新部署与发布.md) 和 [操作手册](docs/操作手册.md)。
 
 ## 历史包应急恢复
 
