@@ -9,8 +9,6 @@ const {
   selectUpdate,
 } = require('./release-manifest');
 
-const RELEASE_BASE_URL = 'http://192.168.10.99:18080/codex-session-keeper/stable/';
-const WINDOWS_FEED_URL = `${RELEASE_BASE_URL}windows/`;
 const CONNECTION_MESSAGE = '暂时无法连接公司更新服务器，请稍后重试';
 const UPDATE_FAILURE_MESSAGE = '更新失败，请稍后重试';
 const BACKUP_BUSY_MESSAGE = '备份仍在写入，已取消更新重启，请稍后重试';
@@ -25,11 +23,10 @@ class UpdateService {
     fetchImpl = globalThis.fetch,
     now = () => new Date(),
     publicKeyBase64,
-    releaseBaseURL = RELEASE_BASE_URL,
+    releaseBaseURL,
     sendState = () => {},
     stateStore,
     timeoutMs = 5000,
-    windowsFeedURL = WINDOWS_FEED_URL,
   }) {
     if (!autoUpdater || !backupAgent || !stateStore) {
       throw new TypeError('UpdateService requires updater, backup agent, and state store.');
@@ -41,6 +38,16 @@ class UpdateService {
       throw new TypeError('UpdateService requires current version and public key.');
     }
     if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function.');
+    if (typeof releaseBaseURL !== 'string') {
+      throw new TypeError('UpdateService requires releaseBaseURL.');
+    }
+    const parsedReleaseBaseURL = new URL(releaseBaseURL);
+    if (!['http:', 'https:'].includes(parsedReleaseBaseURL.protocol)
+        || parsedReleaseBaseURL.pathname !== '/codex-session-keeper/stable/'
+        || parsedReleaseBaseURL.search || parsedReleaseBaseURL.hash
+        || parsedReleaseBaseURL.username || parsedReleaseBaseURL.password) {
+      throw new TypeError('releaseBaseURL must be the canonical stable root.');
+    }
 
     this.autoUpdater = autoUpdater;
     this.backupAgent = backupAgent;
@@ -49,8 +56,8 @@ class UpdateService {
     this.fetchImpl = fetchImpl;
     this.now = now;
     this.publicKeyBase64 = publicKeyBase64;
-    this.releaseBaseURL = new URL(releaseBaseURL).href;
-    this.windowsFeedURL = new URL(windowsFeedURL).href;
+    this.releaseBaseURL = parsedReleaseBaseURL.href;
+    this.windowsFeedURL = new URL('windows/', parsedReleaseBaseURL).href;
     this.sendState = sendState;
     this.stateStore = stateStore;
     this.timeoutMs = timeoutMs;
@@ -353,7 +360,5 @@ function sha256File(filePath) {
 }
 
 module.exports = {
-  RELEASE_BASE_URL,
   UpdateService,
-  WINDOWS_FEED_URL,
 };

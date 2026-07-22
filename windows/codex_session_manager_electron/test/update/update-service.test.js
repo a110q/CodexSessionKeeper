@@ -9,8 +9,9 @@ const test = require('node:test');
 const { UpdateService } = require('../../src/update/update-service');
 const { UpdateStateStore } = require('../../src/update/update-state-store');
 
-const RELEASE_BASE = 'http://192.168.10.99:18080/codex-session-keeper/stable/';
-const WINDOWS_FEED = `${RELEASE_BASE}windows/`;
+const updateServer = require('../../../../Config/UpdateServer.json');
+const RELEASE_BASE = updateServer.releaseBaseURL;
+const WINDOWS_FEED = new URL('windows/', RELEASE_BASE).href;
 const INSTALLER_NAME = 'CodexSessionKeeper-1.1.0-windows-x64-Setup.exe';
 
 async function makeTempDir(t) {
@@ -143,10 +144,19 @@ function makeService({
     sendState: (state) => emitted.push(state),
     stateStore,
     timeoutMs,
-    windowsFeedURL: WINDOWS_FEED,
   });
   return { backupAgent, emitted, release, service, stateStore, updater };
 }
+
+test('derives the only Windows feed from the fixed release root', async () => {
+  const setup = makeService();
+  await setup.service.check({ manual: true });
+  await setup.service.download();
+  assert.deepEqual(setup.updater.feedURL, {
+    provider: 'generic',
+    url: 'http://192.168.10.54:18080/codex-session-keeper/stable/windows/',
+  });
+});
 
 test('checks, downloads, verifies, and exposes only sanitized progress', async (t) => {
   const root = await makeTempDir(t);

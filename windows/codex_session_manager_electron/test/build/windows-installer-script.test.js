@@ -4,8 +4,10 @@ const path = require('node:path');
 const test = require('node:test');
 
 const appRoot = path.join(__dirname, '..', '..');
+const repositoryRoot = path.join(appRoot, '..', '..');
 const packageJsonPath = path.join(appRoot, 'package.json');
 const packageLockPath = path.join(appRoot, 'package-lock.json');
+const updateServerPath = path.join(repositoryRoot, 'Config', 'UpdateServer.json');
 const electronWindowsX64Sha256 =
   'a07dc1e3d5e589593d37e3b19d1b373e02bb58270e2eb0d6633eee0198ad09f0';
 
@@ -18,6 +20,21 @@ const buildScriptPath = path.join(
   'scripts',
   'build_windows_installer.ps1'
 );
+
+test('Windows package embeds the fixed configured update server', () => {
+  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+  const updateServer = JSON.parse(fs.readFileSync(updateServerPath, 'utf8'));
+  const expectedFeed = new URL('windows/', updateServer.releaseBaseURL).href;
+
+  assert.equal(
+    updateServer.releaseBaseURL,
+    'http://192.168.10.54:18080/codex-session-keeper/stable/'
+  );
+  assert.deepEqual(packageJson.build.publish, [{ provider: 'generic', url: expectedFeed }]);
+  assert.ok(packageJson.build.extraResources.some((entry) =>
+    entry.from === '../../Config/UpdateServer.json' && entry.to === 'UpdateServer.json'
+  ));
+});
 
 test('Windows installer build stops when any native build step fails', () => {
   const source = fs.readFileSync(buildScriptPath, 'utf8');

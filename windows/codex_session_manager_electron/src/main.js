@@ -173,7 +173,10 @@ app.whenReady().then(async () => {
     updateService = createUpdateService();
   } catch (error) {
     console.error('Update service configuration is invalid:', error);
-    dialog.showErrorBox('更新功能配置错误', '更新公钥或版本信息无效，请联系管理员。');
+    dialog.showErrorBox(
+      '更新功能配置错误',
+      '更新服务器、公钥或版本信息无效，请联系管理员。',
+    );
     app.quit();
     return;
   }
@@ -203,9 +206,17 @@ function createUpdateService() {
   if (!Number.isSafeInteger(currentBuild) || currentBuild <= 0) {
     throw new Error('package.json updateBuild must be a positive safe integer');
   }
-  const keysPath = app.isPackaged
-    ? path.join(process.resourcesPath, 'UpdateKeys.json')
-    : path.join(__dirname, '..', '..', '..', 'Config', 'UpdateKeys.json');
+  const configRoot = app.isPackaged
+    ? process.resourcesPath
+    : path.join(__dirname, '..', '..', '..', 'Config');
+  const keysPath = path.join(configRoot, 'UpdateKeys.json');
+  const updateServerPath = path.join(configRoot, 'UpdateServer.json');
+  const updateServer = JSON.parse(fs.readFileSync(updateServerPath, 'utf8'));
+  const releaseBaseURL = new URL(String(updateServer.releaseBaseURL || ''));
+  if (releaseBaseURL.protocol !== 'http:'
+      || releaseBaseURL.href !== 'http://192.168.10.54:18080/codex-session-keeper/stable/') {
+    throw new Error('UpdateServer.json does not contain the approved releaseBaseURL');
+  }
   const keys = JSON.parse(fs.readFileSync(keysPath, 'utf8'));
   const publicKey = Buffer.from(String(keys.manifestPublicKey || ''), 'base64');
   if (publicKey.length !== 32 || publicKey.toString('base64') !== keys.manifestPublicKey) {
@@ -218,6 +229,7 @@ function createUpdateService() {
     currentBuild,
     currentVersion: app.getVersion(),
     publicKeyBase64: keys.manifestPublicKey,
+    releaseBaseURL: releaseBaseURL.href,
     sendState: (state) => {
       if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
       mainWindow.webContents.send('update:state', state);

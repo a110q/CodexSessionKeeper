@@ -41,6 +41,10 @@
       {
         "from": "../../Config/UpdateKeys.json",
         "to": "UpdateKeys.json"
+      },
+      {
+        "from": "../../Config/UpdateServer.json",
+        "to": "UpdateServer.json"
       }
     ],
     "win": {
@@ -64,7 +68,7 @@
     "publish": [
       {
         "provider": "generic",
-        "url": "http://192.168.10.99:18080/codex-session-keeper/stable/windows/"
+        "url": "http://192.168.10.54:18080/codex-session-keeper/stable/windows/"
       }
     ]
   }
