@@ -20,6 +20,10 @@ test('Windows installer build stops when any native build step fails', () => {
     source,
     /function Invoke-CheckedNative[\s\S]*& \$Command[\s\S]*\$LASTEXITCODE[\s\S]*throw/
   );
+  assert.match(
+    source,
+    /\$PreviousErrorActionPreference = \$ErrorActionPreference[\s\S]*\$ErrorActionPreference = "Continue"[\s\S]*& \$Command[\s\S]*finally[\s\S]*\$ErrorActionPreference = \$PreviousErrorActionPreference/
+  );
 
   for (const command of [
     'npm ci',

@@ -13,8 +13,16 @@ function Invoke-CheckedNative {
     [scriptblock]$Command
   )
 
-  & $Command
-  $ExitCode = $LASTEXITCODE
+  $PreviousErrorActionPreference = $ErrorActionPreference
+  try {
+    # Windows PowerShell 5.1 can promote piped native stderr (including npm warnings)
+    # to NativeCommandError. The process exit code is the authoritative build gate.
+    $ErrorActionPreference = "Continue"
+    & $Command
+    $ExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
+  }
   if ($ExitCode -ne 0) {
     throw "$Description failed with exit code $ExitCode"
   }
