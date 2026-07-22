@@ -21,6 +21,12 @@
   },
   "build": {
     "appId": "local.codex.session-manager",
+    "electronDownload": {
+      "unsafelyDisableChecksums": false,
+      "checksums": {
+        "electron-v43.1.0-win32-x64.zip": "a07dc1e3d5e589593d37e3b19d1b373e02bb58270e2eb0d6633eee0198ad09f0"
+      }
+    },
     "productName": "codex_会话管理",
     "artifactName": "CodexSessionKeeper-${version}-windows-${arch}-Setup.${ext}",
     "directories": {
