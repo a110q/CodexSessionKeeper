@@ -20,6 +20,7 @@ import {
   verifyManifest,
 } from './release-manifest.mjs';
 import { assembleRelease } from './build-release-manifest.mjs';
+import { UPDATE_SERVER } from './update-server.mjs';
 import { verifyReleaseDirectory } from './verify-release-directory.mjs';
 
 function fixture() {
@@ -196,7 +197,7 @@ function ephemeralKey() {
 function signedAppcast({ version, build, zipName, zipBytes, privateKeyPem }) {
   const enclosureSignature = signManifest(zipBytes, privateKeyPem);
   const prefix = Buffer.from(
-    `<?xml version="1.0" standalone="yes"?><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item><title>${version}</title><sparkle:version>${build}</sparkle:version><sparkle:shortVersionString>${version}</sparkle:shortVersionString><enclosure url="http://192.168.10.99:18080/codex-session-keeper/stable/macos/${zipName}" length="${zipBytes.length}" type="application/octet-stream" sparkle:edSignature="${enclosureSignature}"></enclosure></item></channel></rss>`,
+    `<?xml version="1.0" standalone="yes"?><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item><title>${version}</title><sparkle:version>${build}</sparkle:version><sparkle:shortVersionString>${version}</sparkle:shortVersionString><enclosure url="${UPDATE_SERVER.macDownloadPrefix}${zipName}" length="${zipBytes.length}" type="application/octet-stream" sparkle:edSignature="${enclosureSignature}"></enclosure></item></channel></rss>`,
   );
   const feedSignature = signManifest(prefix, privateKeyPem);
   return Buffer.concat([

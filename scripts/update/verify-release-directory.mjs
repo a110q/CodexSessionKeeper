@@ -9,11 +9,11 @@ import {
   validateManifest,
   verifyManifest,
 } from './release-manifest.mjs';
+import { UPDATE_SERVER } from './update-server.mjs';
 
 const MODULE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(MODULE_DIRECTORY, '..', '..');
 const UPDATE_KEYS_PATH = path.join(REPOSITORY_ROOT, 'Config', 'UpdateKeys.json');
-const MAC_DOWNLOAD_PREFIX = 'http://192.168.10.99:18080/codex-session-keeper/stable/macos/';
 
 function releaseError(message) {
   return new Error(`Release verification failed: ${message}`);
@@ -94,7 +94,7 @@ async function verifyAppcast({
 
   const attributes = enclosureAttributes(item);
   const zipName = path.basename(macZipPath);
-  if (attributes.url !== `${MAC_DOWNLOAD_PREFIX}${zipName}`) {
+  if (attributes.url !== `${UPDATE_SERVER.macDownloadPrefix}${zipName}`) {
     throw releaseError('appcast enclosure URL does not match the macOS artifact');
   }
   const metadata = await stat(macZipPath);

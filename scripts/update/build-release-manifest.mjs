@@ -17,6 +17,7 @@ import {
   stableManifestBytes,
   validateManifest,
 } from './release-manifest.mjs';
+import { UPDATE_SERVER } from './update-server.mjs';
 import { verifyReleaseDirectory } from './verify-release-directory.mjs';
 
 const MODULE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
@@ -26,7 +27,6 @@ const SPARKLE_APPCAST_TOOL = path.join(
   REPOSITORY_ROOT,
   '.build', 'artifacts', 'sparkle', 'Sparkle', 'bin', 'generate_appcast',
 );
-const MAC_DOWNLOAD_PREFIX = 'http://192.168.10.99:18080/codex-session-keeper/stable/macos/';
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 async function requireRegularAbsoluteFile(filePath, label) {
@@ -42,7 +42,7 @@ async function requireRegularAbsoluteFile(filePath, label) {
 async function defaultGenerateAppcast({ macDirectory }) {
   execFileSync(SPARKLE_APPCAST_TOOL, [
     '--account', 'local.codex.session-manager',
-    '--download-url-prefix', MAC_DOWNLOAD_PREFIX,
+    '--download-url-prefix', UPDATE_SERVER.macDownloadPrefix,
     macDirectory,
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 }
