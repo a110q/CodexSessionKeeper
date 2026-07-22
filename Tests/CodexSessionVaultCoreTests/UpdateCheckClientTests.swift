@@ -6,7 +6,7 @@ import Testing
 @Suite
 struct UpdateCheckClientTests {
     private let baseURL = URL(
-        string: "http://192.168.10.99:18080/codex-session-keeper/stable/"
+        string: "http://updates.test/codex-session-keeper/stable/"
     )!
 
     @Test
@@ -193,4 +193,3 @@ private struct FailingUpdateTransport: UpdateTransport {
         throw URLError(.cannotConnectToHost)
     }
 }
-

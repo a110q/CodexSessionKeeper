@@ -9,9 +9,6 @@ final class MacUpdateCoordinator: ObservableObject {
     @Published private(set) var state: UpdatePresentationState = .idle
     @Published private(set) var isPresented = false
 
-    private static let fallbackBaseURL = URL(
-        string: "http://192.168.10.99:18080/codex-session-keeper/stable/"
-    )!
     private static let scheduledInterval = Duration.seconds(8 * 60 * 60)
 
     private let model: VaultModel
@@ -51,8 +48,9 @@ final class MacUpdateCoordinator: ObservableObject {
         ) ?? 0
 
         let baseURL = (bundle.object(forInfoDictionaryKey: "CSKUpdateBaseURL") as? String)
-            .flatMap(URL.init(string:)) ?? Self.fallbackBaseURL
-        if let encodedKey = bundle.object(forInfoDictionaryKey: "CSKManifestPublicKey") as? String,
+            .flatMap(URL.init(string:))
+        if let baseURL,
+           let encodedKey = bundle.object(forInfoDictionaryKey: "CSKManifestPublicKey") as? String,
            let publicKey = Data(base64Encoded: encodedKey),
            publicKey.count == 32 {
             self.checkClient = UpdateCheckClient(

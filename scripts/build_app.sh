@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="codex_会话管理"
 APP_VERSION="${APP_VERSION:-1.1.0}"
 APP_BUILD="${APP_BUILD:-10100}"
-UPDATE_BASE_URL="${UPDATE_BASE_URL:-http://192.168.10.99:18080/codex-session-keeper/stable/}"
+UPDATE_SERVER_CONFIG="$ROOT_DIR/Config/UpdateServer.json"
 UPDATE_KEYS="$ROOT_DIR/Config/UpdateKeys.json"
 BUILD_DIR="$ROOT_DIR/.build/release"
 DIST_DIR="$ROOT_DIR/dist"
@@ -14,12 +14,19 @@ APP_DIR="$DIST_DIR/$APP_NAME.app"
 ARCHIVE_PATH="$MACOS_DIST_DIR/CodexSessionKeeper-$APP_VERSION-macos-arm64.zip"
 SPARKLE_FRAMEWORK_SOURCE="$ROOT_DIR/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 
-[[ "$UPDATE_BASE_URL" == */ ]] || UPDATE_BASE_URL="$UPDATE_BASE_URL/"
+[[ -f "$UPDATE_SERVER_CONFIG" ]] || { echo "missing update server config: $UPDATE_SERVER_CONFIG" >&2; exit 2; }
 [[ -f "$UPDATE_KEYS" ]] || { echo "missing update keys: $UPDATE_KEYS" >&2; exit 2; }
 
+SERVER_PLIST="$(mktemp "${TMPDIR:-/tmp}/codex-update-server.XXXXXX.plist")"
 KEYS_PLIST="$(mktemp "${TMPDIR:-/tmp}/codex-update-keys.XXXXXX.plist")"
-trap 'rm -f "$KEYS_PLIST"' EXIT
+trap 'rm -f "$SERVER_PLIST" "$KEYS_PLIST"' EXIT
+/usr/bin/plutil -convert xml1 -o "$SERVER_PLIST" "$UPDATE_SERVER_CONFIG"
 /usr/bin/plutil -convert xml1 -o "$KEYS_PLIST" "$UPDATE_KEYS"
+UPDATE_BASE_URL="$(/usr/libexec/PlistBuddy -c 'Print :releaseBaseURL' "$SERVER_PLIST")"
+[[ "$UPDATE_BASE_URL" == "http://192.168.10.54:18080/codex-session-keeper/stable/" ]] || {
+  echo "unexpected fixed update server: $UPDATE_BASE_URL" >&2
+  exit 2
+}
 MANIFEST_PUBLIC_KEY="$(/usr/libexec/PlistBuddy -c 'Print :manifestPublicKey' "$KEYS_PLIST")"
 SPARKLE_PUBLIC_KEY="$(/usr/libexec/PlistBuddy -c 'Print :sparklePublicEDKey' "$KEYS_PLIST")"
 [[ -n "$MANIFEST_PUBLIC_KEY" && -n "$SPARKLE_PUBLIC_KEY" ]] || {

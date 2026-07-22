@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { parseUpdateServerConfig, UPDATE_SERVER } from './update-server.mjs';
 
 const RELEASE_BASE = 'http://192.168.10.54:18080/codex-session-keeper/stable/';
+const testDirectory = path.dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = path.resolve(testDirectory, '..', '..');
 
 test('repository update server is the fixed Mac mini endpoint', () => {
   assert.deepEqual(UPDATE_SERVER, {
@@ -29,4 +34,18 @@ test('update server parser rejects mutable or ambiguous URLs', () => {
       releaseBaseURL,
     );
   }
+});
+
+test('macOS packaging reads UpdateServer.json and retains no NAS fallback', () => {
+  const buildScript = readFileSync(path.join(repositoryRoot, 'scripts', 'build_app.sh'), 'utf8');
+  const coordinator = readFileSync(
+    path.join(repositoryRoot, 'Sources', 'CodexSessionVault', 'Update', 'MacUpdateCoordinator.swift'),
+    'utf8',
+  );
+
+  assert.match(buildScript, /Config\/UpdateServer\.json/);
+  assert.doesNotMatch(buildScript, /UPDATE_BASE_URL:-/);
+  assert.doesNotMatch(buildScript, /192\.168\.10\.99/);
+  assert.doesNotMatch(coordinator, /fallbackBaseURL/);
+  assert.doesNotMatch(coordinator, /192\.168\.10\.99/);
 });
