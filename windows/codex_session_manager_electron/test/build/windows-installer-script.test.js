@@ -70,3 +70,32 @@ test('Windows build validates cached Electron against its pinned official checks
     [artifactName]: electronWindowsX64Sha256,
   });
 });
+
+test('Windows installer build restores temporary release metadata after every outcome', () => {
+  const source = fs.readFileSync(buildScriptPath, 'utf8');
+  const snapshotIndex = source.indexOf('[System.IO.File]::ReadAllBytes($PackageJsonPath)');
+  const lockSnapshotIndex = source.indexOf('[System.IO.File]::ReadAllBytes($PackageLockPath)');
+  const mutationIndex = source.indexOf('set release metadata');
+  const buildFailureIndex = source.indexOf('$BuildFailure = $_', mutationIndex);
+  const finalizerIndex = source.indexOf('} finally {', buildFailureIndex);
+  const packageJsonRestoreIndex = source.indexOf(
+    '[System.IO.File]::WriteAllBytes($PackageJsonPath, $OriginalPackageJsonBytes)',
+    finalizerIndex
+  );
+  const packageLockRestoreIndex = source.indexOf(
+    '[System.IO.File]::WriteAllBytes($PackageLockPath, $OriginalPackageLockBytes)',
+    finalizerIndex
+  );
+
+  assert.notEqual(snapshotIndex, -1);
+  assert.notEqual(lockSnapshotIndex, -1);
+  assert.ok(snapshotIndex < mutationIndex);
+  assert.ok(lockSnapshotIndex < mutationIndex);
+  assert.ok(mutationIndex < buildFailureIndex);
+  assert.ok(buildFailureIndex < finalizerIndex);
+  assert.ok(finalizerIndex < packageJsonRestoreIndex);
+  assert.ok(finalizerIndex < packageLockRestoreIndex);
+  assert.match(source, /catch \{\s*\$BuildFailure = \$_/);
+  assert.match(source, /if \(\$BuildFailure -ne \$null\)[\s\S]*throw \$BuildFailure/);
+  assert.match(source, /Failed to restore release metadata/);
+});

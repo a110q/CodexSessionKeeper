@@ -41,35 +41,66 @@ if ($Build -le 0) {
 $Root = Split-Path -Parent $PSScriptRoot
 $App = Join-Path $Root "windows\codex_session_manager_electron"
 $Dist = Join-Path $Root "dist\windows"
+$PackageJsonPath = Join-Path $App "package.json"
+$PackageLockPath = Join-Path $App "package-lock.json"
+$OriginalPackageJsonBytes = [System.IO.File]::ReadAllBytes($PackageJsonPath)
+$OriginalPackageLockBytes = [System.IO.File]::ReadAllBytes($PackageLockPath)
+$BuildFailure = $null
+$RestoreFailures = @()
 
-Push-Location $App
 try {
-  Invoke-CheckedNative "npm ci" { npm ci }
-  Invoke-CheckedNative "prepare Windows SQLite" { npm run prepare:sqlite-win }
-  $env:CODEX_RELEASE_VERSION = $Version
-  $env:CODEX_RELEASE_BUILD = "$Build"
-  Invoke-CheckedNative "set release metadata" { node -e "const fs=require('fs');const p=require('./package.json');p.version=process.env.CODEX_RELEASE_VERSION;p.updateBuild=Number(process.env.CODEX_RELEASE_BUILD);fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')" }
-  Invoke-CheckedNative "update package lock" { npm install --package-lock-only --ignore-scripts }
-  Invoke-CheckedNative "npm test" { npm test }
-  Invoke-CheckedNative "package Windows installer" { npm run package:win }
+  Push-Location $App
+  try {
+    Invoke-CheckedNative "npm ci" { npm ci }
+    Invoke-CheckedNative "prepare Windows SQLite" { npm run prepare:sqlite-win }
+    $env:CODEX_RELEASE_VERSION = $Version
+    $env:CODEX_RELEASE_BUILD = "$Build"
+    Invoke-CheckedNative "set release metadata" { node -e "const fs=require('fs');const p=require('./package.json');p.version=process.env.CODEX_RELEASE_VERSION;p.updateBuild=Number(process.env.CODEX_RELEASE_BUILD);fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')" }
+    Invoke-CheckedNative "update package lock" { npm install --package-lock-only --ignore-scripts }
+    Invoke-CheckedNative "npm test" { npm test }
+    Invoke-CheckedNative "package Windows installer" { npm run package:win }
+  } finally {
+    Pop-Location
+  }
+
+  $InstallerName = "CodexSessionKeeper-$Version-windows-x64-Setup.exe"
+  $Installers = @(Get-ChildItem -LiteralPath $Dist -Filter $InstallerName -File)
+  if ($Installers.Count -ne 1) {
+    throw "Expected exactly one installer named $InstallerName"
+  }
+
+  $LatestYml = Join-Path $Dist "latest.yml"
+  if (-not (Test-Path -LiteralPath $LatestYml -PathType Leaf)) {
+    throw "Missing latest.yml"
+  }
+  $LatestText = Get-Content -LiteralPath $LatestYml -Raw
+  if ($LatestText -notmatch [regex]::Escape($InstallerName) -or $LatestText -notmatch [regex]::Escape("version: $Version")) {
+    throw "latest.yml does not reference the requested release"
+  }
+
+  Get-FileHash -Algorithm SHA256 -LiteralPath $Installers[0].FullName
+  Get-FileHash -Algorithm SHA256 -LiteralPath $LatestYml
+} catch {
+  $BuildFailure = $_
 } finally {
-  Pop-Location
+  try {
+    [System.IO.File]::WriteAllBytes($PackageJsonPath, $OriginalPackageJsonBytes)
+  } catch {
+    $RestoreFailures += "${PackageJsonPath}: $($_.Exception.Message)"
+  }
+  try {
+    [System.IO.File]::WriteAllBytes($PackageLockPath, $OriginalPackageLockBytes)
+  } catch {
+    $RestoreFailures += "${PackageLockPath}: $($_.Exception.Message)"
+  }
 }
 
-$InstallerName = "CodexSessionKeeper-$Version-windows-x64-Setup.exe"
-$Installers = @(Get-ChildItem -LiteralPath $Dist -Filter $InstallerName -File)
-if ($Installers.Count -ne 1) {
-  throw "Expected exactly one installer named $InstallerName"
+if ($BuildFailure -ne $null) {
+  if ($RestoreFailures.Count -gt 0) {
+    throw "$($BuildFailure.Exception.Message)`nFailed to restore release metadata: $($RestoreFailures -join '; ')"
+  }
+  throw $BuildFailure
 }
-
-$LatestYml = Join-Path $Dist "latest.yml"
-if (-not (Test-Path -LiteralPath $LatestYml -PathType Leaf)) {
-  throw "Missing latest.yml"
+if ($RestoreFailures.Count -gt 0) {
+  throw "Failed to restore release metadata: $($RestoreFailures -join '; ')"
 }
-$LatestText = Get-Content -LiteralPath $LatestYml -Raw
-if ($LatestText -notmatch [regex]::Escape($InstallerName) -or $LatestText -notmatch [regex]::Escape("version: $Version")) {
-  throw "latest.yml does not reference the requested release"
-}
-
-Get-FileHash -Algorithm SHA256 -LiteralPath $Installers[0].FullName
-Get-FileHash -Algorithm SHA256 -LiteralPath $LatestYml
