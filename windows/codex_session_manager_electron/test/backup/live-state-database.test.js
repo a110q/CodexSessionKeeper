@@ -6,6 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  buildAttachedWriteTransactionSql,
   deleteSingleSessionStateDb,
   ensureRecoveredThreadsInStateDatabase,
   mergeStateDatabase,
@@ -84,6 +85,15 @@ function acquireWriteLock(databasePath, sql) {
   });
 }
 
+test('attached write transaction acquires the live write lock before opening the snapshot', () => {
+  const sql = buildAttachedWriteTransactionSql(
+    'C:\\snapshot.sqlite',
+    'INSERT INTO threads SELECT * FROM snapshot.threads;'
+  );
+
+  assert.ok(sql.indexOf('BEGIN IMMEDIATE;') < sql.indexOf('ATTACH DATABASE'));
+});
+
 test('mergeStateDatabase keeps existing live rows while adding snapshot rows', async (t) => {
   const { destinationDbPath, sourceDbPath } = await makeFixture(t);
   createStateDatabase(destinationDbPath, [
@@ -127,8 +137,12 @@ test('mergeStateDatabase waits for a concurrent Codex commit and preserves both 
     { sqlitePath }
   );
   await new Promise((resolve) => setTimeout(resolve, 100));
-  await lock.release();
-  await mergePromise;
+  const [releaseResult, mergeResult] = await Promise.allSettled([
+    lock.release(),
+    mergePromise,
+  ]);
+  if (releaseResult.status === 'rejected') throw releaseResult.reason;
+  if (mergeResult.status === 'rejected') throw mergeResult.reason;
 
   assert.deepEqual(
     queryRows(destinationDbPath, 'SELECT id FROM threads ORDER BY id;'),

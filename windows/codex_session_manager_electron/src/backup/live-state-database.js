@@ -109,6 +109,18 @@ async function mergePlan(sourceDbPath, destinationDbPath, allowedSessionIds, opt
   return plan;
 }
 
+function buildAttachedWriteTransactionSql(sourceDbPath, statements) {
+  return `
+    PRAGMA foreign_keys = OFF;
+    BEGIN IMMEDIATE;
+    ATTACH DATABASE ${quoteLiteral(sourceDbPath)} AS snapshot;
+    ${statements}
+    COMMIT;
+    DETACH DATABASE snapshot;
+    PRAGMA foreign_keys = ON;
+  `;
+}
+
 async function mergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessionIds = null, options = {}) {
   if (!fs.existsSync(sourceDbPath)) return 'SQLite 索引未合并：快照数据库缺失。';
   if (allowedSessionIds && allowedSessionIds.size === 0) {
@@ -127,15 +139,11 @@ async function mergeStateDatabase(sourceDbPath, destinationDbPath, allowedSessio
   }
 
   const plan = await mergePlan(sourceDbPath, destinationDbPath, allowedSessionIds, options);
-  await runSQLite(destinationDbPath, `
-    PRAGMA foreign_keys = OFF;
-    ATTACH DATABASE ${quoteLiteral(sourceDbPath)} AS snapshot;
-    BEGIN IMMEDIATE;
-    ${plan.map((item) => item.insert).join('\n')}
-    COMMIT;
-    DETACH DATABASE snapshot;
-    PRAGMA foreign_keys = ON;
-  `, options);
+  await runSQLite(
+    destinationDbPath,
+    buildAttachedWriteTransactionSql(sourceDbPath, plan.map((item) => item.insert).join('\n')),
+    options
+  );
   return 'SQLite 索引已合并。';
 }
 
@@ -156,17 +164,16 @@ async function replaceStateDatabase(sourceDbPath, destinationDbPath, allowedSess
     if ((await tableColumns(destinationDbPath, table, options)).length) accountTables.push(table);
   }
 
-  await runSQLite(destinationDbPath, `
-    PRAGMA foreign_keys = OFF;
-    ATTACH DATABASE ${quoteLiteral(sourceDbPath)} AS snapshot;
-    BEGIN IMMEDIATE;
-    ${plan.map((item) => `DELETE FROM ${quoteIdent(item.table)};`).join('\n')}
-    ${plan.map((item) => item.insert).join('\n')}
-    ${accountTables.map((table) => `DELETE FROM ${quoteIdent(table)};`).join('\n')}
-    COMMIT;
-    DETACH DATABASE snapshot;
-    PRAGMA foreign_keys = ON;
-  `, options);
+  const statements = [
+    ...plan.map((item) => `DELETE FROM ${quoteIdent(item.table)};`),
+    ...plan.map((item) => item.insert),
+    ...accountTables.map((table) => `DELETE FROM ${quoteIdent(table)};`),
+  ].join('\n');
+  await runSQLite(
+    destinationDbPath,
+    buildAttachedWriteTransactionSql(sourceDbPath, statements),
+    options
+  );
   return 'SQLite 索引已完整恢复。';
 }
 
@@ -325,6 +332,7 @@ async function ensureRecoveredThreadsInStateDatabase(databasePath, entries, opti
 }
 
 module.exports = {
+  buildAttachedWriteTransactionSql,
   deleteSingleSessionStateDb,
   ensureRecoveredThreadsInStateDatabase,
   mergeStateDatabase,
