@@ -217,7 +217,8 @@ test('rollback stops a known replacement after listener validation fails before 
   const result = runInstallerFunctions(`
     lsof_counter="$(mktemp)"
     launchctl_counter="$(mktemp)"
-    trap 'rm -f "$lsof_counter" "$launchctl_counter"' EXIT
+    check_log="$(mktemp)"
+    trap 'cat "$check_log"; rm -f "$lsof_counter" "$launchctl_counter" "$check_log"' EXIT
     run_lsof() {
       calls="$(wc -l < "$lsof_counter")"
       printf 'x\\n' >> "$lsof_counter"
@@ -233,8 +234,8 @@ test('rollback stops a known replacement after listener validation fails before 
       if [[ "$calls" -lt 51 ]]; then
         printf 'state = running\\npid = 410\\n'
       else
-        printf 'Could not find service "%s" in domain for system\\n' "$LABEL"
-        return 1
+        printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"
+        return 113
       fi
     }
     run_launchctl_bootout() { printf 'bootout-replacement\\n'; }
@@ -273,9 +274,10 @@ test('launchctl inspection distinguishes present jobs, explicit absence, and ope
 
   const absent = runInstallerFunctions(`
     run_launchctl_print() {
-      printf 'Could not find service "%s" in domain for system\\n' "$LABEL"
-      return 1
+      printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"
+      return 113
     }
+    process_parent_pid() { return 1; }
     inspect_launchd_job
     [[ "$LAUNCHD_JOB_PRESENT" == 0 ]]
   `);
@@ -298,7 +300,7 @@ test('job snapshot and preflight stop preserve present states and reject launchc
   assert.equal(exited.status, 0, exited.stderr);
 
   const absent = runInstallerFunctions(`
-    run_launchctl_print() { printf 'Could not find service "%s" in domain for system\\n' "$LABEL"; return 1; }
+    run_launchctl_print() { printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"; return 113; }
     snapshot_existing_job
     [[ "$HAD_JOB" == 0 ]]
   `);
@@ -322,14 +324,15 @@ test('replacement rollback checks a captured master after its launchd label is a
   const result = runInstallerFunctions(`
     lsof_counter="$(mktemp)"
     launchctl_counter="$(mktemp)"
-    trap 'rm -f "$lsof_counter" "$launchctl_counter"' EXIT
+    check_log="$(mktemp)"
+    trap 'cat "$check_log"; rm -f "$lsof_counter" "$launchctl_counter" "$check_log"' EXIT
     run_lsof() {
       calls="$(wc -l < "$lsof_counter")"
       printf 'x\\n' >> "$lsof_counter"
       if [[ "$calls" -eq 0 ]]; then
         printf 'p410\\nf8\\nn192.168.10.54:18080\\n'
       else
-        printf 'replacement-listener-checked\\n' >&2
+        printf 'replacement-listener-checked\\n' >> "$check_log"
         return 1
       fi
     }
@@ -339,8 +342,8 @@ test('replacement rollback checks a captured master after its launchd label is a
       if [[ "$calls" -eq 0 ]]; then
         printf 'state = running\\npid = 410\\n'
       else
-        printf 'Could not find service "%s" in domain for system\\n' "$LABEL"
-        return 1
+        printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"
+        return 113
       fi
     }
     process_command() { printf '%s -c %s' "$NGINX_BIN" "$CONFIG_DEST"; }
@@ -350,7 +353,7 @@ test('replacement rollback checks a captured master after its launchd label is a
     stop_replacement_service
   `);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stderr, /replacement-listener-checked/);
+  assert.match(result.stdout, /replacement-listener-checked/);
 });
 
 test('replacement stop waits for listener PIDs captured before the master can be reparented', () => {
@@ -366,8 +369,8 @@ test('replacement stop waits for listener PIDs captured before the master can be
       if [[ "$calls" -eq 0 ]]; then
         printf 'state = running\\npid = 410\\n'
       else
-        printf 'Could not find service "%s" in domain for system\\n' "$LABEL"
-        return 1
+        printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"
+        return 113
       fi
     }
     run_launchctl_bootout() { : > "$booted_marker"; }
@@ -379,4 +382,110 @@ test('replacement stop waits for listener PIDs captured before the master can be
   `);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stderr, /replacement listener processes did not exit/);
+});
+
+test('listener status 1 is empty only when lsof also has no stderr', () => {
+  const empty = runInstallerFunctions(`
+    run_lsof() { return 1; }
+    listener_records
+  `);
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.equal(empty.stdout.trim(), '');
+
+  const error = runInstallerFunctions(`
+    run_lsof() { printf 'lsof: permission denied\\n' >&2; return 1; }
+    if listener_records; then exit 1; fi
+  `);
+  assert.equal(error.status, 0, error.stderr);
+  assert.match(error.stderr, /lsof: permission denied/);
+});
+
+test('launchctl absence requires the observed status 113 and exact English message for this label', () => {
+  assert.match(installer(), /run_launchctl_print\(\) \{ sudo \/usr\/bin\/env LC_ALL=C LANG=C \/bin\/launchctl print/);
+  const exactAbsent = runInstallerFunctions(`
+    run_launchctl_print() {
+      printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"
+      return 113
+    }
+    inspect_launchd_job
+    [[ "$LAUNCHD_JOB_PRESENT" == 0 ]]
+  `);
+  assert.equal(exactAbsent.status, 0, exactAbsent.stderr);
+
+  const wrongLabel = runInstallerFunctions(`
+    run_launchctl_print() {
+      printf 'Bad request.\\nCould not find service "other.service" in domain for system\\n'
+      return 113
+    }
+    if inspect_launchd_job; then exit 1; fi
+  `);
+  assert.equal(wrongLabel.status, 0, wrongLabel.stderr);
+
+  const wrongStatus = runInstallerFunctions(`
+    run_launchctl_print() {
+      printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"
+      return 1
+    }
+    if inspect_launchd_job; then exit 1; fi
+  `);
+  assert.equal(wrongStatus.status, 0, wrongStatus.stderr);
+
+  const localized = runInstallerFunctions(`
+    run_launchctl_print() { printf '请求错误。\\n找不到服务。\\n'; return 113; }
+    if inspect_launchd_job; then exit 1; fi
+  `);
+  assert.equal(localized.status, 0, localized.stderr);
+});
+
+test('rollback refuses file restore when a replacement label is absent but port 18080 is still occupied', () => {
+  const result = runInstallerFunctions(`
+    run_lsof() { printf 'p777\\nf8\\nn192.168.10.54:18080\\n'; }
+    run_launchctl_print() {
+      printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"
+      return 113
+    }
+    wait_for_listener_to_stop() { printf 'port-empty-check\\n'; return 1; }
+    restore_config() { printf 'restore-config\\n'; }
+    restore_plist() { printf 'restore-plist\\n'; }
+    verify_rollback_restoration() { printf 'verify-restore\\n'; }
+    DEPLOYING=1
+    REPLACEMENT_JOB_STARTED=1
+    REPLACEMENT_MASTER_PID=999
+    if rollback; then exit 1; fi
+  `);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /port-empty-check/);
+  assert.doesNotMatch(result.stdout, /restore-config|restore-plist|verify-restore/);
+});
+
+test('ERR rollback simulation stops replacement and checks an empty port before restore', () => {
+  const result = runInstallerFunctions(`
+    set -eE
+    log_file="$(mktemp)"
+    trap 'cat "$log_file"; rm -f "$log_file"' EXIT
+    run_launchctl_bootstrap() { printf 'bootstrap\\n' >> "$log_file"; }
+    run_launchctl_enable() { printf 'enable\\n' >> "$log_file"; return 1; }
+    run_launchctl_kickstart() { printf 'kickstart\\n' >> "$log_file"; }
+    run_launchctl_print() {
+      printf 'Bad request.\\nCould not find service "%s" in domain for system\\n' "$LABEL"
+      return 113
+    }
+    run_lsof() { printf 'p777\\nf8\\nn192.168.10.54:18080\\n'; }
+    wait_for_listener_to_stop() { printf 'port-empty-check\\n' >> "$log_file"; return 1; }
+    restore_config() { printf 'restore-config\\n' >> "$log_file"; }
+    restore_plist() { printf 'restore-plist\\n' >> "$log_file"; }
+    verify_rollback_restoration() { printf 'verify-restore\\n' >> "$log_file"; }
+    DEPLOYING=1
+    activate() {
+      run_launchctl_bootstrap
+      REPLACEMENT_JOB_STARTED=1
+      run_launchctl_enable
+      run_launchctl_kickstart
+    }
+    activate
+  `);
+  assert.notEqual(result.status, 0, result.stderr);
+  assert.match(result.stderr, /rollback failed/);
+  assert.match(result.stdout, /bootstrap\nenable\nport-empty-check/);
+  assert.doesNotMatch(result.stdout, /restore-config|restore-plist|verify-restore/);
 });

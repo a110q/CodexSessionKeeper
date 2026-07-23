@@ -29,7 +29,7 @@ cleanup() {
 }
 
 run_lsof() { sudo /usr/sbin/lsof -nP -F pfn -iTCP:18080 -sTCP:LISTEN; }
-run_launchctl_print() { sudo /bin/launchctl print "system/$LABEL" 2>&1; }
+run_launchctl_print() { sudo /usr/bin/env LC_ALL=C LANG=C /bin/launchctl print "system/$LABEL" 2>&1; }
 run_launchctl_bootout() { sudo /bin/launchctl bootout "system/$LABEL"; }
 run_launchctl_bootstrap() { sudo /bin/launchctl bootstrap system "$PLIST_DEST"; }
 run_launchctl_enable() { sudo /bin/launchctl enable "system/$LABEL"; }
@@ -38,7 +38,7 @@ process_command() { sudo /bin/ps -p "$1" -o command=; }
 process_parent_pid() { sudo /bin/ps -p "$1" -o ppid= | /usr/bin/tr -d '[:space:]'; }
 
 inspect_launchd_job() {
-  local output status
+  local output status absent_output
   LAUNCHD_JOB_PRESENT=0
   LAUNCHD_JOB_OUTPUT=""
   LAUNCHD_INSPECTION_ERROR=""
@@ -50,7 +50,8 @@ inspect_launchd_job() {
     status=$?
   fi
   LAUNCHD_JOB_OUTPUT="$output"
-  if [[ "$output" == *"Could not find service"* || "$output" == *"Could not find the service"* ]]; then
+  printf -v absent_output 'Bad request.\nCould not find service "%s" in domain for system' "$LABEL"
+  if [[ "$status" -eq 113 && "$output" == "$absent_output" ]]; then
     return 0
   fi
   LAUNCHD_INSPECTION_ERROR="could not inspect launchd job $LABEL (launchctl status $status): $output"
@@ -64,15 +65,20 @@ snapshot_existing_job() {
 }
 
 listener_records() {
-  local output status line pid="" endpoint=""
-  if output="$(run_lsof)"; then
+  local output stderr status line pid="" endpoint="" stderr_file
+  stderr_file="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-lsof.XXXXXX")"
+  if output="$(run_lsof 2>"$stderr_file")"; then
     :
   else
     status=$?
-    [[ "$status" -eq 1 ]] && return 0
+    stderr="$(/bin/cat "$stderr_file")"
+    /bin/rm -f "$stderr_file"
+    [[ "$status" -eq 1 && -z "$output" && -z "$stderr" ]] && return 0
+    [[ -n "$stderr" ]] && echo "$stderr" >&2
     echo "unable to inspect listeners on port 18080" >&2
     return "$status"
   fi
+  /bin/rm -f "$stderr_file"
   while IFS= read -r line; do
     case "$line" in
       p*) pid="${line#p}" ;;
@@ -240,7 +246,8 @@ stop_replacement_service() {
     replacement_pids="$(replacement_listener_pids "$master_pid")" || return 1
   fi
   wait_for_launchd_job_absent || return 1
-  wait_for_listener_pids_to_exit "$replacement_pids"
+  wait_for_listener_pids_to_exit "$replacement_pids" || return 1
+  wait_for_listener_to_stop
 }
 
 restore_config() {
