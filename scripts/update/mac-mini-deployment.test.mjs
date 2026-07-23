@@ -217,8 +217,10 @@ test('rollback stops a known replacement after listener validation fails before 
   const result = runInstallerFunctions(`
     lsof_counter="$(mktemp)"
     launchctl_counter="$(mktemp)"
+    booted_marker="$(mktemp)"
     check_log="$(mktemp)"
-    trap 'cat "$check_log"; rm -f "$lsof_counter" "$launchctl_counter" "$check_log"' EXIT
+    rm -f "$booted_marker"
+    trap 'cat "$check_log"; rm -f "$lsof_counter" "$launchctl_counter" "$booted_marker" "$check_log"' EXIT
     run_lsof() {
       calls="$(wc -l < "$lsof_counter")"
       printf 'x\\n' >> "$lsof_counter"
@@ -238,9 +240,10 @@ test('rollback stops a known replacement after listener validation fails before 
         return 113
       fi
     }
-    run_launchctl_bootout() { printf 'bootout-replacement\\n'; }
+    run_launchctl_bootout() { : > "$booted_marker"; printf 'bootout-replacement\\n'; }
     process_command() { printf '%s -c %s' "$NGINX_BIN" "$CONFIG_DEST"; }
     process_parent_pid() { printf '1'; }
+    process_identity() { [[ -e "$booted_marker" ]] && return 1; printf 'Mon Jul 21 10:00:00 2026 replacement nginx'; }
     restore_config() { printf 'restore-config\\n'; }
     restore_plist() { printf 'restore-plist\\n'; }
     verify_rollback_restoration() { printf 'verify-restore\\n'; }
@@ -348,6 +351,7 @@ test('replacement rollback checks a captured master after its launchd label is a
     }
     process_command() { printf '%s -c %s' "$NGINX_BIN" "$CONFIG_DEST"; }
     process_parent_pid() { printf '1'; }
+    process_identity() { printf 'Mon Jul 21 10:00:00 2026 replacement nginx'; }
     REPLACEMENT_JOB_STARTED=1
     validate_listener_records
     stop_replacement_service
@@ -377,6 +381,7 @@ test('replacement stop waits for listener PIDs captured before the master can be
     process_parent_pid() {
       [[ -e "$booted_marker" ]] && printf '1' || printf '410'
     }
+    process_identity() { printf 'Mon Jul 21 10:00:00 2026 replacement nginx'; }
     REPLACEMENT_JOB_STARTED=1
     if stop_replacement_service; then exit 1; fi
   `);
@@ -488,4 +493,121 @@ test('ERR rollback simulation stops replacement and checks an empty port before 
   assert.match(result.stderr, /rollback failed/);
   assert.match(result.stdout, /bootstrap\nenable\nport-empty-check/);
   assert.doesNotMatch(result.stdout, /restore-config|restore-plist|verify-restore/);
+});
+
+test('replacement identities must exit rather than merely stop listening', () => {
+  const alive = runInstallerFunctions(`
+    process_identity() { printf 'Mon Jul 21 10:00:00 2026 nginx worker'; }
+    if wait_for_replacement_identities_to_exit $'411\\tMon Jul 21 10:00:00 2026 nginx worker'; then exit 1; fi
+  `);
+  assert.equal(alive.status, 0, alive.stderr);
+
+  const exited = runInstallerFunctions(`
+    process_identity() { return 1; }
+    wait_for_replacement_identities_to_exit $'411\\tMon Jul 21 10:00:00 2026 nginx worker'
+  `);
+  assert.equal(exited.status, 0, exited.stderr);
+
+  const reused = runInstallerFunctions(`
+    process_identity() { printf 'Mon Jul 21 11:00:00 2026 unrelated process'; }
+    wait_for_replacement_identities_to_exit $'411\\tMon Jul 21 10:00:00 2026 nginx worker'
+  `);
+  assert.equal(reused.status, 0, reused.stderr);
+});
+
+test('site file rollback removes new files and restores prior marker and health snapshots', () => {
+  const fresh = runInstallerFunctions(`
+    restore_site_file() { printf "restore:$1:$2\\n"; }
+    MARKER_HAD_FILE=0
+    HEALTH_HAD_FILE=0
+    rollback_site_files
+  `);
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.match(fresh.stdout, /restore:.*\.codex-update-root:0/);
+  assert.match(fresh.stdout, /restore:.*health\.txt:0/);
+
+  const existing = runInstallerFunctions(`
+    restore_site_file() { printf "restore:$1:$2\\n"; }
+    MARKER_HAD_FILE=1
+    HEALTH_HAD_FILE=1
+    rollback_site_files
+  `);
+  assert.equal(existing.status, 0, existing.stderr);
+  assert.match(existing.stdout, /restore:.*\.codex-update-root:1/);
+  assert.match(existing.stdout, /restore:.*health\.txt:1/);
+});
+
+test('site file snapshots restore exact contents and metadata', () => {
+  const result = runInstallerFunctions(`
+    sudo() { "$@"; }
+    site_dir="$(mktemp -d)"
+    trap 'rm -rf "$site_dir"' EXIT
+    MARKER_PATH="$site_dir/.codex-update-root"
+    HEALTH_DEST="$site_dir/health.txt"
+    BACKUP_MARKER="$(mktemp)"
+    BACKUP_HEALTH="$(mktemp)"
+    printf 'old marker\\n' > "$MARKER_PATH"
+    printf 'old health\\n' > "$HEALTH_DEST"
+    chmod 0640 "$MARKER_PATH"
+    chmod 0600 "$HEALTH_DEST"
+    backup_site_files
+    marker_metadata="$MARKER_METADATA"
+    health_metadata="$HEALTH_METADATA"
+    printf 'replacement marker\\n' > "$MARKER_PATH"
+    printf 'replacement health\\n' > "$HEALTH_DEST"
+    chmod 0666 "$MARKER_PATH" "$HEALTH_DEST"
+    rollback_site_files
+    cmp -s "$BACKUP_MARKER" "$MARKER_PATH"
+    cmp -s "$BACKUP_HEALTH" "$HEALTH_DEST"
+    [[ "$(site_file_metadata "$MARKER_PATH")" == "$marker_metadata" ]]
+    [[ "$(site_file_metadata "$HEALTH_DEST")" == "$health_metadata" ]]
+    MARKER_PATH="$site_dir/new-marker"
+    HEALTH_DEST="$site_dir/new-health"
+    BACKUP_MARKER="$(mktemp)"
+    BACKUP_HEALTH="$(mktemp)"
+    MARKER_HAD_FILE=0
+    HEALTH_HAD_FILE=0
+    MARKER_METADATA=""
+    HEALTH_METADATA=""
+    printf 'new marker\\n' > "$MARKER_PATH"
+    printf 'new health\\n' > "$HEALTH_DEST"
+    rollback_site_files
+    [[ ! -e "$MARKER_PATH" && ! -e "$HEALTH_DEST" ]]
+  `);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('production activation function rolls back bootstrap, enable, and kickstart failures before restore', () => {
+  assert.match(installer(), /activate_service\(\) \{[\s\S]*run_launchctl_bootstrap[\s\S]*run_launchctl_enable[\s\S]*run_launchctl_kickstart/);
+  for (const failingStep of ['bootstrap', 'enable', 'kickstart']) {
+    const result = runInstallerFunctions(`
+      set -e
+      log_file="$(mktemp)"
+      trap 'cat "$log_file"; rm -f "$log_file"' EXIT
+      stop_service() { printf 'port-empty\\n' >> "$log_file"; }
+      install_launchd_plist() { printf 'install-plist\\n' >> "$log_file"; }
+      run_launchctl_bootstrap() { printf 'bootstrap\\n' >> "$log_file"; [[ "${failingStep}" != bootstrap ]]; }
+      run_launchctl_enable() { printf 'enable\\n' >> "$log_file"; [[ "${failingStep}" != enable ]]; }
+      run_launchctl_kickstart() { printf 'kickstart\\n' >> "$log_file"; [[ "${failingStep}" != kickstart ]]; }
+      wait_for_service() { printf 'verify\\n' >> "$log_file"; }
+      stop_replacement_service() { printf 'stop-replacement\\nport-empty\\n' >> "$log_file"; }
+      rollback_site_files() { printf 'restore-site\\n' >> "$log_file"; }
+      restore_config() { printf 'restore-config\\n' >> "$log_file"; }
+      restore_plist() { printf 'restore-plist\\n' >> "$log_file"; }
+      verify_rollback_restoration() { printf 'verify-restore\\n' >> "$log_file"; }
+      DEPLOYING=1
+      HAD_JOB=0
+      activate_service
+    `);
+    assert.notEqual(result.status, 0, `${failingStep}: ${result.stderr}`);
+    assert.match(result.stdout, /bootstrap/);
+    assert.match(result.stdout, /port-empty/);
+    assert.ok(result.stdout.indexOf('port-empty') < result.stdout.indexOf('restore-site'));
+    if (failingStep === 'bootstrap') {
+      assert.doesNotMatch(result.stdout, /stop-replacement/);
+    } else {
+      assert.match(result.stdout, /stop-replacement/);
+    }
+    assert.doesNotMatch(result.stdout, /installed/);
+  }
 });

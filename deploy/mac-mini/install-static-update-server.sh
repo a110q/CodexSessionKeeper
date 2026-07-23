@@ -8,16 +8,24 @@ CONFIG_DEST="/usr/local/etc/codex-update-nginx.conf"
 PLIST_DEST="/Library/LaunchDaemons/$LABEL.plist"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HEALTH_PATH="/codex-session-keeper/health.txt"
+MARKER_PATH="$SITE_ROOT/.codex-update-root"
+HEALTH_DEST="$SITE_ROOT$HEALTH_PATH"
 BREW_BIN="/opt/homebrew/bin/brew"
 ARCH="$(/usr/bin/uname -m)"
 
 BACKUP_CONFIG="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-config.XXXXXX")"
 BACKUP_PLIST="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-plist.XXXXXX")"
+BACKUP_MARKER="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-marker.XXXXXX")"
+BACKUP_HEALTH="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-health-backup.XXXXXX")"
 MARKER_TEMP="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-root.XXXXXX")"
 HEALTH_TEMP="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-health.XXXXXX")"
 PLIST_TEMP="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-launchd.XXXXXX.plist")"
 HAD_CONFIG=0
 HAD_PLIST=0
+MARKER_HAD_FILE=0
+HEALTH_HAD_FILE=0
+MARKER_METADATA=""
+HEALTH_METADATA=""
 HAD_JOB=0
 DEPLOYING=0
 ROLLING_BACK=0
@@ -25,7 +33,7 @@ REPLACEMENT_JOB_STARTED=0
 REPLACEMENT_MASTER_PID=""
 
 cleanup() {
-  /bin/rm -f "$BACKUP_CONFIG" "$BACKUP_PLIST" "$MARKER_TEMP" "$HEALTH_TEMP" "$PLIST_TEMP"
+  /bin/rm -f "$BACKUP_CONFIG" "$BACKUP_PLIST" "$BACKUP_MARKER" "$BACKUP_HEALTH" "$MARKER_TEMP" "$HEALTH_TEMP" "$PLIST_TEMP"
 }
 
 run_lsof() { sudo /usr/sbin/lsof -nP -F pfn -iTCP:18080 -sTCP:LISTEN; }
@@ -36,6 +44,7 @@ run_launchctl_enable() { sudo /bin/launchctl enable "system/$LABEL"; }
 run_launchctl_kickstart() { sudo /bin/launchctl kickstart -k "system/$LABEL"; }
 process_command() { sudo /bin/ps -p "$1" -o command=; }
 process_parent_pid() { sudo /bin/ps -p "$1" -o ppid= | /usr/bin/tr -d '[:space:]'; }
+process_identity() { sudo /bin/ps -p "$1" -o lstart= -o command=; }
 
 inspect_launchd_job() {
   local output status absent_output
@@ -199,33 +208,32 @@ wait_for_launchd_job_absent() {
   return 1
 }
 
-replacement_listener_pids() {
-  local master_pid="$1" records pid endpoint
+replacement_listener_identities() {
+  local master_pid="$1" records pid endpoint identity
   [[ "$master_pid" =~ ^[0-9]+$ ]] || return 0
   records="$(listener_records)" || return 1
   while IFS=$'\t' read -r pid endpoint; do
     [[ -n "$pid" ]] || continue
     if [[ "$pid" == "$master_pid" ]] || is_descended_from_master "$pid" "$master_pid"; then
-      /usr/bin/printf '%s\n' "$pid"
+      identity="$(process_identity "$pid")" || return 1
+      /usr/bin/printf '%s\t%s\n' "$pid" "$identity"
     fi
   done <<<"$records"
 }
 
-wait_for_listener_pids_to_exit() {
-  local expected_pids="$1" attempt records current_pids pid still_listening
-  [[ -n "$expected_pids" ]] || return 0
+wait_for_replacement_identities_to_exit() {
+  local expected_identities="$1" attempt pid expected_identity actual_identity original_still_running
+  [[ -n "$expected_identities" ]] || return 0
   for attempt in {1..50}; do
-    records="$(listener_records)" || return 1
-    current_pids="$(/usr/bin/awk -F '\t' '{ print $1 }' <<<"$records")"
-    still_listening=0
-    while IFS= read -r pid; do
+    original_still_running=0
+    while IFS=$'\t' read -r pid expected_identity; do
       [[ -n "$pid" ]] || continue
-      if /usr/bin/grep -Fxq "$pid" <<<"$current_pids"; then
-        still_listening=1
+      if actual_identity="$(process_identity "$pid")" && [[ "$actual_identity" == "$expected_identity" ]]; then
+        original_still_running=1
         break
       fi
-    done <<<"$expected_pids"
-    [[ "$still_listening" -eq 0 ]] && return 0
+    done <<<"$expected_identities"
+    [[ "$original_still_running" -eq 0 ]] && return 0
     /bin/sleep 0.1
   done
   echo "replacement listener processes did not exit" >&2
@@ -233,21 +241,65 @@ wait_for_listener_pids_to_exit() {
 }
 
 stop_replacement_service() {
-  local master_pid="$REPLACEMENT_MASTER_PID" replacement_pids=""
+  local master_pid="$REPLACEMENT_MASTER_PID" replacement_identities=""
   inspect_launchd_job || return 1
   if [[ "$LAUNCHD_JOB_PRESENT" -eq 1 ]]; then
     master_pid="$(launchd_job_pid)"
-    replacement_pids="$(replacement_listener_pids "$master_pid")" || return 1
+    replacement_identities="$(replacement_listener_identities "$master_pid")" || return 1
     if ! run_launchctl_bootout; then
       echo "could not bootout replacement $LABEL" >&2
       return 1
     fi
   elif [[ -n "$master_pid" ]]; then
-    replacement_pids="$(replacement_listener_pids "$master_pid")" || return 1
+    replacement_identities="$(replacement_listener_identities "$master_pid")" || return 1
   fi
   wait_for_launchd_job_absent || return 1
-  wait_for_listener_pids_to_exit "$replacement_pids" || return 1
+  wait_for_replacement_identities_to_exit "$replacement_identities" || return 1
   wait_for_listener_to_stop
+}
+
+site_file_metadata() { sudo /usr/bin/stat -f '%Su:%Sg:%Lp' "$1"; }
+
+backup_site_file() {
+  local path="$1" had_file_var="$2" backup_path="$3" metadata_var="$4" metadata
+  if [[ -e "$path" ]]; then
+    [[ -f "$path" ]] || { echo "refusing to replace non-file $path" >&2; return 1; }
+    sudo /bin/cp -p "$path" "$backup_path"
+    metadata="$(site_file_metadata "$path")" || return 1
+    printf -v "$had_file_var" '%s' 1
+    printf -v "$metadata_var" '%s' "$metadata"
+  fi
+}
+
+backup_site_files() {
+  backup_site_file "$MARKER_PATH" MARKER_HAD_FILE "$BACKUP_MARKER" MARKER_METADATA || return 1
+  backup_site_file "$HEALTH_DEST" HEALTH_HAD_FILE "$BACKUP_HEALTH" HEALTH_METADATA
+}
+
+site_file_matches_snapshot() {
+  local path="$1" had_file="$2" backup_path="$3" expected_metadata="$4" current_metadata
+  if [[ "$had_file" -eq 0 ]]; then
+    [[ ! -e "$path" ]]
+    return
+  fi
+  sudo /usr/bin/cmp -s "$backup_path" "$path" || return 1
+  current_metadata="$(site_file_metadata "$path")" || return 1
+  [[ "$current_metadata" == "$expected_metadata" ]]
+}
+
+restore_site_file() {
+  local path="$1" had_file="$2" backup_path="$3" expected_metadata="$4"
+  if [[ "$had_file" -eq 1 ]]; then
+    sudo /bin/cp -p "$backup_path" "$path"
+  else
+    sudo /bin/rm -f "$path"
+  fi
+  site_file_matches_snapshot "$path" "$had_file" "$backup_path" "$expected_metadata"
+}
+
+rollback_site_files() {
+  restore_site_file "$MARKER_PATH" "$MARKER_HAD_FILE" "$BACKUP_MARKER" "$MARKER_METADATA" || return 1
+  restore_site_file "$HEALTH_DEST" "$HEALTH_HAD_FILE" "$BACKUP_HEALTH" "$HEALTH_METADATA"
 }
 
 restore_config() {
@@ -262,6 +314,8 @@ verify_rollback_restoration() {
   local attempt
   if [[ "$HAD_CONFIG" -eq 1 ]]; then sudo /usr/bin/cmp -s "$BACKUP_CONFIG" "$CONFIG_DEST" || return 1; elif [[ -e "$CONFIG_DEST" ]]; then return 1; fi
   if [[ "$HAD_PLIST" -eq 1 ]]; then sudo /usr/bin/cmp -s "$BACKUP_PLIST" "$PLIST_DEST" || return 1; elif [[ -e "$PLIST_DEST" ]]; then return 1; fi
+  site_file_matches_snapshot "$MARKER_PATH" "$MARKER_HAD_FILE" "$BACKUP_MARKER" "$MARKER_METADATA" || return 1
+  site_file_matches_snapshot "$HEALTH_DEST" "$HEALTH_HAD_FILE" "$BACKUP_HEALTH" "$HEALTH_METADATA" || return 1
   if [[ "$HAD_JOB" -eq 0 ]]; then wait_for_listener_to_stop; return; fi
   for attempt in {1..50}; do
     validate_listener_records && return 0
@@ -283,6 +337,7 @@ rollback() {
     echo "rollback failed: could not stop replacement service" >&2
     return 1
   fi
+  if ! rollback_site_files; then echo "rollback failed: could not restore site marker files" >&2; failed=1; fi
   if ! restore_config; then echo "rollback failed: could not restore nginx configuration" >&2; failed=1; fi
   if ! restore_plist; then echo "rollback failed: could not restore launchd plist" >&2; failed=1; fi
   if [[ "$HAD_JOB" -eq 1 ]] && ! restart_prior_service; then echo "rollback failed: could not restart prior launchd job" >&2; failed=1; fi
@@ -322,6 +377,20 @@ wait_for_service() {
   return 1
 }
 
+install_launchd_plist() { sudo /usr/bin/install -o root -g wheel -m 0644 "$PLIST_TEMP" "$PLIST_DEST"; }
+
+activate_service() {
+  if [[ "$HAD_JOB" -eq 1 ]]; then
+    if ! stop_service; then return 1; fi
+  fi
+  if ! install_launchd_plist; then return 1; fi
+  if ! run_launchctl_bootstrap; then return 1; fi
+  REPLACEMENT_JOB_STARTED=1
+  if ! run_launchctl_enable; then return 1; fi
+  if ! run_launchctl_kickstart; then return 1; fi
+  if ! wait_for_service; then return 1; fi
+}
+
 /sbin/ifconfig | /usr/bin/awk '/inet / { print $2 }' | /usr/bin/grep -Fxq "$EXPECTED_IP" || {
   die "refusing deployment: this Mac does not own $EXPECTED_IP"
 }
@@ -345,6 +414,7 @@ if [[ -f "$PLIST_DEST" ]]; then
   HAD_PLIST=1
 fi
 snapshot_existing_job || die "$LAUNCHD_INSPECTION_ERROR"
+backup_site_files || die "could not snapshot existing site marker files"
 DEPLOYING=1
 
 sudo /usr/bin/install -d -o root -g admin -m 0775 \
@@ -355,9 +425,9 @@ sudo /usr/bin/install -d -o root -g admin -m 0775 \
   "$SITE_ROOT/codex-session-keeper/stable/windows"
 
 /usr/bin/printf '%s\n' 'codex-session-keeper-update-root-v1' > "$MARKER_TEMP"
-sudo /usr/bin/install -o root -g admin -m 0664 "$MARKER_TEMP" "$SITE_ROOT/.codex-update-root"
+sudo /usr/bin/install -o root -g admin -m 0664 "$MARKER_TEMP" "$MARKER_PATH"
 /usr/bin/printf '%s\n' 'codex-session-keeper update service health check' > "$HEALTH_TEMP"
-sudo /usr/bin/install -o root -g admin -m 0664 "$HEALTH_TEMP" "$SITE_ROOT$HEALTH_PATH"
+sudo /usr/bin/install -o root -g admin -m 0664 "$HEALTH_TEMP" "$HEALTH_DEST"
 sudo /usr/bin/install -d -o root -g wheel -m 0755 /usr/local/etc
 sudo /usr/bin/install -o root -g wheel -m 0644 "$SCRIPT_DIR/nginx.conf" "$CONFIG_DEST"
 
@@ -377,14 +447,6 @@ sudo /usr/bin/install -o root -g wheel -m 0644 "$SCRIPT_DIR/nginx.conf" "$CONFIG
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string /var/log/codex-update-launchd-error.log" "$PLIST_TEMP"
 
 sudo "$NGINX_BIN" -t -c "$CONFIG_DEST"
-if [[ "$HAD_JOB" -eq 1 ]]; then
-  stop_service
-fi
-sudo /usr/bin/install -o root -g wheel -m 0644 "$PLIST_TEMP" "$PLIST_DEST"
-sudo /bin/launchctl bootstrap system "$PLIST_DEST"
-REPLACEMENT_JOB_STARTED=1
-sudo /bin/launchctl enable "system/$LABEL"
-sudo /bin/launchctl kickstart -k "system/$LABEL"
-wait_for_service
+activate_service
 DEPLOYING=0
 echo "installed $LABEL on http://192.168.10.54:18080/"
