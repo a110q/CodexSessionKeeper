@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs';
 import { lstat, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 function escapeHTML(value) {
   return String(value)
@@ -79,7 +80,17 @@ async function runCLI() {
   await writeDownloadPage(args[1], args[3]);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+function isMainModule(moduleURL, argumentPath) {
+  if (!argumentPath) return false;
+  try {
+    return pathToFileURL(realpathSync(fileURLToPath(moduleURL))).href
+      === pathToFileURL(realpathSync(argumentPath)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule(import.meta.url, process.argv[1])) {
   runCLI().catch((error) => {
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;
