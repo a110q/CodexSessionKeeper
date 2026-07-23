@@ -20,6 +20,7 @@ BACKUP_HEALTH="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-health-backup.XXX
 MARKER_TEMP="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-root.XXXXXX")"
 HEALTH_TEMP="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-health.XXXXXX")"
 PLIST_TEMP="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-launchd.XXXXXX.plist")"
+IDENTITY_STDERR="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-ps.XXXXXX")"
 HAD_CONFIG=0
 HAD_PLIST=0
 MARKER_HAD_FILE=0
@@ -33,7 +34,7 @@ REPLACEMENT_JOB_STARTED=0
 REPLACEMENT_MASTER_PID=""
 
 cleanup() {
-  /bin/rm -f "$BACKUP_CONFIG" "$BACKUP_PLIST" "$BACKUP_MARKER" "$BACKUP_HEALTH" "$MARKER_TEMP" "$HEALTH_TEMP" "$PLIST_TEMP"
+  /bin/rm -f "$BACKUP_CONFIG" "$BACKUP_PLIST" "$BACKUP_MARKER" "$BACKUP_HEALTH" "$MARKER_TEMP" "$HEALTH_TEMP" "$PLIST_TEMP" "$IDENTITY_STDERR"
 }
 
 run_lsof() { sudo /usr/sbin/lsof -nP -F pfn -iTCP:18080 -sTCP:LISTEN; }
@@ -44,7 +45,7 @@ run_launchctl_enable() { sudo /bin/launchctl enable "system/$LABEL"; }
 run_launchctl_kickstart() { sudo /bin/launchctl kickstart -k "system/$LABEL"; }
 process_command() { sudo /bin/ps -p "$1" -o command=; }
 process_parent_pid() { sudo /bin/ps -p "$1" -o ppid= | /usr/bin/tr -d '[:space:]'; }
-process_identity() { sudo /bin/ps -p "$1" -o lstart= -o command=; }
+process_identity() { sudo /usr/bin/env LC_ALL=C LANG=C /bin/ps -p "$1" -o lstart= -o command=; }
 
 inspect_launchd_job() {
   local output status absent_output
@@ -222,15 +223,35 @@ replacement_listener_identities() {
 }
 
 wait_for_replacement_identities_to_exit() {
-  local expected_identities="$1" attempt pid expected_identity actual_identity original_still_running
+  local expected_identities="$1" attempt pid expected_identity actual_identity identity_stderr identity_status original_still_running
   [[ -n "$expected_identities" ]] || return 0
   for attempt in {1..50}; do
     original_still_running=0
     while IFS=$'\t' read -r pid expected_identity; do
       [[ -n "$pid" ]] || continue
-      if actual_identity="$(process_identity "$pid")" && [[ "$actual_identity" == "$expected_identity" ]]; then
-        original_still_running=1
-        break
+      : > "$IDENTITY_STDERR"
+      if actual_identity="$(process_identity "$pid" 2>"$IDENTITY_STDERR")"; then
+        identity_status=0
+      else
+        identity_status=$?
+      fi
+      identity_stderr="$(/bin/cat "$IDENTITY_STDERR")"
+      if [[ "$identity_status" -eq 0 ]]; then
+        if [[ -n "$identity_stderr" ]]; then
+          echo "$identity_stderr" >&2
+          echo "could not inspect replacement process $pid (ps returned stderr)" >&2
+          return 1
+        fi
+        if [[ "$actual_identity" == "$expected_identity" ]]; then
+          original_still_running=1
+          break
+        fi
+      elif [[ "$identity_status" -eq 1 && -z "$actual_identity" && -z "$identity_stderr" ]]; then
+        :
+      else
+        [[ -n "$identity_stderr" ]] && echo "$identity_stderr" >&2
+        echo "could not inspect replacement process $pid (ps status $identity_status)" >&2
+        return "$identity_status"
       fi
     done <<<"$expected_identities"
     [[ "$original_still_running" -eq 0 ]] && return 0

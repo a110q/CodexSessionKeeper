@@ -496,17 +496,31 @@ test('ERR rollback simulation stops replacement and checks an empty port before 
 });
 
 test('replacement identities must exit rather than merely stop listening', () => {
+  const absent = runInstallerFunctions(`
+    process_identity() { return 1; }
+    wait_for_replacement_identities_to_exit $'411\\tMon Jul 21 10:00:00 2026 nginx worker'
+  `);
+  assert.equal(absent.status, 0, absent.stderr);
+
+  const stderrFailure = runInstallerFunctions(`
+    process_identity() { printf 'ps: permission denied\\n' >&2; return 1; }
+    if wait_for_replacement_identities_to_exit $'411\\tMon Jul 21 10:00:00 2026 nginx worker'; then exit 1; fi
+  `);
+  assert.equal(stderrFailure.status, 0, stderrFailure.stderr);
+  assert.match(stderrFailure.stderr, /could not inspect replacement process 411/);
+
+  const statusFailure = runInstallerFunctions(`
+    process_identity() { return 2; }
+    if wait_for_replacement_identities_to_exit $'411\\tMon Jul 21 10:00:00 2026 nginx worker'; then exit 1; fi
+  `);
+  assert.equal(statusFailure.status, 0, statusFailure.stderr);
+  assert.match(statusFailure.stderr, /could not inspect replacement process 411/);
+
   const alive = runInstallerFunctions(`
     process_identity() { printf 'Mon Jul 21 10:00:00 2026 nginx worker'; }
     if wait_for_replacement_identities_to_exit $'411\\tMon Jul 21 10:00:00 2026 nginx worker'; then exit 1; fi
   `);
   assert.equal(alive.status, 0, alive.stderr);
-
-  const exited = runInstallerFunctions(`
-    process_identity() { return 1; }
-    wait_for_replacement_identities_to_exit $'411\\tMon Jul 21 10:00:00 2026 nginx worker'
-  `);
-  assert.equal(exited.status, 0, exited.stderr);
 
   const reused = runInstallerFunctions(`
     process_identity() { printf 'Mon Jul 21 11:00:00 2026 unrelated process'; }
