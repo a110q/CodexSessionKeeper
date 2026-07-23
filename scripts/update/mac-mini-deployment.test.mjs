@@ -81,10 +81,38 @@ test('installer verifies the activated service, listener, health file, and metho
   assert.match(source, /launchctl print "system\/\$LABEL"/);
   assert.match(source, /lsof -nP -F pfn -iTCP:18080 -sTCP:LISTEN/);
   assert.match(source, /HEALTH_PATH="\/codex-session-keeper\/health\.txt"/);
-  assert.match(source, /curl --fail --silent --show-error[^\n]*"http:\/\/\$EXPECTED_IP:18080\$HEALTH_PATH"/);
-  assert.match(source, /curl --silent --show-error --output \/dev\/null --write-out '%\{http_code\}'[^\n]*-X POST/);
+  assert.match(source, /CURL_BIN="\/usr\/bin\/curl"/);
+  assert.match(source, /"\$CURL_BIN" --noproxy '\*' --connect-timeout 2 --max-time 5 --fail --silent --show-error[^\n]*"http:\/\/\$EXPECTED_IP:18080\$HEALTH_PATH"/);
+  assert.match(source, /"\$CURL_BIN" --noproxy '\*' --connect-timeout 2 --max-time 5 --silent --show-error --output \/dev\/null --write-out '%\{http_code\}'[^\n]*-X POST/);
   assert.match(source, /\[\[ "\$post_status" == "405" \]\]/);
   assert.doesNotMatch(source, /curl[^\n]*\|\| true/);
+});
+
+test('health verification bypasses inherited proxies and bounds both direct curl requests', () => {
+  const result = runInstallerFunctions(`
+    curl_log="$(mktemp)"
+    trap 'cat "$curl_log"; rm -f "$curl_log"' EXIT
+    CURL_BIN=curl_mock
+    HTTP_PROXY=http://proxy.invalid:8080
+    HTTPS_PROXY=http://proxy.invalid:8080
+    ALL_PROXY=http://proxy.invalid:8080
+    validate_listener_records() { :; }
+    curl_mock() {
+      printf '<%s>' "$@" >> "$curl_log"
+      printf '\\n' >> "$curl_log"
+      case " $* " in
+        *' -X POST '*) printf '405' ;;
+        *) printf '200' ;;
+      esac
+    }
+    verify_service
+  `);
+  assert.equal(result.status, 0, result.stderr);
+  const lines = result.stdout.trim().split('\n');
+  assert.deepEqual(lines, [
+    '<--noproxy><*><--connect-timeout><2><--max-time><5><--fail><--silent><--show-error><--output></dev/null><--write-out><%{http_code}><http://192.168.10.54:18080/codex-session-keeper/health.txt>',
+    '<--noproxy><*><--connect-timeout><2><--max-time><5><--silent><--show-error><--output></dev/null><--write-out><%{http_code}><-X><POST><http://192.168.10.54:18080/codex-session-keeper/health.txt>',
+  ]);
 });
 
 test('installer protects against a foreign listener and rolls back an updated service after activation failure', () => {

@@ -11,6 +11,7 @@ HEALTH_PATH="/codex-session-keeper/health.txt"
 MARKER_PATH="$SITE_ROOT/.codex-update-root"
 HEALTH_DEST="$SITE_ROOT$HEALTH_PATH"
 BREW_BIN="/opt/homebrew/bin/brew"
+CURL_BIN="/usr/bin/curl"
 ARCH="$(/usr/bin/uname -m)"
 
 BACKUP_CONFIG="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/codex-update-config.XXXXXX")"
@@ -381,11 +382,11 @@ die() { echo "$*" >&2; exit 2; }
 verify_service() {
   local health_status post_status
   if ! validate_listener_records; then echo "$LISTENER_VALIDATION_ERROR" >&2; return 1; fi
-  if ! health_status="$(/usr/bin/curl --fail --silent --show-error --output /dev/null --write-out '%{http_code}' "http://$EXPECTED_IP:18080$HEALTH_PATH")"; then
+  if ! health_status="$("$CURL_BIN" --noproxy '*' --connect-timeout 2 --max-time 5 --fail --silent --show-error --output /dev/null --write-out '%{http_code}' "http://$EXPECTED_IP:18080$HEALTH_PATH")"; then
     echo "health file is not readable through nginx" >&2; return 1
   fi
   [[ "$health_status" == "200" ]] || { echo "health file returned HTTP $health_status instead of 200" >&2; return 1; }
-  if ! post_status="$(/usr/bin/curl --silent --show-error --output /dev/null --write-out '%{http_code}' -X POST "http://$EXPECTED_IP:18080$HEALTH_PATH")"; then
+  if ! post_status="$("$CURL_BIN" --noproxy '*' --connect-timeout 2 --max-time 5 --silent --show-error --output /dev/null --write-out '%{http_code}' -X POST "http://$EXPECTED_IP:18080$HEALTH_PATH")"; then
     echo "POST verification request failed" >&2; return 1
   fi
   [[ "$post_status" == "405" ]] || { echo "POST returned HTTP $post_status instead of 405" >&2; return 1; }
