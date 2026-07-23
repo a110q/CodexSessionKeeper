@@ -37,3 +37,36 @@ test('installer refuses the wrong host and installs a root launch daemon', () =>
   assert.match(source, /daemon off;/);
   assert.doesNotMatch(source, /docker/i);
 });
+
+test('installer uses only Apple Silicon Homebrew and preserves the publishable site permissions', () => {
+  const source = installer();
+  assert.match(source, /ARCH="\$\(\/usr\/bin\/uname -m\)"/);
+  assert.match(source, /\[\[ "\$ARCH" == "arm64" \]\]/);
+  assert.match(source, /BREW_BIN="\/opt\/homebrew\/bin\/brew"/);
+  assert.doesNotMatch(source, /\/usr\/local\/bin\/brew/);
+  assert.match(source, /install -d -o root -g admin -m 0775/);
+  assert.match(source, /SITE_ROOT/);
+  assert.doesNotMatch(source, /chmod[^\n]*(?:0755|0700).*SITE_ROOT/);
+  assert.doesNotMatch(source, /chmod[^\n]*-N/);
+});
+
+test('installer verifies the activated service, listener, health file, and method protection without swallowing failures', () => {
+  const source = installer();
+  assert.match(source, /launchctl print "system\/\$LABEL"/);
+  assert.match(source, /lsof -nP -t -iTCP@"\$EXPECTED_IP":18080 -sTCP:LISTEN/);
+  assert.match(source, /HEALTH_PATH="\/codex-session-keeper\/health\.txt"/);
+  assert.match(source, /curl --fail --silent --show-error[^\n]*"http:\/\/\$EXPECTED_IP:18080\$HEALTH_PATH"/);
+  assert.match(source, /curl --silent --show-error --output \/dev\/null --write-out '%\{http_code\}'[^\n]*-X POST/);
+  assert.match(source, /\[\[ "\$post_status" != "405" \]\]/);
+  assert.doesNotMatch(source, /curl[^\n]*\|\| true/);
+});
+
+test('installer protects against a foreign listener and rolls back an updated service after activation failure', () => {
+  const source = installer();
+  assert.match(source, /existing service does not own 192\.168\.10\.54:18080/);
+  assert.match(source, /BACKUP_CONFIG/);
+  assert.match(source, /BACKUP_PLIST/);
+  assert.match(source, /rollback\(\)/);
+  assert.match(source, /installed \$LABEL/);
+  assert.match(source, /verify_service/);
+});
