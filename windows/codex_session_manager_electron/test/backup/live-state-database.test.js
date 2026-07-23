@@ -81,7 +81,7 @@ function acquireWriteLock(databasePath, sql) {
     child.on('close', (status) => {
       if (!acquired) reject(new Error(stderr || `sqlite3 exited ${status} before acquiring lock`));
     });
-    child.stdin.write(`.bail on\nBEGIN IMMEDIATE;\n${sql}\nSELECT 'LOCKED';\n`);
+    child.stdin.write(`.bail on\n.timeout 5000\nBEGIN IMMEDIATE;\n${sql}\nSELECT 'LOCKED';\n`);
   });
 }
 
@@ -136,7 +136,7 @@ test('mergeStateDatabase waits for a concurrent Codex commit and preserves both 
     new Set(['snapshot-session']),
     { sqlitePath }
   );
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await new Promise((resolve) => setTimeout(resolve, 0));
   const [releaseResult, mergeResult] = await Promise.allSettled([
     lock.release(),
     mergePromise,
