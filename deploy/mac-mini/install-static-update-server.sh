@@ -21,19 +21,47 @@ HAD_PLIST=0
 HAD_JOB=0
 DEPLOYING=0
 ROLLING_BACK=0
+REPLACEMENT_JOB_STARTED=0
+REPLACEMENT_MASTER_PID=""
 
 cleanup() {
   /bin/rm -f "$BACKUP_CONFIG" "$BACKUP_PLIST" "$MARKER_TEMP" "$HEALTH_TEMP" "$PLIST_TEMP"
 }
 
 run_lsof() { sudo /usr/sbin/lsof -nP -F pfn -iTCP:18080 -sTCP:LISTEN; }
-run_launchctl_print() { sudo /bin/launchctl print "system/$LABEL"; }
+run_launchctl_print() { sudo /bin/launchctl print "system/$LABEL" 2>&1; }
 run_launchctl_bootout() { sudo /bin/launchctl bootout "system/$LABEL"; }
 run_launchctl_bootstrap() { sudo /bin/launchctl bootstrap system "$PLIST_DEST"; }
 run_launchctl_enable() { sudo /bin/launchctl enable "system/$LABEL"; }
 run_launchctl_kickstart() { sudo /bin/launchctl kickstart -k "system/$LABEL"; }
 process_command() { sudo /bin/ps -p "$1" -o command=; }
 process_parent_pid() { sudo /bin/ps -p "$1" -o ppid= | /usr/bin/tr -d '[:space:]'; }
+
+inspect_launchd_job() {
+  local output status
+  LAUNCHD_JOB_PRESENT=0
+  LAUNCHD_JOB_OUTPUT=""
+  LAUNCHD_INSPECTION_ERROR=""
+  if output="$(run_launchctl_print)"; then
+    LAUNCHD_JOB_PRESENT=1
+    LAUNCHD_JOB_OUTPUT="$output"
+    return 0
+  else
+    status=$?
+  fi
+  LAUNCHD_JOB_OUTPUT="$output"
+  if [[ "$output" == *"Could not find service"* || "$output" == *"Could not find the service"* ]]; then
+    return 0
+  fi
+  LAUNCHD_INSPECTION_ERROR="could not inspect launchd job $LABEL (launchctl status $status): $output"
+  echo "$LAUNCHD_INSPECTION_ERROR" >&2
+  return "$status"
+}
+
+snapshot_existing_job() {
+  inspect_launchd_job || return 1
+  HAD_JOB="$LAUNCHD_JOB_PRESENT"
+}
 
 listener_records() {
   local output status line pid="" endpoint=""
@@ -59,14 +87,18 @@ listener_records() {
 listener_pids() { listener_records | /usr/bin/awk -F '\t' '!seen[$1]++ { print $1 }'; }
 
 launchd_master_pid() {
-  local job state pid
+  local state pid
   LAUNCHD_MASTER_PID=""
-  if ! job="$(run_launchctl_print)"; then
+  if ! inspect_launchd_job; then
+    LISTENER_VALIDATION_ERROR="$LAUNCHD_INSPECTION_ERROR"
+    return 1
+  fi
+  if [[ "$LAUNCHD_JOB_PRESENT" -eq 0 ]]; then
     LISTENER_VALIDATION_ERROR="launchd job is not loaded"
     return 1
   fi
-  state="$(/usr/bin/awk -F ' = ' '/^[[:space:]]*state = / { print $2; exit }' <<<"$job")"
-  pid="$(/usr/bin/awk -F ' = ' '/^[[:space:]]*pid = / { print $2; exit }' <<<"$job")"
+  state="$(/usr/bin/awk -F ' = ' '/^[[:space:]]*state = / { print $2; exit }' <<<"$LAUNCHD_JOB_OUTPUT")"
+  pid="$(/usr/bin/awk -F ' = ' '/^[[:space:]]*pid = / { print $2; exit }' <<<"$LAUNCHD_JOB_OUTPUT")"
   [[ "$state" == "running" ]] || { LISTENER_VALIDATION_ERROR="launchd job is not running"; return 1; }
   [[ "$pid" =~ ^[0-9]+$ ]] || { LISTENER_VALIDATION_ERROR="launchd job has no master PID"; return 1; }
   LAUNCHD_MASTER_PID="$pid"
@@ -90,6 +122,9 @@ validate_listener_records() {
   [[ -n "$records" ]] || { LISTENER_VALIDATION_ERROR="nginx is not listening on $EXPECTED_IP:18080"; return 1; }
   launchd_master_pid || return 1
   master_pid="$LAUNCHD_MASTER_PID"
+  if [[ "$REPLACEMENT_JOB_STARTED" -eq 1 ]]; then
+    REPLACEMENT_MASTER_PID="$master_pid"
+  fi
   master_command="$(process_command "$master_pid")" || { LISTENER_VALIDATION_ERROR="could not inspect launchd master PID $master_pid"; return 1; }
   [[ "$master_command" == *"$NGINX_BIN"* && "$master_command" == *"$CONFIG_DEST"* ]] || {
     LISTENER_VALIDATION_ERROR="launchd master is not this update nginx"; return 1;
@@ -124,20 +159,16 @@ wait_for_listener_to_stop() {
 }
 
 stop_service() {
-  local records job_status job_loaded=0
-  if run_launchctl_print >/dev/null; then
-    job_loaded=1
-  else
-    job_status=$?
-  fi
+  local records
+  inspect_launchd_job || return 1
   records="$(listener_records)" || return 1
   if [[ -n "$records" ]] && ! validate_listener_records; then
     echo "refusing to stop listener: $LISTENER_VALIDATION_ERROR" >&2
     return 1
   fi
-  if [[ "$job_loaded" -eq 0 ]]; then
+  if [[ "$LAUNCHD_JOB_PRESENT" -eq 0 ]]; then
     [[ -z "$records" ]] && return 0
-    echo "could not inspect launchd job $LABEL (launchctl status $job_status)" >&2
+    echo "launchd job $LABEL is absent while port 18080 is still listening" >&2
     return 1
   fi
   if ! run_launchctl_bootout; then
@@ -145,6 +176,71 @@ stop_service() {
     return 1
   fi
   wait_for_listener_to_stop
+}
+
+launchd_job_pid() {
+  /usr/bin/awk -F ' = ' '/^[[:space:]]*pid = / { print $2; exit }' <<<"$LAUNCHD_JOB_OUTPUT"
+}
+
+wait_for_launchd_job_absent() {
+  local attempt
+  for attempt in {1..50}; do
+    inspect_launchd_job || return 1
+    [[ "$LAUNCHD_JOB_PRESENT" -eq 0 ]] && return 0
+    /bin/sleep 0.1
+  done
+  echo "replacement launchd job did not unload" >&2
+  return 1
+}
+
+replacement_listener_pids() {
+  local master_pid="$1" records pid endpoint
+  [[ "$master_pid" =~ ^[0-9]+$ ]] || return 0
+  records="$(listener_records)" || return 1
+  while IFS=$'\t' read -r pid endpoint; do
+    [[ -n "$pid" ]] || continue
+    if [[ "$pid" == "$master_pid" ]] || is_descended_from_master "$pid" "$master_pid"; then
+      /usr/bin/printf '%s\n' "$pid"
+    fi
+  done <<<"$records"
+}
+
+wait_for_listener_pids_to_exit() {
+  local expected_pids="$1" attempt records current_pids pid still_listening
+  [[ -n "$expected_pids" ]] || return 0
+  for attempt in {1..50}; do
+    records="$(listener_records)" || return 1
+    current_pids="$(/usr/bin/awk -F '\t' '{ print $1 }' <<<"$records")"
+    still_listening=0
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      if /usr/bin/grep -Fxq "$pid" <<<"$current_pids"; then
+        still_listening=1
+        break
+      fi
+    done <<<"$expected_pids"
+    [[ "$still_listening" -eq 0 ]] && return 0
+    /bin/sleep 0.1
+  done
+  echo "replacement listener processes did not exit" >&2
+  return 1
+}
+
+stop_replacement_service() {
+  local master_pid="$REPLACEMENT_MASTER_PID" replacement_pids=""
+  inspect_launchd_job || return 1
+  if [[ "$LAUNCHD_JOB_PRESENT" -eq 1 ]]; then
+    master_pid="$(launchd_job_pid)"
+    replacement_pids="$(replacement_listener_pids "$master_pid")" || return 1
+    if ! run_launchctl_bootout; then
+      echo "could not bootout replacement $LABEL" >&2
+      return 1
+    fi
+  elif [[ -n "$master_pid" ]]; then
+    replacement_pids="$(replacement_listener_pids "$master_pid")" || return 1
+  fi
+  wait_for_launchd_job_absent || return 1
+  wait_for_listener_pids_to_exit "$replacement_pids"
 }
 
 restore_config() {
@@ -171,7 +267,15 @@ rollback() {
   local failed=0
   [[ "$DEPLOYING" -eq 1 && "$ROLLING_BACK" -eq 0 ]] || return 0
   ROLLING_BACK=1
-  if ! stop_service; then echo "rollback failed: could not stop replacement service" >&2; failed=1; fi
+  if [[ "$REPLACEMENT_JOB_STARTED" -eq 1 ]]; then
+    if ! stop_replacement_service; then
+      echo "rollback failed: could not stop replacement service" >&2
+      return 1
+    fi
+  elif ! stop_service; then
+    echo "rollback failed: could not stop replacement service" >&2
+    return 1
+  fi
   if ! restore_config; then echo "rollback failed: could not restore nginx configuration" >&2; failed=1; fi
   if ! restore_plist; then echo "rollback failed: could not restore launchd plist" >&2; failed=1; fi
   if [[ "$HAD_JOB" -eq 1 ]] && ! restart_prior_service; then echo "rollback failed: could not restart prior launchd job" >&2; failed=1; fi
@@ -233,9 +337,7 @@ if [[ -f "$PLIST_DEST" ]]; then
   sudo /bin/cp "$PLIST_DEST" "$BACKUP_PLIST"
   HAD_PLIST=1
 fi
-if sudo /bin/launchctl print "system/$LABEL" >/dev/null 2>&1; then
-  HAD_JOB=1
-fi
+snapshot_existing_job || die "$LAUNCHD_INSPECTION_ERROR"
 DEPLOYING=1
 
 sudo /usr/bin/install -d -o root -g admin -m 0775 \
@@ -268,11 +370,12 @@ sudo /usr/bin/install -o root -g wheel -m 0644 "$SCRIPT_DIR/nginx.conf" "$CONFIG
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string /var/log/codex-update-launchd-error.log" "$PLIST_TEMP"
 
 sudo "$NGINX_BIN" -t -c "$CONFIG_DEST"
-if sudo /bin/launchctl print "system/$LABEL" >/dev/null 2>&1; then
+if [[ "$HAD_JOB" -eq 1 ]]; then
   stop_service
 fi
 sudo /usr/bin/install -o root -g wheel -m 0644 "$PLIST_TEMP" "$PLIST_DEST"
 sudo /bin/launchctl bootstrap system "$PLIST_DEST"
+REPLACEMENT_JOB_STARTED=1
 sudo /bin/launchctl enable "system/$LABEL"
 sudo /bin/launchctl kickstart -k "system/$LABEL"
 wait_for_service

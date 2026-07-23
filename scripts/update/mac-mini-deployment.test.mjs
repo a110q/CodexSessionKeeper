@@ -30,7 +30,7 @@ ${body}`,
       helperPath,
     ], {
       encoding: 'utf8',
-      env: { ...process.env, ...env },
+      env: { ...process.env, TMPDIR: tempDir, ...env },
     });
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
@@ -211,4 +211,172 @@ test('service stop unloads a loaded job even when it has already lost its listen
   `);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /bootout-called/);
+});
+
+test('rollback stops a known replacement after listener validation fails before restoring files', () => {
+  const result = runInstallerFunctions(`
+    lsof_counter="$(mktemp)"
+    launchctl_counter="$(mktemp)"
+    trap 'rm -f "$lsof_counter" "$launchctl_counter"' EXIT
+    run_lsof() {
+      calls="$(wc -l < "$lsof_counter")"
+      printf 'x\\n' >> "$lsof_counter"
+      if [[ "$calls" -lt 51 ]]; then
+        printf 'p410\\nf8\\nn*:18080\\n'
+      else
+        return 1
+      fi
+    }
+    run_launchctl_print() {
+      calls="$(wc -l < "$launchctl_counter")"
+      printf 'x\\n' >> "$launchctl_counter"
+      if [[ "$calls" -lt 51 ]]; then
+        printf 'state = running\\npid = 410\\n'
+      else
+        printf 'Could not find service "%s" in domain for system\\n' "$LABEL"
+        return 1
+      fi
+    }
+    run_launchctl_bootout() { printf 'bootout-replacement\\n'; }
+    process_command() { printf '%s -c %s' "$NGINX_BIN" "$CONFIG_DEST"; }
+    process_parent_pid() { printf '1'; }
+    restore_config() { printf 'restore-config\\n'; }
+    restore_plist() { printf 'restore-plist\\n'; }
+    verify_rollback_restoration() { printf 'verify-restore\\n'; }
+    DEPLOYING=1
+    REPLACEMENT_JOB_STARTED=1
+    HAD_JOB=0
+    if wait_for_service; then exit 1; fi
+    rollback
+  `);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /bootout-replacement/);
+  assert.match(result.stdout, /restore-config/);
+  assert.match(result.stdout, /verify-restore/);
+});
+
+test('launchctl inspection distinguishes present jobs, explicit absence, and operational failures', () => {
+  const running = runInstallerFunctions(`
+    run_launchctl_print() { printf 'state = running\\npid = 410\\n'; }
+    inspect_launchd_job
+    [[ "$LAUNCHD_JOB_PRESENT" == 1 ]]
+    grep -F 'state = running' <<<"$LAUNCHD_JOB_OUTPUT"
+  `);
+  assert.equal(running.status, 0, running.stderr);
+
+  const exited = runInstallerFunctions(`
+    run_launchctl_print() { printf 'state = exited\\npid = 410\\n'; }
+    inspect_launchd_job
+    [[ "$LAUNCHD_JOB_PRESENT" == 1 ]]
+  `);
+  assert.equal(exited.status, 0, exited.stderr);
+
+  const absent = runInstallerFunctions(`
+    run_launchctl_print() {
+      printf 'Could not find service "%s" in domain for system\\n' "$LABEL"
+      return 1
+    }
+    inspect_launchd_job
+    [[ "$LAUNCHD_JOB_PRESENT" == 0 ]]
+  `);
+  assert.equal(absent.status, 0, absent.stderr);
+
+  const operationalFailure = runInstallerFunctions(`
+    run_launchctl_print() { printf 'launchctl: permission denied\\n'; return 1; }
+    if inspect_launchd_job; then exit 1; fi
+    grep -F 'could not inspect launchd job' <<<"$LAUNCHD_INSPECTION_ERROR"
+  `);
+  assert.equal(operationalFailure.status, 0, operationalFailure.stderr);
+});
+
+test('job snapshot and preflight stop preserve present states and reject launchctl operational failures', () => {
+  const exited = runInstallerFunctions(`
+    run_launchctl_print() { printf 'state = exited\\npid = 410\\n'; }
+    snapshot_existing_job
+    [[ "$HAD_JOB" == 1 ]]
+  `);
+  assert.equal(exited.status, 0, exited.stderr);
+
+  const absent = runInstallerFunctions(`
+    run_launchctl_print() { printf 'Could not find service "%s" in domain for system\\n' "$LABEL"; return 1; }
+    snapshot_existing_job
+    [[ "$HAD_JOB" == 0 ]]
+  `);
+  assert.equal(absent.status, 0, absent.stderr);
+
+  const preflightFailure = runInstallerFunctions(`
+    run_lsof() { return 1; }
+    run_launchctl_print() { printf 'launchctl: permission denied\\n'; return 1; }
+    if stop_service; then exit 1; fi
+  `);
+  assert.equal(preflightFailure.status, 0, preflightFailure.stderr);
+
+  const snapshotFailure = runInstallerFunctions(`
+    run_launchctl_print() { printf 'launchctl: permission denied\\n'; return 1; }
+    if snapshot_existing_job; then exit 1; fi
+  `);
+  assert.equal(snapshotFailure.status, 0, snapshotFailure.stderr);
+});
+
+test('replacement rollback checks a captured master after its launchd label is already absent', () => {
+  const result = runInstallerFunctions(`
+    lsof_counter="$(mktemp)"
+    launchctl_counter="$(mktemp)"
+    trap 'rm -f "$lsof_counter" "$launchctl_counter"' EXIT
+    run_lsof() {
+      calls="$(wc -l < "$lsof_counter")"
+      printf 'x\\n' >> "$lsof_counter"
+      if [[ "$calls" -eq 0 ]]; then
+        printf 'p410\\nf8\\nn192.168.10.54:18080\\n'
+      else
+        printf 'replacement-listener-checked\\n' >&2
+        return 1
+      fi
+    }
+    run_launchctl_print() {
+      calls="$(wc -l < "$launchctl_counter")"
+      printf 'x\\n' >> "$launchctl_counter"
+      if [[ "$calls" -eq 0 ]]; then
+        printf 'state = running\\npid = 410\\n'
+      else
+        printf 'Could not find service "%s" in domain for system\\n' "$LABEL"
+        return 1
+      fi
+    }
+    process_command() { printf '%s -c %s' "$NGINX_BIN" "$CONFIG_DEST"; }
+    process_parent_pid() { printf '1'; }
+    REPLACEMENT_JOB_STARTED=1
+    validate_listener_records
+    stop_replacement_service
+  `);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /replacement-listener-checked/);
+});
+
+test('replacement stop waits for listener PIDs captured before the master can be reparented', () => {
+  const result = runInstallerFunctions(`
+    booted_marker="$(mktemp)"
+    launchctl_counter="$(mktemp)"
+    rm -f "$booted_marker"
+    trap 'rm -f "$booted_marker" "$launchctl_counter"' EXIT
+    run_lsof() { printf 'p411\\nf8\\nn192.168.10.54:18080\\n'; }
+    run_launchctl_print() {
+      calls="$(wc -l < "$launchctl_counter")"
+      printf 'x\\n' >> "$launchctl_counter"
+      if [[ "$calls" -eq 0 ]]; then
+        printf 'state = running\\npid = 410\\n'
+      else
+        printf 'Could not find service "%s" in domain for system\\n' "$LABEL"
+        return 1
+      fi
+    }
+    run_launchctl_bootout() { : > "$booted_marker"; }
+    process_parent_pid() {
+      [[ -e "$booted_marker" ]] && printf '1' || printf '410'
+    }
+    REPLACEMENT_JOB_STARTED=1
+    if stop_replacement_service; then exit 1; fi
+  `);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /replacement listener processes did not exit/);
 });
