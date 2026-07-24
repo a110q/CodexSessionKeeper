@@ -59,3 +59,10 @@ test('publisher exposes release.json before replacing the employee page', () => 
   assert.ok(pageBuildIndex > manifestIndex);
   assert.ok(pagePublishIndex > pageBuildIndex);
 });
+
+test('candidate publication cannot replace the employee page', () => {
+  const source = readFileSync(publishScriptPath, 'utf8');
+  assert.match(source, /--candidate/);
+  assert.match(source, /PUBLISH_PAGE=0/);
+  assert.match(source, /if \[\[ "\$PUBLISH_PAGE" == 1 \]\]/);
+});

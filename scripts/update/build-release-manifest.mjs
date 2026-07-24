@@ -17,7 +17,11 @@ import {
   stableManifestBytes,
   validateManifest,
 } from './release-manifest.mjs';
-import { UPDATE_SERVER } from './update-server.mjs';
+import {
+  UPDATE_SERVER,
+  UPDATE_SERVERS,
+  updateServerForScope,
+} from './update-server.mjs';
 import { verifyReleaseDirectory } from './verify-release-directory.mjs';
 
 const MODULE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
@@ -39,10 +43,10 @@ async function requireRegularAbsoluteFile(filePath, label) {
   }
 }
 
-async function defaultGenerateAppcast({ macDirectory }) {
+async function defaultGenerateAppcast({ downloadPrefix, macDirectory }) {
   execFileSync(SPARKLE_APPCAST_TOOL, [
     '--account', 'local.codex.session-manager',
-    '--download-url-prefix', UPDATE_SERVER.macDownloadPrefix,
+    '--download-url-prefix', downloadPrefix,
     macDirectory,
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 }
@@ -57,10 +61,14 @@ export async function assembleRelease({
   output,
   publishedAt = new Date().toISOString(),
   sparklePublicKeyBase64,
+  updateServer = UPDATE_SERVER,
   version,
   windowsExe,
   windowsYml,
 }) {
+  if (![UPDATE_SERVERS.stable, UPDATE_SERVERS.testing].includes(updateServer)) {
+    throw new Error('updateServer must be a declared stable or testing server');
+  }
   if (typeof version !== 'string' || !VERSION.test(version)) {
     throw new Error('version must use numeric X.Y.Z format');
   }
@@ -105,9 +113,13 @@ export async function assembleRelease({
 
   await mkdir(path.dirname(output), { recursive: true });
   await mkdir(output);
-  const stableRoot = path.join(output, 'codex-session-keeper', 'stable');
-  const macDirectory = path.join(stableRoot, 'macos');
-  const windowsDirectory = path.join(stableRoot, 'windows');
+  const releaseRoot = path.join(
+    output,
+    'codex-session-keeper',
+    updateServer.scope,
+  );
+  const macDirectory = path.join(releaseRoot, 'macos');
+  const windowsDirectory = path.join(releaseRoot, 'windows');
   await mkdir(macDirectory, { recursive: true });
   await mkdir(windowsDirectory, { recursive: true });
   const stagedMacZip = path.join(macDirectory, macName);
@@ -119,6 +131,7 @@ export async function assembleRelease({
   const zipBytes = await readFile(stagedMacZip);
   await generateAppcast({
     build,
+    downloadPrefix: updateServer.macDownloadPrefix,
     macDirectory,
     version,
     zipBytes,
@@ -147,19 +160,23 @@ export async function assembleRelease({
   });
   const manifestBytes = stableManifestBytes(manifest);
   const signature = signManifest(manifestBytes, manifestPrivateKey);
-  await writeFile(path.join(stableRoot, 'release.json'), manifestBytes, { flag: 'wx', mode: 0o644 });
-  await writeFile(path.join(stableRoot, 'release.json.sig'), `${signature}\n`, { flag: 'wx', mode: 0o644 });
+  await writeFile(path.join(releaseRoot, 'release.json'), manifestBytes, { flag: 'wx', mode: 0o644 });
+  await writeFile(path.join(releaseRoot, 'release.json.sig'), `${signature}\n`, { flag: 'wx', mode: 0o644 });
 
-  const verified = await verifyReleaseDirectory(stableRoot, manifestPublicKey, {
+  const verified = await verifyReleaseDirectory(releaseRoot, manifestPublicKey, {
     sparklePublicKeyBase64: sparklePublicKey,
   });
-  return { stableRoot, verified };
+  return {
+    releaseRoot,
+    stableRoot: releaseRoot,
+    verified,
+  };
 }
 
 function parseArguments(argv) {
   const allowed = new Set([
     '--version', '--build', '--mac-zip', '--windows-exe',
-    '--windows-yml', '--notes-file', '--output',
+    '--windows-yml', '--notes-file', '--output', '--server-scope',
   ]);
   if (argv.length !== allowed.size * 2) throw new Error('all release arguments are required');
   const values = {};
@@ -185,11 +202,12 @@ async function runCLI() {
     macZip: args['--mac-zip'],
     notesFile: args['--notes-file'],
     output: args['--output'],
+    updateServer: updateServerForScope(args['--server-scope']),
     version: args['--version'],
     windowsExe: args['--windows-exe'],
     windowsYml: args['--windows-yml'],
   });
-  process.stdout.write(`${JSON.stringify(result.verified)}\n${result.stableRoot}\n`);
+  process.stdout.write(`${JSON.stringify(result.verified)}\n${result.releaseRoot}\n`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

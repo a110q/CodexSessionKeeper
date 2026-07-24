@@ -10,7 +10,7 @@ import {
   validateManifest,
   verifyManifest,
 } from './release-manifest.mjs';
-import { UPDATE_SERVER } from './update-server.mjs';
+import { updateServerForScope } from './update-server.mjs';
 
 const MODULE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(MODULE_DIRECTORY, '..', '..');
@@ -58,6 +58,7 @@ async function verifyAppcast({
   appcastPath,
   build,
   macZipPath,
+  macDownloadPrefix,
   sparklePublicKeyBase64,
   version,
 }) {
@@ -95,7 +96,7 @@ async function verifyAppcast({
 
   const attributes = enclosureAttributes(item);
   const zipName = path.basename(macZipPath);
-  if (attributes.url !== `${UPDATE_SERVER.macDownloadPrefix}${zipName}`) {
+  if (attributes.url !== `${macDownloadPrefix}${zipName}`) {
     throw releaseError('appcast enclosure URL does not match the macOS artifact');
   }
   const metadata = await stat(macZipPath);
@@ -152,6 +153,12 @@ export async function verifyReleaseDirectory(
   const stableRoot = await realpath(root);
   const rootMetadata = await stat(stableRoot);
   if (!rootMetadata.isDirectory()) throw releaseError('staging root must be a directory');
+  let updateServer;
+  try {
+    updateServer = updateServerForScope(path.basename(stableRoot));
+  } catch {
+    throw releaseError('staging root must end in a declared stable or testing scope');
+  }
 
   const defaults = manifestPublicKeyBase64 && sparklePublicKeyBase64
     ? null
@@ -202,6 +209,7 @@ export async function verifyReleaseDirectory(
   await verifyAppcast({
     appcastPath: path.join(stableRoot, 'macos', 'appcast.xml'),
     build: manifest.build,
+    macDownloadPrefix: updateServer.macDownloadPrefix,
     macZipPath,
     sparklePublicKeyBase64: sparklePublicKey,
     version: manifest.version,

@@ -20,7 +20,7 @@ import {
   verifyManifest,
 } from './release-manifest.mjs';
 import { assembleRelease } from './build-release-manifest.mjs';
-import { UPDATE_SERVER } from './update-server.mjs';
+import { UPDATE_SERVER, updateServerForScope } from './update-server.mjs';
 import { verifyReleaseDirectory } from './verify-release-directory.mjs';
 
 function fixture() {
@@ -194,10 +194,17 @@ function ephemeralKey() {
   };
 }
 
-function signedAppcast({ version, build, zipName, zipBytes, privateKeyPem }) {
+function signedAppcast({
+  version,
+  build,
+  zipName,
+  zipBytes,
+  privateKeyPem,
+  downloadPrefix = UPDATE_SERVER.macDownloadPrefix,
+}) {
   const enclosureSignature = signManifest(zipBytes, privateKeyPem);
   const prefix = Buffer.from(
-    `<?xml version="1.0" standalone="yes"?><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item><title>${version}</title><sparkle:version>${build}</sparkle:version><sparkle:shortVersionString>${version}</sparkle:shortVersionString><enclosure url="${UPDATE_SERVER.macDownloadPrefix}${zipName}" length="${zipBytes.length}" type="application/octet-stream" sparkle:edSignature="${enclosureSignature}"></enclosure></item></channel></rss>`,
+    `<?xml version="1.0" standalone="yes"?><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item><title>${version}</title><sparkle:version>${build}</sparkle:version><sparkle:shortVersionString>${version}</sparkle:shortVersionString><enclosure url="${downloadPrefix}${zipName}" length="${zipBytes.length}" type="application/octet-stream" sparkle:edSignature="${enclosureSignature}"></enclosure></item></channel></rss>`,
   );
   const feedSignature = signManifest(prefix, privateKeyPem);
   return Buffer.concat([
@@ -311,6 +318,49 @@ test('assembles signed release metadata with actual artifact hashes', async () =
       manifestKey.publicKeyBase64,
       { sparklePublicKeyBase64: sparkleKey.publicKeyBase64 },
     ), { verified: true, version: '1.1.0', build: 10100 });
+
+    const candidateOutput = path.join(root, 'candidate-output');
+    const candidate = await assembleRelease({
+      build: 10100,
+      generateAppcast: async ({
+        downloadPrefix,
+        macDirectory,
+        zipName,
+        zipBytes,
+      }) => {
+        await writeFile(
+          path.join(macDirectory, 'appcast.xml'),
+          signedAppcast({
+            version: '1.1.0',
+            build: 10100,
+            zipName,
+            zipBytes,
+            privateKeyPem: sparkleKey.privateKeyPem,
+            downloadPrefix,
+          }),
+        );
+      },
+      macZip,
+      manifestPrivateKeyPem: manifestKey.privateKeyPem,
+      manifestPublicKeyBase64: manifestKey.publicKeyBase64,
+      notesFile,
+      output: candidateOutput,
+      publishedAt: '2026-07-21T00:00:00Z',
+      sparklePublicKeyBase64: sparkleKey.publicKeyBase64,
+      updateServer: updateServerForScope('testing'),
+      version: '1.1.0',
+      windowsExe,
+      windowsYml,
+    });
+    const appcast = await readFile(
+      path.join(candidate.releaseRoot, 'macos', 'appcast.xml'),
+      'utf8',
+    );
+    assert.match(
+      appcast,
+      /http:\/\/192\.168\.10\.54:18080\/codex-session-keeper\/testing\/macos\//,
+    );
+    assert.doesNotMatch(appcast, /\/stable\/macos\//);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
