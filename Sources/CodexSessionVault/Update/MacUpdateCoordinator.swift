@@ -135,7 +135,10 @@ final class MacUpdateCoordinator: ObservableObject {
     }
 
     func beginDownload() {
-        guard case .available(let version, _) = state else { return }
+        guard MacUpdateConsentPolicy.allows(.beginDownload, in: state),
+              case .available(let version, _) = state else {
+            return
+        }
         guard updaterStartError == nil else {
             transition(.failed(message: "更新功能配置失败，请联系管理员"), present: true)
             return
@@ -160,7 +163,10 @@ final class MacUpdateCoordinator: ObservableObject {
     }
 
     func restartAndInstall() async {
-        guard case .ready(let version) = state else { return }
+        guard MacUpdateConsentPolicy.allows(.restartAndInstall, in: state),
+              case .ready(let version) = state else {
+            return
+        }
         guard await model.prepareForUpdate(timeout: .seconds(5)) else {
             transition(
                 .failed(message: "备份仍在写入，已取消更新重启，请稍后重试"),
