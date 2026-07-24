@@ -6,8 +6,9 @@ Codex 会话管理当前包含两个桌面实现：
 
 - Windows Electron 应用已经通过公司内网 Mac mini 静态服务器完成
   `1.0.99 → 1.1.0` 更新验证。
-- macOS 原生 SwiftUI 应用已有 `1.0.14` DMG，但源码中尚未集成应用内更新，
-  现有安装包只能由员工手动下载和覆盖安装。
+- macOS 原生 SwiftUI 应用已有 `1.0.14` DMG。自动更新分支中已经包含 Sparkle 2、
+  员工确认式更新界面、EdDSA 清单校验和静态发布工具，但尚未在最新同步提交上完成
+  macOS 双版本构建与实机升级验证；现有已交付 DMG 仍只能由员工手动覆盖安装。
 
 公司更新服务器位于 `192.168.10.54:18080`，使用 Homebrew Nginx 提供静态文件。
 公司 Mac 均为 Apple Silicon（M 系列）。本项目不申请 Apple Developer ID，不做
@@ -15,7 +16,7 @@ Apple 公证，接受首次安装时可能出现的 Gatekeeper 提示。
 
 ## 目标
 
-为 macOS 原生应用增加与 Windows 一致的员工确认式内网更新体验：
+完成并验证 macOS 原生应用中与 Windows 一致的员工确认式内网更新体验：
 
 1. 应用启动后自动检查更新，但不自动下载。
 2. 发现新版本时显示版本号和更新说明。
@@ -35,14 +36,33 @@ Apple 公证，接受首次安装时可能出现的 Gatekeeper 提示。
 
 ## 方案选择
 
-采用 Sparkle 2 的标准更新控制器和标准用户界面。
+保留自动更新分支已经采用的 Sparkle 2 更新控制器和自定义 SwiftUI 员工确认界面。
+Sparkle 的用户驱动负责下载、提取、签名验证和安装事件，应用界面负责“稍后提醒”、
+“立即更新”、“稍后重启”和“重启并更新”交互。
 
 未选择自行开发更新器，因为自行处理包替换、权限提升、签名验证、失败恢复和重启
 会显著增加安全与维护风险。未选择仅提供 DMG，因为这不能满足应用内发现和确认更新
 的目标。
 
-Sparkle 依赖使用实施时确认的稳定 Sparkle 2.x 版本，并在 Swift Package 解析结果中
-固定具体版本。升级 Sparkle 必须作为独立变更重新测试。
+当前分支将 Sparkle 固定为 `2.9.4`。本轮保持该版本不变；升级 Sparkle 必须作为
+独立变更重新测试。
+
+## 现有实现基线
+
+自动更新分支已经包含：
+
+- `MacUpdateCoordinator`：定时检查、版本匹配、下载、备份排空和重启安装协调；
+- `SparkleUpdateDriver`：把 Sparkle 下载与安装回调转交给应用状态机；
+- `UpdatePromptView`：员工确认、下载进度、重启确认和错误提示；
+- `ReleaseManifest` 与 `UpdateCheckClient`：签名发布清单和平台产物校验；
+- `scripts/build_app.sh`：Sparkle 框架嵌入、固定内网地址和 ad-hoc 签名；
+- `build-release-manifest.mjs`、`verify-release-directory.mjs` 和
+  `publish-release.sh`：跨平台发布组装、校验和原子发布；
+- `build-download-page.mjs`：员工下载首页生成。
+
+本轮实施以同步后的最新远端提交为准，不重新实现这些组件。只有自动化测试证明存在
+缺口时才修改对应逻辑。已知需要补齐的交付缺口是：独立候选路径、正式 DMG 产物、
+员工确认门禁回归测试以及 macOS `1.0.99 → 1.1.0` 实机验证。
 
 ## 应用架构
 
