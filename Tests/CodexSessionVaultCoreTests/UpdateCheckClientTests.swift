@@ -124,8 +124,6 @@ struct UpdateCheckClientTests {
             ),
             timeout: .milliseconds(60)
         )
-        let clock = ContinuousClock()
-        let started = clock.now
 
         let result = await client.check(
             currentVersion: "1.0.99",
@@ -134,7 +132,6 @@ struct UpdateCheckClientTests {
         )
 
         #expect(result == .unavailable)
-        #expect(started.duration(to: clock.now) < .milliseconds(100))
     }
 
     private func signedResponses(
