@@ -17,4 +17,34 @@ public enum MacUpdateConsentPolicy {
             return false
         }
     }
+
+    @MainActor
+    @discardableResult
+    public static func perform(
+        _ action: MacUpdateUserAction,
+        in state: UpdatePresentationState,
+        confirmation: () -> Bool,
+        operation: () -> Void
+    ) -> Bool {
+        guard allows(action, in: state), confirmation() else {
+            return false
+        }
+        operation()
+        return true
+    }
+
+    @MainActor
+    @discardableResult
+    public static func performAsync(
+        _ action: MacUpdateUserAction,
+        in state: UpdatePresentationState,
+        confirmation: () -> Bool,
+        operation: () async -> Void
+    ) async -> Bool {
+        guard allows(action, in: state), confirmation() else {
+            return false
+        }
+        await operation()
+        return true
+    }
 }

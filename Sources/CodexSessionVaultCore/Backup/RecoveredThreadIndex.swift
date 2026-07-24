@@ -336,12 +336,11 @@ private struct RecoveredJSONLMetadata {
 }
 
 private func extractRecoveredJSONLMetadata(from url: URL) throws -> RecoveredJSONLMetadata {
-    let data = try Data(contentsOf: url)
-    let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+    let lines = try firstRecoveredJSONLLines(from: url)
     var metadata = RecoveredJSONLMetadata()
 
-    for rawLine in lines.prefix(400) {
-        guard let object = try? JSONSerialization.jsonObject(with: Data(rawLine)) as? [String: Any] else {
+    for rawLine in lines {
+        guard let object = try? JSONSerialization.jsonObject(with: rawLine) as? [String: Any] else {
             continue
         }
         if let timestamp = parseCodexDate(object["timestamp"] as? String) {
@@ -369,6 +368,35 @@ private func extractRecoveredJSONLMetadata(from url: URL) throws -> RecoveredJSO
         }
     }
     return metadata
+}
+
+private func firstRecoveredJSONLLines(from url: URL, limit: Int = 400) throws -> [Data] {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    var lines: [Data] = []
+    var pending = Data()
+    while lines.count < limit,
+          let chunk = try handle.read(upToCount: 1_048_576),
+          !chunk.isEmpty {
+        var start = chunk.startIndex
+        for newline in chunk.indices where chunk[newline] == 0x0A {
+            if start < newline {
+                pending.append(contentsOf: chunk[start..<newline])
+            }
+            if !pending.isEmpty { lines.append(pending) }
+            pending.removeAll(keepingCapacity: true)
+            if lines.count == limit { return lines }
+            start = chunk.index(after: newline)
+        }
+        if start < chunk.endIndex {
+            pending.append(contentsOf: chunk[start..<chunk.endIndex])
+            guard pending.count <= SessionTailer.defaultMaxLineBytes else {
+                throw BackupFileVerificationError.lineTooLong(SessionTailer.defaultMaxLineBytes)
+            }
+        }
+    }
+    if !pending.isEmpty, lines.count < limit { lines.append(pending) }
+    return lines
 }
 
 private func firstUserMessage(from object: [String: Any]) -> String? {

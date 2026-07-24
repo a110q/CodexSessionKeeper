@@ -21,25 +21,31 @@ public enum SessionIdentity {
     }
 
     public static func title(fromJSONLine line: String) -> String? {
-        guard let data = line.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data),
-              let object = json as? [String: Any]
-        else {
-            return nil
-        }
+        guard let data = line.data(using: .utf8) else { return nil }
+        return title(fromJSONData: data)
+    }
 
-        if let item = object["item"] as? [String: Any],
-           let title = title(fromMessageObject: item) {
-            return title
-        }
+    static func title(fromJSONData data: Data) -> String? {
+        return autoreleasepool { () -> String? in
+            guard let json = try? JSONSerialization.jsonObject(with: data),
+                  let object = json as? [String: Any]
+            else {
+                return nil
+            }
 
-        if let payload = object["payload"] as? [String: Any],
-           isUserPayload(object: object, payload: payload),
-           let title = title(fromPayloadObject: payload) {
-            return title
-        }
+            if let item = object["item"] as? [String: Any],
+               let title = title(fromMessageObject: item) {
+                return title
+            }
 
-        return title(fromMessageObject: object)
+            if let payload = object["payload"] as? [String: Any],
+               isUserPayload(object: object, payload: payload),
+               let title = title(fromPayloadObject: payload) {
+                return title
+            }
+
+            return title(fromMessageObject: object)
+        }
     }
 
     private static func title(fromMessageObject object: [String: Any]) -> String? {

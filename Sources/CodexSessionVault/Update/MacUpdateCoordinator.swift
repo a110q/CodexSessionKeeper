@@ -16,6 +16,7 @@ final class MacUpdateCoordinator: ObservableObject {
     private let currentBuild: Int
     private let checkClient: UpdateCheckClient?
     private let stateStore: MacUpdateStateStore
+    private let auditLogger: UpdateActionAuditLogger
     private let sparkleDriver: SparkleUpdateDriver
     private let updater: SPUUpdater
 
@@ -62,9 +63,13 @@ final class MacUpdateCoordinator: ObservableObject {
         } else {
             self.checkClient = nil
         }
+        let vaultURL = URL(fileURLWithPath: model.vaultRoot, isDirectory: true)
         self.stateStore = MacUpdateStateStore(
-            url: URL(fileURLWithPath: model.vaultRoot, isDirectory: true)
-                .appendingPathComponent("update-state.json")
+            url: vaultURL.appendingPathComponent("update-state.json")
+        )
+        self.auditLogger = UpdateActionAuditLogger(
+            url: vaultURL.appendingPathComponent("update-audit.jsonl"),
+            platform: "macos-arm64"
         )
 
         let driver = SparkleUpdateDriver()
@@ -147,10 +152,30 @@ final class MacUpdateCoordinator: ObservableObject {
             transition(.failed(message: "更新版本不匹配，请联系管理员"), present: true)
             return
         }
-        installRequested = true
-        installWhenReady = false
-        deferredReady = false
-        updater.checkForUpdates()
+
+        let currentState = state
+        recordAudit(.downloadConfirmationRequested, version: version)
+        _ = MacUpdateConsentPolicy.perform(
+            .beginDownload,
+            in: currentState,
+            confirmation: { [weak self] in
+                guard let self else { return false }
+                let confirmed = self.showDownloadConfirmation(version: version)
+                self.recordAudit(
+                    confirmed ? .downloadConfirmed : .downloadCancelled,
+                    version: version
+                )
+                return confirmed
+            },
+            operation: { [weak self] in
+                guard let self else { return }
+                self.recordAudit(.downloadRequested, version: version)
+                self.installRequested = true
+                self.installWhenReady = false
+                self.deferredReady = false
+                self.updater.checkForUpdates()
+            }
+        )
     }
 
     func deferRestart() {
@@ -167,6 +192,29 @@ final class MacUpdateCoordinator: ObservableObject {
               case .ready(let version) = state else {
             return
         }
+        let currentState = state
+        recordAudit(.installConfirmationRequested, version: version)
+        _ = await MacUpdateConsentPolicy.performAsync(
+            .restartAndInstall,
+            in: currentState,
+            confirmation: { [weak self] in
+                guard let self else { return false }
+                let confirmed = self.showInstallConfirmation(version: version)
+                self.recordAudit(
+                    confirmed ? .installConfirmed : .installCancelled,
+                    version: version
+                )
+                return confirmed
+            },
+            operation: { [weak self] in
+                guard let self else { return }
+                await self.performRestartAndInstall(version: version)
+            }
+        )
+    }
+
+    private func performRestartAndInstall(version: String) async {
+        recordAudit(.installRequested, version: version)
         guard await model.prepareForUpdate(timeout: .seconds(5)) else {
             transition(
                 .failed(message: "备份仍在写入，已取消更新重启，请稍后重试"),
@@ -271,6 +319,32 @@ final class MacUpdateCoordinator: ObservableObject {
         backupDrainedForInstall = false
         model.resumeBackupAfterCancelledUpdate()
     }
+
+    private func showDownloadConfirmation(version: String) -> Bool {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "发现公司版本 \(version)"
+        alert.informativeText = "是否开始下载更新？下载前不会关闭应用。"
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "确认下载")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    private func showInstallConfirmation(version: String) -> Bool {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "更新已经下载完成"
+        alert.informativeText = "应用将关闭并安装 \(version)，是否继续？"
+        alert.addButton(withTitle: "稍后安装")
+        alert.addButton(withTitle: "重启并安装")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    private func recordAudit(_ event: UpdateActionAuditEvent, version: String) {
+        try? auditLogger.record(event, version: version)
+    }
 }
 
 extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
@@ -318,6 +392,7 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         installRequested = false
         installWhenReady = false
         resumeBackupIfNeeded()
+        recordAudit(.updateFailed, version: targetVersion ?? currentVersion)
         transition(.failed(message: "更新失败，请稍后重试"), present: true)
     }
 
@@ -326,6 +401,7 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         downloadCancellation = cancellation
         downloadReceived = 0
         downloadTotal = nil
+        recordAudit(.downloadStarted, version: targetVersion ?? currentVersion)
         transition(.downloadStarted(version: targetVersion ?? currentVersion), present: true)
     }
 
@@ -365,6 +441,7 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
             readyReply = nil
             previous(.dismiss)
         }
+        recordAudit(.downloadReady, version: targetVersion ?? currentVersion)
         if installWhenReady && backupDrainedForInstall {
             installWhenReady = false
             transition(.installStarted(version: targetVersion ?? currentVersion), present: true)
@@ -381,12 +458,14 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         retryTerminatingApplication: @escaping () -> Void
     ) {
         retryTermination = applicationTerminated ? nil : retryTerminatingApplication
+        recordAudit(.installStarted, version: targetVersion ?? currentVersion)
         transition(.installStarted(version: targetVersion ?? currentVersion), present: true)
     }
 
     func sparkleInstallCompleted() {
         backupDrainedForInstall = false
         installWhenReady = false
+        recordAudit(.installCompleted, version: targetVersion ?? currentVersion)
         transition(.completed(version: targetVersion ?? currentVersion), present: true)
     }
 

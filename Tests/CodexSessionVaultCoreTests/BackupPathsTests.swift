@@ -17,6 +17,78 @@ func defaultLayoutUsesCodexAndIncrementalBackupRoots() {
 }
 
 @Test
+func explicitNASLayoutSeparatesRemoteContentFromLocalControlState() {
+    let home = URL(fileURLWithPath: "/Users/alice", isDirectory: true)
+    let codexRoot = home.appendingPathComponent(".codex", isDirectory: true)
+    let backupRoot = URL(fileURLWithPath: "/Volumes/文件中转站/codex会话备份/运营部/陈超/devices/mac-a13f/incremental-backups", isDirectory: true)
+    let stateRoot = home.appendingPathComponent(".codex-session-vault/nas-state/mac-a13f", isDirectory: true)
+    let paths = BackupPaths(
+        homeDirectory: home,
+        codexRoot: codexRoot,
+        backupRoot: backupRoot,
+        stateRoot: stateRoot
+    )
+
+    #expect(paths.cursorDatabaseURL.path == stateRoot.appendingPathComponent("cursors.sqlite").path)
+    #expect(paths.auditStateURL.path == stateRoot.appendingPathComponent("integrity-audit.json").path)
+    #expect(paths.verificationURL.path == backupRoot.appendingPathComponent("verification.json").path)
+    #expect(paths.localStatusURL.path == stateRoot.appendingPathComponent("status.json").path)
+    #expect(paths.logURL.path == stateRoot.appendingPathComponent("logs/backup-agent.log").path)
+    #expect(paths.manifestURL.path == backupRoot.appendingPathComponent("manifest.json").path)
+    #expect(paths.remoteStatusURL.path == backupRoot.appendingPathComponent("status.json").path)
+    #expect(paths.sessionsRoot.path == backupRoot.appendingPathComponent("sessions").path)
+    #expect(paths.archivedSessionsRoot.path == backupRoot.appendingPathComponent("archived_sessions").path)
+    #expect(paths.repairQuarantineRoot.path == backupRoot.appendingPathComponent("repair-quarantine").path)
+}
+
+@Test
+func backupFileURLMirrorsActiveAndArchivedSourceRelativePaths() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("BackupPathsMirrorTests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let codexRoot = root.appendingPathComponent(".codex", isDirectory: true)
+    let backupRoot = root.appendingPathComponent("nas-backup", isDirectory: true)
+    let active = codexRoot.appendingPathComponent("sessions/2026/07/active.jsonl")
+    let archived = codexRoot.appendingPathComponent("archived_sessions/2026/07/archived.jsonl")
+    for source in [active, archived] {
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{}\n".utf8).write(to: source)
+    }
+    let paths = BackupPaths(codexRoot: codexRoot, backupRoot: backupRoot, stateRoot: root.appendingPathComponent("state"))
+
+    #expect(try paths.backupFileURL(for: active).path == backupRoot.appendingPathComponent("sessions/2026/07/active.jsonl").path)
+    #expect(try paths.backupFileURL(for: archived).path == backupRoot.appendingPathComponent("archived_sessions/2026/07/archived.jsonl").path)
+}
+
+@Test
+func backupFileURLRejectsOutsideLinkedAndNonJSONLSources() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("BackupPathsSafetyTests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let codexRoot = root.appendingPathComponent(".codex", isDirectory: true)
+    let sessionsRoot = codexRoot.appendingPathComponent("sessions", isDirectory: true)
+    let backupRoot = root.appendingPathComponent("nas-backup", isDirectory: true)
+    try FileManager.default.createDirectory(at: sessionsRoot, withIntermediateDirectories: true)
+    let outside = root.appendingPathComponent("outside.jsonl")
+    let nonJSONL = sessionsRoot.appendingPathComponent("notes.txt")
+    let linked = sessionsRoot.appendingPathComponent("linked.jsonl")
+    try Data("{}\n".utf8).write(to: outside)
+    try Data("notes".utf8).write(to: nonJSONL)
+    try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: outside)
+    let paths = BackupPaths(codexRoot: codexRoot, backupRoot: backupRoot, stateRoot: root.appendingPathComponent("state"))
+
+    #expect(throws: BackupPathsError.sourceOutsideCodexSessionRoots(outside.path)) {
+        _ = try paths.backupFileURL(for: outside)
+    }
+    #expect(throws: BackupPathsError.sourceIsNotJSONL(nonJSONL.path)) {
+        _ = try paths.backupFileURL(for: nonJSONL)
+    }
+    #expect(throws: BackupPathsError.unsafeSource(linked.path)) {
+        _ = try paths.backupFileURL(for: linked)
+    }
+}
+
+@Test
 func backupFilePathUsesFirstSeenDateInUTC() throws {
     let home = URL(fileURLWithPath: "/Users/alice", isDirectory: true)
     let paths = BackupPaths(homeDirectory: home)
@@ -104,7 +176,11 @@ func backupModelsRoundTripThroughCodable() throws {
         lineCount: record.lineCount,
         bytesBackedUp: record.bytesBackedUp,
         autoStartEnabled: true,
-        lastError: nil
+        lastError: nil,
+        lastAuditAt: lastBackedUpAt,
+        lastAuditResult: "completed",
+        lastRepairAt: lastBackedUpAt,
+        repairCount: 2
     )
 
     let encoder = JSONEncoder()
@@ -115,4 +191,34 @@ func backupModelsRoundTripThroughCodable() throws {
 
     #expect(decodedManifest == manifest)
     #expect(decodedStatus == status)
+}
+
+@Test
+func backupStatusDecodesOlderPayloadWithoutAuditFields() throws {
+    let data = Data("""
+    {
+      "agentVersion":"1.0.0",
+      "enabled":true,
+      "status":"running",
+      "mode":"polling",
+      "codexRoot":"/Users/alice/.codex",
+      "backupRoot":"/Volumes/nas/backups",
+      "firstRunAt":"2026-07-04T10:00:00Z",
+      "lastStartedAt":"2026-07-04T10:00:00Z",
+      "lastHeartbeatAt":"2026-07-04T10:01:00Z",
+      "sessionCount":1,
+      "lineCount":2,
+      "bytesBackedUp":42,
+      "autoStartEnabled":true
+    }
+    """.utf8)
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+
+    let status = try decoder.decode(BackupStatus.self, from: data)
+
+    #expect(status.lastAuditAt == nil)
+    #expect(status.lastAuditResult == nil)
+    #expect(status.lastRepairAt == nil)
+    #expect(status.repairCount == nil)
 }

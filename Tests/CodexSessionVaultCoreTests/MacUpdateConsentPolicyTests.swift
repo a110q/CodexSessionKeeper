@@ -25,6 +25,63 @@ struct MacUpdateConsentPolicyTests {
         }
     }
 
+    @Test
+    @MainActor
+    func cancelledDownloadConfirmationCannotRunTheDownloadAction() {
+        var operationCount = 0
+
+        let performed = MacUpdateConsentPolicy.perform(
+            .beginDownload,
+            in: .available(version: "1.1.0", notes: []),
+            confirmation: { false },
+            operation: { operationCount += 1 }
+        )
+
+        #expect(!performed)
+        #expect(operationCount == 0)
+    }
+
+    @Test
+    @MainActor
+    func cancelledInstallConfirmationCannotRunTheInstallAction() async {
+        var operationCount = 0
+
+        let performed = await MacUpdateConsentPolicy.performAsync(
+            .restartAndInstall,
+            in: .ready(version: "1.1.0"),
+            confirmation: { false },
+            operation: { operationCount += 1 }
+        )
+
+        #expect(!performed)
+        #expect(operationCount == 0)
+    }
+
+    @Test
+    @MainActor
+    func confirmedActionsRunExactlyOnce() async {
+        var downloadCount = 0
+        var installCount = 0
+
+        let downloaded = MacUpdateConsentPolicy.perform(
+            .beginDownload,
+            in: .available(version: "1.1.0", notes: []),
+            confirmation: { true },
+            operation: { downloadCount += 1 }
+        )
+        let installed = await MacUpdateConsentPolicy.performAsync(
+            .restartAndInstall,
+            in: .ready(version: "1.1.0"),
+            confirmation: { true },
+            operation: { installCount += 1 }
+        )
+
+        #expect(downloaded)
+        #expect(installed)
+        #expect(downloadCount == 1)
+        #expect(installCount == 1)
+    }
+
     private var nonAvailableStates: [UpdatePresentationState] {
         [
             .idle,

@@ -34,6 +34,8 @@ case "$UPDATE_SCOPE" in
     ;;
 esac
 UPDATE_KEYS="$ROOT_DIR/Config/UpdateKeys.json"
+APP_BUNDLE_ID="local.codex.session-manager"
+MAC_CODESIGN_IDENTITY="${MAC_CODESIGN_IDENTITY:--}"
 BUILD_DIR="$ROOT_DIR/.build/release"
 DIST_DIR="$ROOT_DIR/dist"
 MACOS_DIST_DIR="$DIST_DIR/macos"
@@ -69,6 +71,15 @@ SPARKLE_PUBLIC_KEY="$(/usr/libexec/PlistBuddy -c 'Print :sparklePublicEDKey' "$K
   exit 2
 }
 
+if [[ ! "$APP_VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+  echo "Invalid APP_VERSION: $APP_VERSION" >&2
+  exit 1
+fi
+if [[ ! "$APP_BUILD" =~ ^[0-9]+$ ]]; then
+  echo "Invalid APP_BUILD: $APP_BUILD" >&2
+  exit 1
+fi
+
 cd "$ROOT_DIR"
 swift build "${SWIFT_BUILD_ARGUMENTS[@]}"
 
@@ -95,7 +106,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key>
   <string>codex_会话管理</string>
   <key>CFBundleIdentifier</key>
-  <string>local.codex.session-manager</string>
+  <string>$APP_BUNDLE_ID</string>
   <key>CFBundleVersion</key>
   <string>$APP_BUILD</string>
   <key>CFBundleShortVersionString</key>
@@ -126,6 +137,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <true/>
   <key>SUVerifyUpdateBeforeExtraction</key>
   <true/>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>用于连接公司局域网更新服务器，检查并下载 codex_会话管理 的新版本。</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsLocalNetworking</key>
@@ -136,9 +149,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 PLIST
 
 chmod +x "$APP_DIR/Contents/MacOS/CodexSessionVault"
-if ! /usr/bin/otool -l "$APP_DIR/Contents/MacOS/CodexSessionVault" | /usr/bin/grep -Fq '@executable_path/../Frameworks'; then
-  /usr/bin/install_name_tool -add_rpath '@executable_path/../Frameworks' "$APP_DIR/Contents/MacOS/CodexSessionVault"
-fi
+codesign --force --deep --sign "$MAC_CODESIGN_IDENTITY" "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
 
 SPARKLE_VERSION_DIR="$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B"
 for nested_bundle in \

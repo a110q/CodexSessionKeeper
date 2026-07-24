@@ -28,3 +28,10 @@ test('macOS build can explicitly disable only the nested SwiftPM sandbox', () =>
   assert.match(script, /DISABLE_SWIFTPM_SANDBOX/);
   assert.match(script, /--disable-sandbox/);
 });
+
+test('macOS package declares its company local-network purpose', () => {
+  const script = source();
+  assert.match(script, /<key>NSLocalNetworkUsageDescription<\/key>/);
+  assert.match(script, /用于连接公司局域网更新服务器/);
+  assert.match(script, /<key>NSAllowsLocalNetworking<\/key>\s*<true\/>/);
+});

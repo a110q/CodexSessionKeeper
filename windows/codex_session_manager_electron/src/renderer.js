@@ -1,9 +1,19 @@
 const state = {
+  appVersion: '',
   section: 'sessions',
   sessions: [],
   snapshots: [],
   currentState: {},
   backupStatus: {},
+  nasSetup: { state: 'unconfigured', configured: false },
+  nasDepartments: [],
+  nasEmployees: [],
+  nasCatalogLoading: false,
+  nasDetected: false,
+  nasUiError: '',
+  nasReconfiguring: false,
+  nasRecoveryDevices: [],
+  selectedNasRecoveryDeviceId: null,
   selectedSessionId: null,
   selectedSnapshotId: null,
   checkedSessionIds: new Set(),
@@ -24,7 +34,11 @@ const state = {
   checkedBackupRestoreIds: new Set(),
   selectedBackupRestoreId: null,
   backupRestoreLoading: false,
-  settings: { autoRestoreOnLaunch: false },
+  settings: {
+    autoRestoreOnLaunch: false,
+    onboardingVersion: 0,
+    onboardingInProgress: false,
+  },
   autoRestorePromptedSnapshotId: null,
   sessionPreviewId: null,
   sessionPreviewMessages: [],
@@ -54,6 +68,7 @@ const els = {
   sessionCount: $('#sessionCount'),
   snapshotCount: $('#snapshotCount'),
   snapshotSource: $('#snapshotSource'),
+  nasRecoveryDevice: $('#nasRecoveryDevice'),
   snapshotName: $('#snapshotName'),
   snapshotFilter: $('#snapshotFilter'),
   checkAllSnapshotsBtn: $('#checkAllSnapshotsBtn'),
@@ -62,6 +77,34 @@ const els = {
   autoRestoreSwitch: $('#autoRestoreSwitch'),
   backupStatusText: $('#backupStatusText'),
   backupStatusDetail: $('#backupStatusDetail'),
+  nasStatusRetryBtn: $('#nasStatusRetryBtn'),
+  nasReconfigureBtn: $('#nasReconfigureBtn'),
+  launchAtLoginWarning: $('#launchAtLoginWarning'),
+  launchAtLoginMessage: $('#launchAtLoginMessage'),
+  retryLaunchAtLoginBtn: $('#retryLaunchAtLoginBtn'),
+  openLoginItemSettingsBtn: $('#openLoginItemSettingsBtn'),
+  nasSetupModal: $('#nasSetupModal'),
+  nasSetupTitle: $('#nasSetupTitle'),
+  nasDetectionBadge: $('#nasDetectionBadge'),
+  nasSetupError: $('#nasSetupError'),
+  nasSetupErrorDetail: $('#nasSetupErrorDetail'),
+  nasOnboardingStatus: $('#nasOnboardingStatus'),
+  nasOnboardingDetail: $('#nasOnboardingDetail'),
+  nasOnboardingCounts: $('#nasOnboardingCounts'),
+  nasDepartment: $('#nasDepartment'),
+  nasEmployee: $('#nasEmployee'),
+  nasTargetPreview: $('#nasTargetPreview'),
+  nasRetryBtn: $('#nasRetryBtn'),
+  nasConfirmBtn: $('#nasConfirmBtn'),
+  nasCancelReconfigureBtn: $('#nasCancelReconfigureBtn'),
+  employeeHelpBtn: $('#employeeHelpBtn'),
+  employeeHelpModal: $('#employeeHelpModal'),
+  employeeHelpVersion: $('#employeeHelpVersion'),
+  employeeHelpTopics: $('#employeeHelpTopics'),
+  employeeHelpCloseBtn: $('#employeeHelpCloseBtn'),
+  employeeHelpRetryBtn: $('#employeeHelpRetryBtn'),
+  employeeHelpReconfigureBtn: $('#employeeHelpReconfigureBtn'),
+  employeeHelpRecoveryBtn: $('#employeeHelpRecoveryBtn'),
   openDirsMenu: $('#openDirsMenu'),
   contextMenu: $('#contextMenu'),
   toast: $('#toast'),
@@ -424,8 +467,6 @@ function filteredBackupRestoreCandidates() {
     return [
       candidate.sessionId,
       candidate.title,
-      candidate.sourcePath,
-      candidate.backupPath,
       candidate.error || ''
     ].join(' ').toLowerCase().includes(query);
   });
@@ -458,6 +499,7 @@ function pruneCheckedItems() {
 
 function renderBatchControls() {
   const snapshotMode = state.snapshotSource === 'snapshots';
+  els.nasRecoveryDevice.classList.toggle('hidden', snapshotMode);
   els.snapshotName.classList.toggle('hidden', !snapshotMode);
   $('#createSnapshotBtn').classList.toggle('hidden', !snapshotMode);
   els.snapshotFilter.classList.toggle('hidden', !snapshotMode);
@@ -484,23 +526,323 @@ function renderStateCard() {
   els.autoRestoreSwitch.checked = Boolean(state.settings?.autoRestoreOnLaunch);
 }
 
+function replaceSelectOptions(select, values, placeholder, selectedValue = '') {
+  const options = [`<option value="">${escapeHtml(placeholder)}</option>`]
+    .concat(values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`));
+  select.innerHTML = options.join('');
+  select.value = values.includes(selectedValue) ? selectedValue : '';
+}
+
+function effectiveNasSetup() {
+  const setup = state.nasSetup || {};
+  const backupState = state.backupStatus?.status;
+  let runtimeState = backupState && backupState !== 'waiting'
+    ? backupState
+    : setup.state || 'unconfigured';
+  if (state.nasUiError) runtimeState = state.nasDetected ? 'error' : 'disconnected';
+  return {
+    ...setup,
+    state: runtimeState,
+    progress: state.backupStatus?.progress || setup.progress || null,
+  };
+}
+
+function renderNasSetup() {
+  const setup = effectiveNasSetup();
+  const department = els.nasDepartment.value;
+  const employee = els.nasEmployee.value;
+  const validDepartment = state.nasDepartments.includes(department);
+  const validEmployee = state.nasEmployees.includes(employee);
+  const decision = window.EmployeeGuidance.onboardingDecision({
+    setup,
+    settings: state.settings,
+    catalogReady: state.nasDetected,
+    selectionValid: validDepartment && validEmployee,
+  });
+  const visible = decision.presentSetup || state.nasReconfiguring;
+  const busy = ['validating', 'seeding', 'verifying'].includes(setup.state);
+  els.nasSetupModal.classList.toggle('hidden', !visible);
+  els.nasSetupTitle.textContent = state.nasReconfiguring
+    ? '更换 NAS 备份身份'
+    : '配置公司 NAS 会话备份';
+  els.nasCancelReconfigureBtn.classList.toggle('hidden', !setup.configured || !state.nasReconfiguring);
+
+  document.querySelectorAll('[data-onboarding-step]').forEach((element) => {
+    const step = Number(element.dataset.onboardingStep);
+    element.classList.toggle('active', step === decision.step);
+    element.classList.toggle('complete', step < decision.step);
+  });
+
+  const guidance = window.EmployeeGuidance.stateGuidance(setup.state);
+  els.nasOnboardingStatus.textContent = guidance.title;
+  els.nasOnboardingDetail.textContent = guidance.detail;
+  const progress = setup.progress || {};
+  const total = Number(progress.totalFiles || 0);
+  const completed = Number(progress.completedFiles || 0);
+  const failed = Number(progress.failedFiles || 0);
+  const pending = Number(progress.pendingFiles || 0);
+  els.nasOnboardingCounts.textContent = total > 0
+    ? failed > 0
+      ? `已发现 ${total} · 成功 ${completed - failed} · 异常 ${failed} · 待处理 ${pending}`
+      : `已发现 ${total} · 已检查 ${completed} · 待处理 ${pending}`
+    : '';
+
+  let detectionText = '等待检测';
+  if (state.nasCatalogLoading) detectionText = '正在检测';
+  else if (state.nasDetected) detectionText = '已连接';
+  else if (state.nasUiError || setup.state === 'disconnected') detectionText = '未连接';
+  els.nasDetectionBadge.textContent = detectionText;
+  els.nasDetectionBadge.className = `nas-detection-badge ${state.nasDetected ? 'connected' : ''}`;
+  const diagnostic = state.nasUiError || setup.lastError || state.backupStatus?.lastError || '';
+  els.nasSetupErrorDetail.textContent = diagnostic;
+  els.nasSetupError.classList.toggle('hidden', !diagnostic);
+  if (!diagnostic) els.nasSetupError.open = false;
+
+  els.nasDepartment.disabled = state.nasCatalogLoading || busy || !state.nasDetected;
+  els.nasEmployee.disabled = state.nasCatalogLoading || busy || !validDepartment;
+  const canActivate = state.nasReconfiguring
+    ? validDepartment && validEmployee
+    : decision.canActivate;
+  els.nasConfirmBtn.disabled = state.nasCatalogLoading || busy || !canActivate;
+  els.nasRetryBtn.disabled = state.nasCatalogLoading || busy;
+  els.nasRetryBtn.textContent = state.nasCatalogLoading
+    ? '正在检测...'
+    : state.nasDetected
+      ? '重新检测'
+      : '检测公司 NAS';
+  els.nasTargetPreview.textContent = validDepartment && validEmployee
+    ? `公司 NAS / ${department} / ${employee}`
+    : '请选择部门和姓名';
+}
+
+function mergeOnboardingSettings(backupStatus) {
+  state.settings = {
+    ...state.settings,
+    onboardingVersion: Number(backupStatus?.onboardingVersion || 0),
+    onboardingInProgress: Boolean(backupStatus?.onboardingInProgress),
+  };
+}
+
+function renderEmployeeHelp() {
+  els.employeeHelpVersion.textContent = `版本 ${state.appVersion || '未知'}`;
+  els.employeeHelpTopics.replaceChildren();
+  for (const topic of window.EmployeeGuidance.helpTopics) {
+    const section = document.createElement('section');
+    const title = document.createElement('h3');
+    const body = document.createElement('p');
+    title.textContent = topic.title;
+    body.textContent = topic.body;
+    section.append(title, body);
+    els.employeeHelpTopics.append(section);
+  }
+}
+
+function openEmployeeHelp() {
+  renderEmployeeHelp();
+  els.employeeHelpModal.classList.remove('hidden');
+  els.employeeHelpCloseBtn.focus();
+}
+
+function closeEmployeeHelp() {
+  els.employeeHelpModal.classList.add('hidden');
+  els.employeeHelpBtn.focus();
+}
+
+async function loadNasEmployees(department, preferredEmployee = '') {
+  state.nasEmployees = [];
+  replaceSelectOptions(els.nasEmployee, [], department ? '正在读取姓名...' : '请先选择部门');
+  renderNasSetup();
+  if (!state.nasDepartments.includes(department)) return;
+
+  try {
+    state.nasEmployees = await window.codexManager.listNasEmployees(department) || [];
+    replaceSelectOptions(els.nasEmployee, state.nasEmployees, '请选择姓名', preferredEmployee);
+  } catch (error) {
+    state.nasUiError = error.message || String(error);
+    replaceSelectOptions(els.nasEmployee, [], '姓名读取失败');
+  }
+  renderNasSetup();
+}
+
+async function detectAndLoadNasCatalogs() {
+  if (state.nasCatalogLoading) return;
+  state.nasCatalogLoading = true;
+  state.nasDetected = false;
+  state.nasUiError = '';
+  renderNasSetup();
+
+  try {
+    await window.codexManager.detectCompanyNas();
+    state.nasDepartments = await window.codexManager.listNasDepartments() || [];
+    state.nasDetected = true;
+    const preferredDepartment = state.nasSetup?.department || '';
+    replaceSelectOptions(els.nasDepartment, state.nasDepartments, '请选择部门', preferredDepartment);
+    state.nasCatalogLoading = false;
+    if (els.nasDepartment.value) {
+      await loadNasEmployees(els.nasDepartment.value, state.nasSetup?.employee || '');
+    } else {
+      replaceSelectOptions(els.nasEmployee, [], '请先选择部门');
+    }
+  } catch (error) {
+    state.nasDepartments = [];
+    state.nasEmployees = [];
+    state.nasUiError = error.message || String(error);
+    replaceSelectOptions(els.nasDepartment, [], '公司 NAS 未连接');
+    replaceSelectOptions(els.nasEmployee, [], '请先连接公司 NAS');
+  } finally {
+    state.nasCatalogLoading = false;
+    renderNasSetup();
+  }
+}
+
+async function beginNasSetup(reconfigure = false) {
+  state.nasReconfiguring = reconfigure;
+  state.nasUiError = '';
+  renderNasSetup();
+  await detectAndLoadNasCatalogs();
+}
+
+async function activateNasBackup() {
+  const department = els.nasDepartment.value;
+  const employee = els.nasEmployee.value;
+  if (!state.nasDepartments.includes(department) || !state.nasEmployees.includes(employee)) return;
+  const previous = state.nasSetup || {};
+  if (previous.configured && (previous.department !== department || previous.employee !== employee)) {
+    const approved = confirm(
+      `确认更改公司 NAS 备份身份？\n\n当前：${previous.department} / ${previous.employee}\n新的：${department} / ${employee}\n\n验证成功后，后续会话将写入新的个人目录。`
+    );
+    if (!approved) return;
+  }
+
+  state.nasCatalogLoading = true;
+  state.nasUiError = '';
+  if (!previous.configured) {
+    state.settings = { ...state.settings, onboardingInProgress: true };
+  }
+  els.nasConfirmBtn.textContent = '正在验证并启动...';
+  renderNasSetup();
+  try {
+    state.nasSetup = await window.codexManager.activateNasBackup(department, employee);
+    state.nasReconfiguring = false;
+    state.backupStatus = await window.codexManager.loadBackupStatus() || {};
+    mergeOnboardingSettings(state.backupStatus);
+    renderAll();
+    await loadNasRecoveryDevices();
+    showToast(`公司 NAS 会话备份已配置：${department} / ${employee}`);
+  } catch (error) {
+    state.nasUiError = error.message || String(error);
+  } finally {
+    state.nasCatalogLoading = false;
+    els.nasConfirmBtn.textContent = '验证并开始备份';
+    renderNasSetup();
+  }
+}
+
+async function retryNasBackup() {
+  if (!state.nasSetup?.configured) {
+    await beginNasSetup(false);
+    return;
+  }
+  try {
+    state.nasSetup = await window.codexManager.retryNasBackup();
+    state.backupStatus = await window.codexManager.loadBackupStatus() || {};
+    state.nasUiError = '';
+    mergeOnboardingSettings(state.backupStatus);
+    renderAll();
+    showToast('公司 NAS 已重新连接');
+  } catch (error) {
+    state.nasSetup = await window.codexManager.getNasSetupState();
+    state.nasUiError = error.message || String(error);
+    renderAll();
+    showToast(state.nasUiError, true);
+  }
+}
+
+function applyLaunchAtLoginState(launchAtLogin) {
+  state.nasSetup = { ...state.nasSetup, launchAtLogin };
+  state.backupStatus = {
+    ...state.backupStatus,
+    autoStartEnabled: Boolean(launchAtLogin?.enabled),
+    launchAtLogin,
+  };
+}
+
+async function retryLaunchAtLogin() {
+  try {
+    const launchAtLogin = await window.codexManager.retryLaunchAtLogin();
+    applyLaunchAtLoginState(launchAtLogin);
+    renderBackupStatus();
+    showToast(launchAtLogin.enabled ? '开机自启已启用' : (launchAtLogin.message || '无法启用开机自启'), !launchAtLogin.enabled);
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
+}
+
+async function openLoginItemSettings() {
+  try {
+    const launchAtLogin = await window.codexManager.openLoginItemSettings();
+    applyLaunchAtLoginState(launchAtLogin);
+    renderBackupStatus();
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  }
+}
+
+async function loadNasRecoveryDevices() {
+  state.nasRecoveryDevices = (await window.codexManager.listNasBackupDevices() || [])
+    .sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent) || String(a.deviceName).localeCompare(String(b.deviceName), 'zh-CN'));
+  if (!state.nasRecoveryDevices.some((device) => device.deviceId === state.selectedNasRecoveryDeviceId)) {
+    state.selectedNasRecoveryDeviceId = state.nasRecoveryDevices[0]?.deviceId || null;
+  }
+  els.nasRecoveryDevice.innerHTML = state.nasRecoveryDevices.map((device) => {
+    const suffix = device.isCurrent ? '当前设备' : `旧设备${device.lastBackupAt ? ` · ${formatDate(device.lastBackupAt)}` : ''}`;
+    return `<option value="${escapeHtml(device.deviceId)}">${escapeHtml(device.deviceName)} · ${suffix}</option>`;
+  }).join('');
+  els.nasRecoveryDevice.value = state.selectedNasRecoveryDeviceId || '';
+  els.nasRecoveryDevice.disabled = state.nasRecoveryDevices.length === 0;
+}
+
 function renderBackupStatus() {
   const backup = state.backupStatus || {};
+  const launchAtLogin = backup.launchAtLogin || state.nasSetup?.launchAtLogin || {};
   const status = backup.status || 'waiting';
   const mode = backup.mode || 'unknown';
   const labels = {
-    running: '运行中',
+    running: '备份已验证',
+    seeding: '首次备份中',
+    verifying: '正在校验',
+    pending: '正在补传',
+    validating: '正在验证',
+    disconnected: 'NAS 未连接',
+    unconfigured: '尚未配置',
     error: '异常',
     waiting: '等待中'
   };
-  const statusClass = status === 'running' || status === 'error' ? status : 'waiting';
+  const statusClass = status === 'running'
+    ? 'running'
+    : status === 'error' || status === 'disconnected'
+      ? 'error'
+      : ['seeding', 'pending', 'validating', 'verifying'].includes(status)
+        ? 'working'
+        : 'waiting';
   els.backupStatusText.textContent = labels[status] || '等待中';
   els.backupStatusText.className = `backup-status-text ${statusClass}`;
 
   const lastBackup = backup.lastBackupAt ? formatDate(backup.lastBackupAt) : '暂无备份';
+  const progress = backup.progress;
   els.backupStatusDetail.textContent = backup.lastError
     ? backup.lastError
+    : status === 'verifying'
+      ? `正在回读校验已上传备份 · ${progress?.completedFiles || 0} / ${progress?.totalFiles || 0}`
+    : progress?.pendingFiles > 0
+      ? `已处理 ${progress.completedFiles || 0} / ${progress.totalFiles || 0}，剩余 ${progress.pendingFiles}`
     : `模式：${mode} · 最近备份：${lastBackup} · 会话：${backup.sessionCount || 0}`;
+  els.nasStatusRetryBtn.classList.toggle('hidden', !['disconnected', 'error', 'waiting'].includes(status));
+  els.nasReconfigureBtn.classList.toggle('hidden', !state.nasSetup?.configured);
+  const launchWarningVisible = Boolean(state.nasSetup?.configured && !launchAtLogin.enabled);
+  els.launchAtLoginWarning.classList.toggle('hidden', !launchWarningVisible);
+  els.launchAtLoginMessage.textContent = launchAtLogin.message || '开机自启尚未启用；关闭窗口后备份将无法长期常驻。';
+  renderNasSetup();
 }
 
 function renderSessions() {
@@ -765,7 +1107,7 @@ function renderBackupRestoreList() {
     : `${catalog.missingCount || 0} / ${catalog.totalCount || 0}`;
 
   if (state.backupRestoreLoading) {
-    els.snapshotList.innerHTML = '<div class="detail-empty"><h3>正在读取本地增量备份</h3><p>正在扫描 manifest 和备份文件。</p></div>';
+    els.snapshotList.innerHTML = '<div class="detail-empty"><h3>正在读取公司 NAS 会话备份</h3><p>正在验证设备和备份记录。</p></div>';
     renderBackupRestoreDetail(null);
     renderBatchControls();
     return;
@@ -797,7 +1139,7 @@ function renderBackupRestoreList() {
 function renderBackupRestoreDetail(candidate) {
   if (!candidate) {
     els.snapshotDetail.className = 'detail-empty';
-    els.snapshotDetail.innerHTML = '<div class="empty-icon">↺</div><h3>没有选中备份会话</h3><p>选择一个缺失会话后可从本地增量备份恢复。</p>';
+    els.snapshotDetail.innerHTML = '<div class="empty-icon">↺</div><h3>没有选中备份会话</h3><p>选择一个缺失会话后可从公司 NAS 备份恢复。</p>';
     return;
   }
 
@@ -843,9 +1185,8 @@ function renderBackupRestoreDetail(candidate) {
     <div class="detail-card">
       <h3 style="margin-bottom: 12px;">备份信息</h3>
       <div class="info-lines">
-        <div class="info-line"><span>备份文件</span><strong class="mono">${escapeHtml(candidate.backupPath || '-')}</strong></div>
-        <div class="info-line"><span>原始路径</span><strong class="mono">${escapeHtml(candidate.sourcePath || '-')}</strong></div>
-        <div class="info-line"><span>本机备份</span><strong class="mono">${escapeHtml(candidate.backupFilePath || '-')}</strong></div>
+        <div class="info-line"><span>备份设备</span><strong>${escapeHtml(state.nasRecoveryDevices.find((device) => device.deviceId === state.selectedNasRecoveryDeviceId)?.deviceName || '-')}</strong></div>
+        <div class="info-line"><span>会话 ID</span><strong class="mono">${escapeHtml(candidate.sessionId)}</strong></div>
         ${candidate.error ? `<div class="info-line"><span>错误</span><strong>${escapeHtml(candidate.error)}</strong></div>` : ''}
       </div>
     </div>
@@ -1040,7 +1381,9 @@ async function loadBackupRestoreCatalog() {
   state.backupRestoreLoading = true;
   renderSnapshots();
   try {
-    const catalog = await window.codexManager.loadIncrementalBackupSessions();
+    if (!state.selectedNasRecoveryDeviceId) await loadNasRecoveryDevices();
+    if (!state.selectedNasRecoveryDeviceId) throw new Error('没有找到可读取的 NAS 备份设备。');
+    const catalog = await window.codexManager.loadIncrementalBackupSessions(state.selectedNasRecoveryDeviceId);
     state.backupRestoreCatalog = catalog;
     state.backupRestoreCandidates = catalog.candidates || [];
     state.checkedBackupRestoreIds = new Set(
@@ -1050,6 +1393,10 @@ async function loadBackupRestoreCatalog() {
   } catch (error) {
     state.backupRestoreCatalog = null;
     state.backupRestoreCandidates = [];
+    state.nasRecoveryDevices = [];
+    state.selectedNasRecoveryDeviceId = null;
+    els.nasRecoveryDevice.innerHTML = '';
+    els.nasRecoveryDevice.disabled = true;
     state.checkedBackupRestoreIds.clear();
     state.selectedBackupRestoreId = null;
     showToast(error.message || String(error), true);
@@ -1071,15 +1418,15 @@ async function restoreBackupRestoreCandidates() {
   const preview = candidates.slice(0, 8).map((candidate) => candidate.title || candidate.sessionId).join('\n');
   const suffix = candidates.length > 8 ? `\n等 ${candidates.length} 个会话` : '';
   const protectionMode = await chooseRestoreProtectionMode(
-    '从本地备份恢复缺失会话？',
+    '从公司 NAS 备份恢复缺失会话？',
     `将恢复 ${candidates.length} 个当前 Codex 中缺失的会话，不覆盖已存在会话。\n\n${preview}${suffix}`,
     'lightweight'
   );
   if (!protectionMode) return;
 
   const result = await withBusy(
-    '正在从本地备份恢复缺失会话...',
-    () => window.codexManager.restoreIncrementalBackupSessions(candidates.map((candidate) => candidate.sessionId), protectionMode)
+    '正在从公司 NAS 备份恢复缺失会话...',
+    () => window.codexManager.restoreIncrementalBackupSessions(state.selectedNasRecoveryDeviceId, candidates.map((candidate) => candidate.sessionId), protectionMode)
   );
   if (busyWasCancelled(result)) return;
   state.checkedBackupRestoreIds.clear();
@@ -1109,10 +1456,12 @@ async function refresh(options = {}) {
   try {
     showToast('正在刷新...');
     const data = await window.codexManager.loadState();
+    state.appVersion = data.appVersion || state.appVersion;
     state.sessions = data.sessions || [];
     state.snapshots = data.snapshots || [];
     state.currentState = data.currentState || {};
     state.backupStatus = data.backupStatus || {};
+    state.nasSetup = data.nasSetup || state.nasSetup;
     state.settings = data.settings || state.settings;
     pruneCheckedItems();
     renderAll();
@@ -1122,7 +1471,12 @@ async function refresh(options = {}) {
       await loadSelectedSnapshotSessions();
     }
     showToast(`已刷新：${state.sessions.length} 个会话，${state.snapshots.length} 个快照`);
-    if (options.forceAutoRestore || !options.skipAutoRestore) await maybeRunLaunchAutoRestore(data.autoRestoreSuggestion);
+    if (!state.nasSetup.configured && !state.nasCatalogLoading && !state.nasDetected) {
+      await beginNasSetup(false);
+    }
+    if (state.nasSetup.configured && (options.forceAutoRestore || !options.skipAutoRestore)) {
+      await maybeRunLaunchAutoRestore(data.autoRestoreSuggestion);
+    }
   } catch (error) {
     showToast(error.message || String(error), true);
   }
@@ -1133,7 +1487,9 @@ async function refreshBackupStatusOnly() {
   backupStatusRefreshInFlight = true;
 
   try {
-    state.backupStatus = await window.codexManager.loadBackupStatus() || {};
+    const backupStatus = await window.codexManager.loadBackupStatus() || {};
+    state.backupStatus = backupStatus;
+    mergeOnboardingSettings(backupStatus);
     renderBackupStatus();
   } catch {
     // Lightweight polling should not interrupt the main UI or show a toast.
@@ -1555,7 +1911,26 @@ els.contextMenu.addEventListener('click', (event) => {
 });
 
 $('#refreshBtn').addEventListener('click', refresh);
-$('#checkUpdatesButton').addEventListener('click', checkForUpdates);
+els.employeeHelpBtn.addEventListener('click', openEmployeeHelp);
+els.employeeHelpCloseBtn.addEventListener('click', closeEmployeeHelp);
+els.employeeHelpRetryBtn.addEventListener('click', () => { void retryNasBackup(); });
+els.employeeHelpReconfigureBtn.addEventListener('click', () => {
+  closeEmployeeHelp();
+  void beginNasSetup(true);
+});
+els.employeeHelpRecoveryBtn.addEventListener('click', () => {
+  closeEmployeeHelp();
+  setSection('snapshots');
+});
+els.employeeHelpModal.addEventListener('click', (event) => {
+  if (event.target === els.employeeHelpModal) closeEmployeeHelp();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !els.employeeHelpModal.classList.contains('hidden')) {
+    event.preventDefault();
+    closeEmployeeHelp();
+  }
+});
 $('#openDirsBtn').addEventListener('click', (event) => {
   event.stopPropagation();
   els.openDirsMenu.classList.toggle('hidden');
@@ -1576,6 +1951,30 @@ els.snapshotSource.addEventListener('change', async () => {
     renderSnapshots();
     await loadSelectedSnapshotSessions();
   }
+});
+els.nasRecoveryDevice.addEventListener('change', async () => {
+  state.selectedNasRecoveryDeviceId = els.nasRecoveryDevice.value || null;
+  state.backupRestoreCatalog = null;
+  state.backupRestoreCandidates = [];
+  state.checkedBackupRestoreIds.clear();
+  state.selectedBackupRestoreId = null;
+  await loadBackupRestoreCatalog();
+});
+els.nasDepartment.addEventListener('change', async () => {
+  state.nasUiError = '';
+  await loadNasEmployees(els.nasDepartment.value);
+});
+els.nasEmployee.addEventListener('change', renderNasSetup);
+els.nasRetryBtn.addEventListener('click', detectAndLoadNasCatalogs);
+els.nasConfirmBtn.addEventListener('click', activateNasBackup);
+els.nasStatusRetryBtn.addEventListener('click', retryNasBackup);
+els.nasReconfigureBtn.addEventListener('click', () => beginNasSetup(true));
+els.retryLaunchAtLoginBtn.addEventListener('click', retryLaunchAtLogin);
+els.openLoginItemSettingsBtn.addEventListener('click', openLoginItemSettings);
+els.nasCancelReconfigureBtn.addEventListener('click', () => {
+  state.nasReconfiguring = false;
+  state.nasUiError = '';
+  renderNasSetup();
 });
 els.autoRestoreSwitch.addEventListener('change', async () => {
   try {

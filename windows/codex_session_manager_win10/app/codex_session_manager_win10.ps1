@@ -5,6 +5,8 @@ Add-Type -AssemblyName System.Drawing
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+. (Join-Path $PSScriptRoot "session-data-security.ps1")
+
 $script:AppVersion = "0.1.0"
 $script:CodexRoot = Join-Path $env:USERPROFILE ".codex"
 $script:VaultRoot = Join-Path $env:USERPROFILE ".codex-session-vault"
@@ -41,7 +43,7 @@ function Invoke-Sqlite {
     $sqlite = Get-SqliteExe
     if (-not $sqlite) { throw "sqlite3.exe not found" }
 
-    $args = @()
+    $args = @("-cmd", ".bail on", "-cmd", ".timeout 5000")
     if ($Json) { $args += "-json" }
     $args += $Database
     $args += $Sql
@@ -84,55 +86,9 @@ function Convert-IsoToDate {
     try { return ([DateTimeOffset]::Parse($Value)).LocalDateTime } catch { return Get-Date }
 }
 
-function Get-SessionIdFromPath {
-    param([string]$Path)
-    if ($Path -match "([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})") {
-        return $matches[1].ToLowerInvariant()
-    }
-    return ""
-}
-
 function Get-JsonLineObject {
     param([string]$Line)
     try { return $Line | ConvertFrom-Json } catch { return $null }
-}
-
-function Get-SessionMetaFromRollout {
-    param([string]$Path)
-    $meta = [ordered]@{
-        cwd = ""
-        provider = "unknown"
-        model = "unknown"
-        source = "jsonl"
-        title = ""
-    }
-
-    if (-not (Test-Path $Path)) { return [pscustomobject]$meta }
-
-    try {
-        $lines = Get-Content -Path $Path -TotalCount 120 -ErrorAction Stop
-        foreach ($line in $lines) {
-            if ($line -like '*"session_meta"*') {
-                $obj = Get-JsonLineObject $line
-                if ($obj -and $obj.payload) {
-                    if ($obj.payload.cwd) { $meta.cwd = [string]$obj.payload.cwd }
-                    if ($obj.payload.model_provider) { $meta.provider = [string]$obj.payload.model_provider }
-                    if ($obj.payload.model) { $meta.model = [string]$obj.payload.model }
-                    if ($obj.payload.source) { $meta.source = [string]$obj.payload.source }
-                }
-            }
-            if ($line -like '*"user_message"*') {
-                $obj = Get-JsonLineObject $line
-                if ($obj -and $obj.payload -and $obj.payload.message) {
-                    $meta.title = [string]$obj.payload.message
-                    break
-                }
-            }
-        }
-    } catch {
-    }
-
-    return [pscustomobject]$meta
 }
 
 function New-SessionObject {
@@ -176,7 +132,6 @@ function Load-SessionsFromSqlite {
 SELECT
   id,
   title,
-  rollout_path AS rolloutPath,
   cwd,
   model_provider AS modelProvider,
   COALESCE(model, 'unknown') AS model,
@@ -191,12 +146,17 @@ ORDER BY updated_at DESC, created_at DESC;
     if ([string]::IsNullOrWhiteSpace($json)) { return @() }
 
     $rows = @($json | ConvertFrom-Json)
+    $trustedFiles = @(Get-TrustedSessionFileIndex -CodexRoot $script:CodexRoot)
     $result = @()
     foreach ($row in $rows) {
+        $sessionId = Normalize-SessionIdentity $row.id
+        if ($null -eq $sessionId) { continue }
+        $trusted = @($trustedFiles | Where-Object { $_.SessionId -ceq $sessionId } | Select-Object -First 1)
+        $rolloutPath = if ($trusted.Count -gt 0) { $trusted[0].Path } else { "" }
         $result += New-SessionObject `
-            -Id ([string]$row.id) `
+            -Id $sessionId `
             -Title ([string]$row.title) `
-            -RolloutPath ([string]$row.rolloutPath) `
+            -RolloutPath $rolloutPath `
             -Cwd ([string]$row.cwd) `
             -Provider ([string]$row.modelProvider) `
             -Model ([string]$row.model) `
@@ -209,31 +169,23 @@ ORDER BY updated_at DESC, created_at DESC;
 }
 
 function Load-TitleMaps {
-    $titles = @{}
-    $archived = @{}
+    $titles = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::Ordinal)
+    $archived = [System.Collections.Generic.Dictionary[string,bool]]::new([System.StringComparer]::Ordinal)
 
     $history = Join-ChildPath $script:CodexRoot "history.jsonl"
     if (Test-Path $history) {
-        Get-Content -Path $history -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($_ -like '*session_id*') {
-                $obj = Get-JsonLineObject $_
-                if ($obj -and $obj.session_id) {
-                    if ($obj.first_text) { $titles[[string]$obj.session_id] = [string]$obj.first_text }
-                    if ($obj.is_archived -ne $null) { $archived[[string]$obj.session_id] = [bool]$obj.is_archived }
-                }
-            }
+        $document = Read-SessionJsonlFile -Path $history -Kind "history"
+        foreach ($record in $document.Records) {
+            if ($record.Object.first_text) { $titles[$record.SessionId] = [string]$record.Object.first_text }
+            if ($record.Object.is_archived -ne $null) { $archived[$record.SessionId] = [bool]$record.Object.is_archived }
         }
     }
 
     $index = Join-ChildPath $script:CodexRoot "session_index.jsonl"
     if (Test-Path $index) {
-        Get-Content -Path $index -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($_ -like '*"id"*') {
-                $obj = Get-JsonLineObject $_
-                if ($obj -and $obj.id -and $obj.thread_name) {
-                    $titles[[string]$obj.id] = [string]$obj.thread_name
-                }
-            }
+        $document = Read-SessionJsonlFile -Path $index -Kind "sessionIndex"
+        foreach ($record in $document.Records) {
+            if ($record.Object.thread_name) { $titles[$record.SessionId] = [string]$record.Object.thread_name }
         }
     }
 
@@ -242,33 +194,27 @@ function Load-TitleMaps {
 
 function Load-SessionsFromFiles {
     $maps = Load-TitleMaps
-    $files = @()
-    $sessionDir = Join-ChildPath $script:CodexRoot "sessions"
-    $archiveDir = Join-ChildPath $script:CodexRoot "archived_sessions"
-    if (Test-Path $sessionDir) { $files += Get-ChildItem -Path $sessionDir -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue }
-    if (Test-Path $archiveDir) { $files += Get-ChildItem -Path $archiveDir -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue }
-
     $result = @()
-    foreach ($file in $files) {
-        $id = Get-SessionIdFromPath $file.FullName
-        if ([string]::IsNullOrWhiteSpace($id)) { continue }
-
-        $meta = Get-SessionMetaFromRollout $file.FullName
+    foreach ($file in @(Get-TrustedSessionFileIndex -CodexRoot $script:CodexRoot)) {
+        $id = $file.SessionId
+        $meta = $file.Meta
         $title = $meta.title
         if ($maps.Titles.ContainsKey($id)) { $title = $maps.Titles[$id] }
-        $isArchived = $file.FullName -like "*\archived_sessions\*"
+        $isArchived = $file.Path.IndexOf(([System.IO.Path]::DirectorySeparatorChar + "archived_sessions" + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase) -ge 0
         if ($maps.Archived.ContainsKey($id)) { $isArchived = [bool]$maps.Archived[$id] }
+
+        $item = Get-Item -LiteralPath $file.Path
 
         $result += New-SessionObject `
             -Id $id `
             -Title $title `
-            -RolloutPath $file.FullName `
+            -RolloutPath $file.Path `
             -Cwd $meta.cwd `
             -Provider $meta.provider `
             -Model $meta.model `
             -Source $meta.source `
-            -CreatedAt $file.CreationTime `
-            -UpdatedAt $file.LastWriteTime `
+            -CreatedAt $item.CreationTime `
+            -UpdatedAt $item.LastWriteTime `
             -Archived $isArchived
     }
 
@@ -394,61 +340,74 @@ function New-CodexSnapshot {
     return $snapshotPath
 }
 
+function New-SessionProtectionSnapshot {
+    param([string]$Name, [string]$Reason, $Plan)
+    Assert-SessionProtectionPlanFresh -Plan $Plan -Phase "protection preflight"
+
+    if (-not (Test-Path $script:SnapshotRoot)) { New-Item -ItemType Directory -Path $script:SnapshotRoot -Force | Out-Null }
+    $id = (Get-Date).ToString("yyyyMMdd-HHmmss-fff") + "-" + $Reason + "-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+    $snapshotPath = Join-ChildPath $script:SnapshotRoot $id
+    $dataPath = Join-ChildPath $snapshotPath "data"
+    New-Item -ItemType Directory -Path $dataPath -Force | Out-Null
+
+    $staged = @()
+    $includedPaths = @()
+    try {
+        foreach ($file in $Plan.TrustedFiles) {
+            $relative = Get-RelativeTrustedPath -Root $script:CodexRoot -Path $file.Path
+            $destination = Join-ChildPath $dataPath $relative
+            $staged += Copy-SessionStagedFile -SourcePath $file.Path -DestinationPath $destination -ExpectedDigest $file.Fingerprint.Digest
+            $includedPaths += $relative
+        }
+        foreach ($output in $Plan.JsonlPlan.Outputs) {
+            $namePart = Split-Path -Leaf $output.DestinationPath
+            $staged += Write-SessionStagedText -DestinationPath (Join-ChildPath $dataPath $namePart) -Data $output.Data
+            $includedPaths += $namePart
+        }
+
+        Assert-SessionProtectionPlanFresh -Plan $Plan -Phase "protection commit"
+        Publish-SessionStagedFiles -Staged $staged
+
+        $archivedCount = @($Plan.TrustedFiles | Where-Object {
+            $_.Path.IndexOf(([System.IO.Path]::DirectorySeparatorChar + "archived_sessions" + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        }).Count
+        $meta = [ordered]@{
+            id = $id
+            name = $Name
+            createdAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            codexRoot = $script:CodexRoot
+            modelProvider = "unknown"
+            model = "unknown"
+            accountFingerprint = "none"
+            sessionCount = $Plan.SessionIds.Count
+            archivedSessionCount = $archivedCount
+            sizeBytes = Get-DirectorySize $dataPath
+            includedPaths = @($includedPaths)
+            appVersion = "win10-$script:AppVersion"
+        }
+        $metaData = ($meta | ConvertTo-Json -Depth 6) + "`n"
+        $metaStage = Write-SessionStagedText -DestinationPath (Join-ChildPath $snapshotPath "snapshot.json") -Data $metaData
+        Publish-SessionStagedFiles -Staged @($metaStage)
+        return $snapshotPath
+    } catch {
+        foreach ($entry in $staged) { Remove-Item -LiteralPath $entry.TemporaryPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $snapshotPath -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
 function Find-LatestSnapshotRollout {
     param([string]$SessionId)
     $snapshots = @(Load-Snapshots)
     foreach ($snapshot in $snapshots) {
         $data = $snapshot.DataPath
         if (-not (Test-Path $data)) { continue }
-        $candidates = @()
-        $sdir = Join-ChildPath $data "sessions"
-        $adir = Join-ChildPath $data "archived_sessions"
-        if (Test-Path $sdir) { $candidates += Get-ChildItem -Path $sdir -Filter "*$SessionId*.jsonl" -Recurse -File -ErrorAction SilentlyContinue }
-        if (Test-Path $adir) { $candidates += Get-ChildItem -Path $adir -Filter "*$SessionId*.jsonl" -Recurse -File -ErrorAction SilentlyContinue }
-        if ($candidates.Count -gt 0) {
-            return [pscustomobject]@{ Snapshot = $snapshot; Rollout = $candidates[0].FullName }
+        $trusted = Resolve-TrustedSessionFiles -SessionIds @($SessionId) -CodexRoot $data
+        if ($trusted.Files.Count -gt 0) {
+            return [pscustomobject]@{ Snapshot = $snapshot; Rollout = $trusted.Files[0].Path }
         }
     }
     return $null
-}
-
-function Get-RelativeToDataRoot {
-    param([string]$DataRoot, [string]$FilePath)
-    $root = (Resolve-Path $DataRoot).Path.TrimEnd("\")
-    $file = (Resolve-Path $FilePath).Path
-    if ($file.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-        return $file.Substring($root.Length).TrimStart("\")
-    }
-    return (Split-Path -Leaf $FilePath)
-}
-
-function Merge-LinesContaining {
-    param([string]$SourcePath, [string]$DestPath, [string]$Needle)
-    if (-not (Test-Path $SourcePath)) { return }
-    $destDir = Split-Path -Parent $DestPath
-    if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
-
-    $seen = New-Object "System.Collections.Generic.HashSet[string]"
-    $output = New-Object "System.Collections.Generic.List[string]"
-    if (Test-Path $DestPath) {
-        Get-Content -Path $DestPath -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($seen.Add($_)) { $output.Add($_) }
-        }
-    }
-    Get-Content -Path $SourcePath -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_ -like "*$Needle*" -and $seen.Add($_)) { $output.Add($_) }
-    }
-    $output | Set-Content -Path $DestPath -Encoding UTF8
-}
-
-function Remove-LinesContaining {
-    param([string]$Path, [string]$Needle)
-    if (-not (Test-Path $Path)) { return }
-    $output = New-Object "System.Collections.Generic.List[string]"
-    Get-Content -Path $Path -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_ -notlike "*$Needle*") { $output.Add($_) }
-    }
-    $output | Set-Content -Path $Path -Encoding UTF8
 }
 
 function Get-SqliteColumns {
@@ -473,7 +432,7 @@ function Test-SqliteTable {
 }
 
 function Merge-SingleSessionStateDb {
-    param([string]$SnapshotDb, [string]$DestDb, [string]$SessionId)
+    param([string]$SnapshotDb, [string]$DestDb, [string]$SessionId, [string]$RolloutPath = "")
     if (-not (Get-SqliteExe)) { return "sqlite3.exe missing; SQLite merge skipped." }
     if (-not (Test-Path $SnapshotDb) -or -not (Test-Path $DestDb)) { return "SQLite database missing; SQLite merge skipped." }
 
@@ -482,10 +441,12 @@ function Merge-SingleSessionStateDb {
         @{ Table = "thread_goals"; Where = "thread_id = $(Convert-ToSqlLiteral $SessionId)" },
         @{ Table = "thread_dynamic_tools"; Where = "thread_id = $(Convert-ToSqlLiteral $SessionId)" },
         @{ Table = "stage1_outputs"; Where = "thread_id = $(Convert-ToSqlLiteral $SessionId)" },
-        @{ Table = "thread_spawn_edges"; Where = "parent_thread_id = $(Convert-ToSqlLiteral $SessionId) OR child_thread_id = $(Convert-ToSqlLiteral $SessionId)" }
+        @{ Table = "thread_spawn_edges"; Where = "parent_thread_id = $(Convert-ToSqlLiteral $SessionId) OR child_thread_id = $(Convert-ToSqlLiteral $SessionId)" },
+        @{ Table = "agent_job_items"; Where = "assigned_thread_id = $(Convert-ToSqlLiteral $SessionId)" }
     )
 
-    $statements = @()
+    $deletes = @()
+    $inserts = @()
     foreach ($rule in $tableRules) {
         if (-not (Test-SqliteTable -Database $SnapshotDb -Table $rule.Table)) { continue }
         if (-not (Test-SqliteTable -Database $DestDb -Table $rule.Table)) { continue }
@@ -495,21 +456,49 @@ function Merge-SingleSessionStateDb {
         if ($common.Count -eq 0) { continue }
         $cols = ($common | ForEach-Object { Convert-ToSqlIdentifier $_ }) -join ", "
         $table = Convert-ToSqlIdentifier $rule.Table
-        $statements += "INSERT OR REPLACE INTO $table ($cols) SELECT $cols FROM snapshot.$table WHERE $($rule.Where);"
+        $deletes += "DELETE FROM $table WHERE $($rule.Where);"
+        $inserts += "INSERT INTO $table ($cols) SELECT $cols FROM snapshot.$table WHERE $($rule.Where);"
     }
 
-    if ($statements.Count -eq 0) { return "No SQLite rows merged." }
+    if ($inserts.Count -eq 0) { return "No SQLite rows merged." }
+
+    $rolloutUpdate = ""
+    $threadColumns = @(Get-SqliteColumns -Database $DestDb -Table "threads")
+    if (-not [string]::IsNullOrWhiteSpace($RolloutPath) -and
+        $threadColumns -contains "id" -and
+        $threadColumns -contains "rollout_path") {
+        $archivedUpdate = ""
+        if ($threadColumns -contains "archived") {
+            $separator = [System.IO.Path]::DirectorySeparatorChar
+            $isArchived = $RolloutPath.IndexOf(($separator + "archived_sessions" + $separator), [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            $archiveValue = if ($isArchived) { "1" } else { "0" }
+            $archivedUpdate = ", archived = " + $archiveValue
+        }
+        $rolloutUpdate = "UPDATE threads SET rollout_path = $(Convert-ToSqlLiteral $RolloutPath)$archivedUpdate WHERE id = $(Convert-ToSqlLiteral $SessionId);"
+    }
 
     $sql = @"
 PRAGMA foreign_keys = OFF;
+PRAGMA busy_timeout = 5000;
 ATTACH DATABASE $(Convert-ToSqlLiteral $SnapshotDb) AS snapshot;
 BEGIN IMMEDIATE;
-$($statements -join "`n")
+$($deletes -join "`n")
+$($inserts -join "`n")
+$rolloutUpdate
 COMMIT;
 DETACH DATABASE snapshot;
 PRAGMA foreign_keys = ON;
 "@
-    Invoke-Sqlite -Database $DestDb -Sql $sql | Out-Null
+    try {
+        Invoke-Sqlite -Database $DestDb -Sql $sql | Out-Null
+    } catch {
+        if ($_.Exception.Message -match 'constraint|primary key|unique') {
+            $conflict = New-Object System.IO.InvalidDataException("SQLITE_RESTORE_CONFLICT: selected session conflicts with an unselected SQLite row")
+            $conflict.Data['Code'] = 'SQLITE_RESTORE_CONFLICT'
+            throw $conflict
+        }
+        throw
+    }
     return "SQLite index merged."
 }
 
@@ -518,14 +507,25 @@ function Delete-SingleSessionStateDb {
     if (-not (Get-SqliteExe)) { return "sqlite3.exe missing; SQLite delete skipped." }
     if (-not (Test-Path $DestDb)) { return "SQLite database missing; SQLite delete skipped." }
     $sid = Convert-ToSqlLiteral $SessionId
+    $rules = @(
+        @{ Table = "thread_dynamic_tools"; Where = "thread_id = $sid" },
+        @{ Table = "thread_goals"; Where = "thread_id = $sid" },
+        @{ Table = "thread_spawn_edges"; Where = "parent_thread_id = $sid OR child_thread_id = $sid" },
+        @{ Table = "stage1_outputs"; Where = "thread_id = $sid" },
+        @{ Table = "agent_job_items"; Where = "assigned_thread_id = $sid" },
+        @{ Table = "threads"; Where = "id = $sid" }
+    )
+    $deletes = @()
+    foreach ($rule in $rules) {
+        if (Test-SqliteTable -Database $DestDb -Table $rule.Table) {
+            $deletes += "DELETE FROM $(Convert-ToSqlIdentifier $rule.Table) WHERE $($rule.Where);"
+        }
+    }
     $sql = @"
 PRAGMA foreign_keys = OFF;
+PRAGMA busy_timeout = 5000;
 BEGIN IMMEDIATE;
-DELETE FROM thread_dynamic_tools WHERE thread_id = $sid;
-DELETE FROM thread_goals WHERE thread_id = $sid;
-DELETE FROM thread_spawn_edges WHERE parent_thread_id = $sid OR child_thread_id = $sid;
-DELETE FROM stage1_outputs WHERE thread_id = $sid;
-DELETE FROM threads WHERE id = $sid;
+$($deletes -join "`n")
 COMMIT;
 PRAGMA foreign_keys = ON;
 "@
@@ -545,22 +545,20 @@ function Restore-SessionFromLatestSnapshot {
     $answer = [System.Windows.Forms.MessageBox]::Show($question, "Restore session", [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Warning)
     if ($answer -ne [System.Windows.Forms.DialogResult]::OK) { return }
 
-    New-CodexSnapshot -Name "Pre-Single-Session Restore Backup" -Reason "pre-single-session-restore" -Candidates (Get-ConversationBackupCandidates) | Out-Null
+    $restorePlan = New-SessionRestorePlan -SessionIds @($Session.Id) -SourceRoot $match.Snapshot.DataPath -DestinationRoot $script:CodexRoot
+    $protectionPlan = New-SessionProtectionPlan -SessionIds @($Session.Id) -CodexRoot $script:CodexRoot
+    New-SessionProtectionSnapshot -Name "Pre-Single-Session Restore Backup" -Reason "pre-single-session-restore" -Plan $protectionPlan | Out-Null
+    Invoke-SessionRestorePlan -Plan $restorePlan
 
-    $rel = Get-RelativeToDataRoot -DataRoot $match.Snapshot.DataPath -FilePath $match.Rollout
-    $destRollout = Join-ChildPath $script:CodexRoot $rel
-    $destParent = Split-Path -Parent $destRollout
-    if (-not (Test-Path $destParent)) { New-Item -ItemType Directory -Path $destParent -Force | Out-Null }
-    Copy-Item -Path $match.Rollout -Destination $destRollout -Force
-
-    foreach ($lineFile in @("history.jsonl", "history.jsonl.bak", "session_index.jsonl")) {
-        Merge-LinesContaining -SourcePath (Join-ChildPath $match.Snapshot.DataPath $lineFile) -DestPath (Join-ChildPath $script:CodexRoot $lineFile) -Needle $Session.Id
-    }
-
+    $restoredRollout = @($restorePlan.Rollouts | Where-Object {
+        $_.SessionId -ceq (Normalize-SessionIdentity $Session.Id)
+    } | Select-Object -First 1)
+    $restoredRolloutPath = if ($restoredRollout.Count -gt 0) { $restoredRollout[0].DestinationPath } else { "" }
     $sqliteMsg = Merge-SingleSessionStateDb `
         -SnapshotDb (Join-ChildPath $match.Snapshot.DataPath "state_5.sqlite") `
         -DestDb (Join-ChildPath $script:CodexRoot "state_5.sqlite") `
-        -SessionId $Session.Id
+        -SessionId $Session.Id `
+        -RolloutPath $restoredRolloutPath
 
     Refresh-App
     [System.Windows.Forms.MessageBox]::Show("Restore finished.`r`n$sqliteMsg", "Restore", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
@@ -571,17 +569,14 @@ function Delete-SelectedSession {
     $answer = [System.Windows.Forms.MessageBox]::Show("Delete session after creating backup?`r`n`r`n$($Session.Title)", "Delete session", [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Warning)
     if ($answer -ne [System.Windows.Forms.DialogResult]::OK) { return }
 
-    New-CodexSnapshot -Name "Pre-Delete Session Backup" -Reason "pre-delete-session" -Candidates (Get-BackupCandidates) | Out-Null
-
-    if ($Session.RolloutPath -and (Test-Path $Session.RolloutPath)) {
-        Remove-Item -Path $Session.RolloutPath -Force
-    }
-    foreach ($lineFile in @("history.jsonl", "history.jsonl.bak", "session_index.jsonl")) {
-        Remove-LinesContaining -Path (Join-ChildPath $script:CodexRoot $lineFile) -Needle $Session.Id
-    }
+    $deletionPlan = New-SessionDeletionPlan -SessionIds @($Session.Id) -CodexRoot $script:CodexRoot
+    $protectionPlan = New-SessionProtectionPlan -SessionIds @($Session.Id) -CodexRoot $script:CodexRoot
+    New-SessionProtectionSnapshot -Name "Pre-Delete Session Backup" -Reason "pre-delete-session" -Plan $protectionPlan | Out-Null
+    $warning = Invoke-SessionDeletionPlan -Plan $deletionPlan
     $sqliteMsg = Delete-SingleSessionStateDb -DestDb (Join-ChildPath $script:CodexRoot "state_5.sqlite") -SessionId $Session.Id
     Refresh-App
-    [System.Windows.Forms.MessageBox]::Show("Delete finished.`r`n$sqliteMsg", "Delete", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    $warningText = if ([string]::IsNullOrWhiteSpace($warning)) { "" } else { "`r`n$warning" }
+    [System.Windows.Forms.MessageBox]::Show("Delete finished.`r`n$sqliteMsg$warningText", "Delete", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 }
 
 function Extract-ConversationText {

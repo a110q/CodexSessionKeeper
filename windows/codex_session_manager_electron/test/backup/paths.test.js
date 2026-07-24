@@ -7,8 +7,35 @@ const { backupPaths } = require('../../src/backup/paths');
 const homeDir = 'C:\\Users\\Ada';
 
 test('backup model constants are exported', () => {
-  assert.equal(MANIFEST_VERSION, 1);
-  assert.equal(AGENT_VERSION, '1.0.0');
+  assert.equal(MANIFEST_VERSION, 2);
+  assert.equal(AGENT_VERSION, '2.0.0');
+});
+
+test('backupPaths splits NAS content from local state and mirrors source paths', () => {
+  const pathImpl = require('node:path');
+  const paths = backupPaths({
+    homeDir: '/home/ada',
+    codexRoot: '/home/ada/.codex',
+    backupRoot: '/mnt/nas/device/incremental-backups',
+    stateRoot: '/home/ada/.codex-session-vault/nas-state/device',
+    pathImpl,
+  });
+
+  assert.ok(paths.cursorDatabasePath.startsWith(paths.stateRoot));
+  assert.ok(paths.auditStatePath.startsWith(paths.stateRoot));
+  assert.ok(paths.localStatusPath.startsWith(paths.stateRoot));
+  assert.ok(paths.manifestPath.startsWith(paths.backupRoot));
+  assert.ok(paths.verificationPath.startsWith(paths.backupRoot));
+  assert.ok(paths.remoteStatusPath.startsWith(paths.backupRoot));
+  assert.equal(paths.repairQuarantineRoot, pathImpl.join(paths.backupRoot, 'repair-quarantine'));
+  assert.equal(
+    paths.backupFilePath('/home/ada/.codex/sessions/2026/07/active.jsonl'),
+    '/mnt/nas/device/incremental-backups/sessions/2026/07/active.jsonl',
+  );
+  assert.equal(
+    paths.backupFilePath('/home/ada/.codex/archived_sessions/2026/07/old.jsonl'),
+    '/mnt/nas/device/incremental-backups/archived_sessions/2026/07/old.jsonl',
+  );
 });
 
 test('backupPaths returns the Windows backup layout', () => {
@@ -18,7 +45,10 @@ test('backupPaths returns the Windows backup layout', () => {
   assert.equal(paths.vaultRoot, 'C:\\Users\\Ada\\.codex-session-vault');
   assert.equal(paths.backupRoot, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups');
   assert.equal(paths.manifestPath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\manifest.json');
+  assert.equal(paths.verificationPath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\verification.json');
   assert.equal(paths.cursorDatabasePath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\cursors.sqlite');
+  assert.equal(paths.auditStatePath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\integrity-audit.json');
+  assert.equal(paths.repairQuarantineRoot, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\repair-quarantine');
   assert.equal(paths.statusPath, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\status.json');
   assert.equal(paths.sessionsRoot, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\sessions');
   assert.equal(paths.logsRoot, 'C:\\Users\\Ada\\.codex-session-vault\\incremental-backups\\logs');

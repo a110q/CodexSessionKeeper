@@ -12,6 +12,24 @@ public enum BackupHealthStatus: String, Codable, Sendable {
     case paused
 }
 
+public struct IntegrityAuditState: Codable, Equatable, Sendable {
+    public var lastCompletedAt: Date?
+    public var lastResult: String?
+    public var repairedCount: Int
+
+    public init(lastCompletedAt: Date?, lastResult: String?, repairedCount: Int) {
+        self.lastCompletedAt = lastCompletedAt
+        self.lastResult = lastResult
+        self.repairedCount = repairedCount
+    }
+}
+
+public enum IntegrityAuditOutcome: Equatable, Sendable {
+    case notDue
+    case completed(checked: Int, repaired: Int)
+    case interrupted
+}
+
 public struct BackupSessionRecord: Codable, Equatable, Sendable {
     public var sessionId: String
     public var sourcePath: String
@@ -22,6 +40,7 @@ public struct BackupSessionRecord: Codable, Equatable, Sendable {
     public var lineCount: Int
     public var bytesBackedUp: Int64
     public var status: String
+    public var contentHash: String?
 
     public init(
         sessionId: String,
@@ -32,7 +51,8 @@ public struct BackupSessionRecord: Codable, Equatable, Sendable {
         lastBackedUpAt: Date?,
         lineCount: Int,
         bytesBackedUp: Int64,
-        status: String
+        status: String,
+        contentHash: String? = nil
     ) {
         self.sessionId = sessionId
         self.sourcePath = sourcePath
@@ -43,6 +63,7 @@ public struct BackupSessionRecord: Codable, Equatable, Sendable {
         self.lineCount = lineCount
         self.bytesBackedUp = bytesBackedUp
         self.status = status
+        self.contentHash = contentHash
     }
 }
 
@@ -55,7 +76,7 @@ public struct BackupManifest: Codable, Equatable, Sendable {
     public var sessions: [String: BackupSessionRecord]
 
     public init(
-        version: Int = 1,
+        version: Int = 2,
         codexRoot: String,
         backupRoot: String,
         createdAt: Date,
@@ -87,6 +108,10 @@ public struct BackupStatus: Codable, Equatable, Sendable {
     public var bytesBackedUp: Int64
     public var autoStartEnabled: Bool
     public var lastError: String?
+    public var lastAuditAt: Date?
+    public var lastAuditResult: String?
+    public var lastRepairAt: Date?
+    public var repairCount: Int?
 
     public init(
         agentVersion: String,
@@ -103,7 +128,11 @@ public struct BackupStatus: Codable, Equatable, Sendable {
         lineCount: Int,
         bytesBackedUp: Int64,
         autoStartEnabled: Bool,
-        lastError: String?
+        lastError: String?,
+        lastAuditAt: Date? = nil,
+        lastAuditResult: String? = nil,
+        lastRepairAt: Date? = nil,
+        repairCount: Int? = nil
     ) {
         self.agentVersion = agentVersion
         self.enabled = enabled
@@ -120,5 +149,9 @@ public struct BackupStatus: Codable, Equatable, Sendable {
         self.bytesBackedUp = bytesBackedUp
         self.autoStartEnabled = autoStartEnabled
         self.lastError = lastError
+        self.lastAuditAt = lastAuditAt
+        self.lastAuditResult = lastAuditResult
+        self.lastRepairAt = lastRepairAt
+        self.repairCount = repairCount
     }
 }

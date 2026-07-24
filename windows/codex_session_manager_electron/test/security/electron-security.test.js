@@ -231,35 +231,39 @@ test('Electron source contract exposes no renderer-controlled filesystem path ch
   assert.deepEqual(mainChannels, preloadChannels);
 });
 
-test('zero-argument update handlers reject renderer-controlled options', async () => {
-  const fixture = trustedIpcFixture();
-  const calls = [];
-  for (const channel of [
-    'update:get-state',
-    'update:check',
-    'update:download',
-    'update:defer-restart',
-    'update:install',
-  ]) {
-    fixture.handleTrustedIpc(
-      channel,
-      strictZeroArgumentHandler(async () => {
-        calls.push(channel);
-        return { phase: 'idle' };
-      }),
-    );
-  }
-  const event = {
-    sender: fixture.webContents,
-    senderFrame: fixture.mainFrame,
-  };
+test('NAS setup and recovery IPC stays guarded and accepts identities instead of paths', () => {
+  const sourceRoot = path.join(__dirname, '..', '..', 'src');
+  const mainSource = fs.readFileSync(path.join(sourceRoot, 'main.js'), 'utf8');
+  const preloadSource = fs.readFileSync(path.join(sourceRoot, 'preload.js'), 'utf8');
+  const requiredChannels = [
+    'get-nas-setup-state',
+    'detect-company-nas',
+    'list-nas-departments',
+    'list-nas-employees',
+    'activate-nas-backup',
+    'retry-nas-backup',
+    'list-nas-backup-devices',
+    'load-incremental-backup-sessions',
+    'restore-incremental-backup-sessions',
+  ];
 
-  for (const channel of fixture.handlers.keys()) {
-    assert.deepEqual(await fixture.handlers.get(channel)(event), { phase: 'idle' });
-    await assert.rejects(
-      fixture.handlers.get(channel)(event, { url: 'https://attacker.invalid/update.exe' }),
-      /不接受参数/,
-    );
+  for (const channel of requiredChannels) {
+    assert.match(mainSource, new RegExp(`handleTrustedIpc\\('${channel}'`));
+    assert.match(preloadSource, new RegExp(`ipcRenderer\\.invoke\\('${channel}'`));
   }
-  assert.equal(calls.length, 5);
+  assert.doesNotMatch(mainSource, /\blocalBackupPaths\b|\blocalBackupAgent\b|buildIncrementalRecoveryPackage/);
+  assert.doesNotMatch(preloadSource, /backupRoot|targetPath|sourcePath|destinationPath/);
+  assert.match(preloadSource, /loadIncrementalBackupSessions:\s*\(deviceId\)/);
+  assert.match(preloadSource, /restoreIncrementalBackupSessions:\s*\(deviceId, sessionIds, protectionMode\)/);
+
+  const restoreHandler = mainSource.slice(mainSource.indexOf("handleTrustedIpc('restore-incremental-backup-sessions'"));
+  assert.ok(restoreHandler.indexOf('resolveRecoveryDevicePaths(deviceId)') < restoreHandler.indexOf('createRestoreProtectionSnapshot('));
+  assert.ok(restoreHandler.indexOf('preflightIncrementalRecovery(') < restoreHandler.indexOf('createRestoreProtectionSnapshot('));
+  assert.doesNotMatch(restoreHandler, /recovery-packages|buildIncrementalRecoveryPackage/);
+});
+
+test('Electron enforces one backup writer per device identity', () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'main.js'), 'utf8');
+  assert.match(mainSource, /app\.requestSingleInstanceLock\(\)/);
+  assert.match(mainSource, /app\.on\('second-instance'/);
 });

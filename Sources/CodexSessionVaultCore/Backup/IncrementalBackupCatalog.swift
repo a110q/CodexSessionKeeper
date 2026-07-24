@@ -136,7 +136,7 @@ public final class IncrementalBackupCatalog {
         return fileURL.path
     }
 
-    private func validatedBackupFileURL(for record: BackupSessionRecord) throws -> URL {
+    func validatedBackupFileURL(for record: BackupSessionRecord) throws -> URL {
         guard !record.backupPath.isEmpty else {
             throw CatalogError.invalidBackupPath(
                 sessionID: record.sessionId,

@@ -7,10 +7,12 @@ public struct BackupCursor: Equatable, Sendable {
     public var lastByteOffset: Int64
     public var lastSourceSize: Int64
     public var lastSourceModifiedAt: TimeInterval
+    public var sourceFileIdentity: String?
     public var lineCount: Int
     public var pendingPartialLine: Data
     public var status: String
     public var lastError: String?
+    public var blockedLineLimitBytes: Int?
     public var updatedAt: TimeInterval
 
     public init(
@@ -24,7 +26,9 @@ public struct BackupCursor: Equatable, Sendable {
         pendingPartialLine: Data,
         status: String,
         lastError: String?,
-        updatedAt: TimeInterval
+        updatedAt: TimeInterval,
+        sourceFileIdentity: String? = nil,
+        blockedLineLimitBytes: Int? = nil
     ) {
         self.sessionId = sessionId
         self.sourcePath = sourcePath
@@ -32,10 +36,12 @@ public struct BackupCursor: Equatable, Sendable {
         self.lastByteOffset = lastByteOffset
         self.lastSourceSize = lastSourceSize
         self.lastSourceModifiedAt = lastSourceModifiedAt
+        self.sourceFileIdentity = sourceFileIdentity
         self.lineCount = lineCount
         self.pendingPartialLine = pendingPartialLine
         self.status = status
         self.lastError = lastError
+        self.blockedLineLimitBytes = blockedLineLimitBytes
         self.updatedAt = updatedAt
     }
 }
@@ -45,21 +51,52 @@ public final class BackupCursorStore {
     private let sqlitePath: String
     private let fileManager: FileManager
     private let decoder: JSONDecoder
+    private let sqliteRunner: (([String], String) throws -> String)?
 
     public init(databaseURL: URL, sqlitePath: String = "/usr/bin/sqlite3") {
         self.databaseURL = databaseURL
         self.sqlitePath = sqlitePath
         self.fileManager = .default
         self.decoder = JSONDecoder()
+        self.sqliteRunner = nil
+    }
+
+    init(
+        databaseURL: URL,
+        sqlitePath: String = "/usr/bin/sqlite3",
+        sqliteRunner: @escaping ([String], String) throws -> String
+    ) {
+        self.databaseURL = databaseURL
+        self.sqlitePath = sqlitePath
+        self.fileManager = .default
+        self.decoder = JSONDecoder()
+        self.sqliteRunner = sqliteRunner
     }
 
     public func open() throws {
+        let parent = databaseURL.deletingLastPathComponent()
         try fileManager.createDirectory(
-            at: databaseURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+            at: parent,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
         )
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+        if (try? fileManager.destinationOfSymbolicLink(atPath: databaseURL.path)) != nil {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        let databaseExisted = fileManager.fileExists(atPath: databaseURL.path)
+        if !databaseExisted {
+            guard fileManager.createFile(
+                atPath: databaseURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: databaseURL.path)
 
-        try execute("""
+        let createTable = """
         CREATE TABLE IF NOT EXISTS backup_cursors (
             source_path TEXT NOT NULL PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -67,16 +104,62 @@ public final class BackupCursorStore {
             last_byte_offset INTEGER NOT NULL,
             last_source_size INTEGER NOT NULL,
             last_source_modified_at REAL NOT NULL,
+            source_file_identity TEXT,
             line_count INTEGER NOT NULL,
             pending_partial_line TEXT NOT NULL,
             status TEXT NOT NULL,
             last_error TEXT,
+            blocked_line_limit_bytes INTEGER,
             updated_at REAL NOT NULL
         );
-        """)
+        """
+        if databaseExisted {
+            let columns = try cursorColumnNames()
+            if columns.isEmpty {
+                try execute(createTable)
+            } else {
+                var migrations: [String] = []
+                if !columns.contains("source_file_identity") {
+                    migrations.append("ALTER TABLE backup_cursors ADD COLUMN source_file_identity TEXT;")
+                }
+                if !columns.contains("blocked_line_limit_bytes") {
+                    migrations.append("ALTER TABLE backup_cursors ADD COLUMN blocked_line_limit_bytes INTEGER;")
+                    migrations.append("""
+                    UPDATE backup_cursors
+                    SET blocked_line_limit_bytes = 33554432
+                    WHERE blocked_line_limit_bytes IS NULL
+                      AND substr(
+                          last_error,
+                          1,
+                          length('Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset ')
+                      ) COLLATE BINARY = 'Session JSONL line exceeds maximum JSONL line size of 33554432 bytes at offset ';
+                    """)
+                }
+                if !migrations.isEmpty {
+                    try execute("""
+                    .bail on
+                    .timeout 5000
+                    BEGIN IMMEDIATE;
+                    \(migrations.joined(separator: "\n"))
+                    COMMIT;
+                    """)
+                }
+            }
+        } else {
+            try execute(createTable)
+        }
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: databaseURL.path)
     }
 
-    public func cursor(sourcePath: String) throws -> BackupCursor? {
+    public func loadAll() throws -> [String: BackupCursor] {
+        try loadAll(readOnly: false)
+    }
+
+    func loadAllReadOnly() throws -> [String: BackupCursor] {
+        try loadAll(readOnly: true)
+    }
+
+    private func loadAll(readOnly: Bool) throws -> [String: BackupCursor] {
         let output = try queryJSON("""
         SELECT
             session_id,
@@ -85,32 +168,71 @@ public final class BackupCursorStore {
             last_byte_offset,
             last_source_size,
             last_source_modified_at,
+            source_file_identity,
             line_count,
             pending_partial_line,
             status,
             last_error,
+            blocked_line_limit_bytes,
             updated_at
         FROM backup_cursors
-        WHERE source_path = \(Self.sqlText(sourcePath))
-        LIMIT 1;
-        """)
+        ORDER BY source_path COLLATE BINARY ASC;
+        """, readOnly: readOnly)
 
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
+            return [:]
         }
 
         let rows = try decoder.decode([CursorRow].self, from: Data(output.utf8))
-        guard let row = rows.first else {
-            return nil
+        var cursors: [String: BackupCursor] = [:]
+        cursors.reserveCapacity(rows.count)
+
+        for row in rows {
+            let cursor = try row.cursor()
+            guard cursors.updateValue(cursor, forKey: cursor.sourcePath) == nil else {
+                throw BackupCursorStoreError.duplicateSourcePath(cursor.sourcePath)
+            }
         }
 
-        return try row.cursor()
+        return cursors
+    }
+
+    public func cursor(sourcePath: String) throws -> BackupCursor? {
+        try loadAll()[sourcePath]
     }
 
     public func upsert(_ cursor: BackupCursor) throws {
+        try upsertMany([cursor])
+    }
+
+    public func upsertMany(
+        _ cursors: [BackupCursor],
+        deletingSourcePaths: [String] = []
+    ) throws {
+        let upsertedSourcePaths = Set(cursors.map(\.sourcePath))
+        let deletedSourcePaths = Set(deletingSourcePaths).subtracting(upsertedSourcePaths)
+        guard !cursors.isEmpty || !deletedSourcePaths.isEmpty else {
+            return
+        }
+
+        let deletions = deletedSourcePaths.sorted().map { sourcePath in
+            "DELETE FROM backup_cursors WHERE source_path = \(Self.sqlText(sourcePath));"
+        }.joined(separator: "\n")
+        let statements = cursors.map(Self.upsertStatement).joined(separator: "\n")
+        try execute("""
+        .bail on
+        .timeout 5000
+        BEGIN IMMEDIATE;
+        \(deletions)
+        \(statements)
+        COMMIT;
+        """)
+    }
+
+    private static func upsertStatement(_ cursor: BackupCursor) -> String {
         let pendingPartialLine = cursor.pendingPartialLine.base64EncodedString()
 
-        try execute("""
+        return """
         INSERT INTO backup_cursors (
             source_path,
             session_id,
@@ -118,10 +240,12 @@ public final class BackupCursorStore {
             last_byte_offset,
             last_source_size,
             last_source_modified_at,
+            source_file_identity,
             line_count,
             pending_partial_line,
             status,
             last_error,
+            blocked_line_limit_bytes,
             updated_at
         ) VALUES (
             \(Self.sqlText(cursor.sourcePath)),
@@ -130,10 +254,12 @@ public final class BackupCursorStore {
             \(cursor.lastByteOffset),
             \(cursor.lastSourceSize),
             \(cursor.lastSourceModifiedAt),
+            \(Self.sqlNullableText(cursor.sourceFileIdentity)),
             \(cursor.lineCount),
             \(Self.sqlText(pendingPartialLine)),
             \(Self.sqlText(cursor.status)),
             \(Self.sqlNullableText(cursor.lastError)),
+            \(Self.sqlNullableInt(cursor.blockedLineLimitBytes)),
             \(cursor.updatedAt)
         )
         ON CONFLICT(source_path) DO UPDATE SET
@@ -142,20 +268,37 @@ public final class BackupCursorStore {
             last_byte_offset = excluded.last_byte_offset,
             last_source_size = excluded.last_source_size,
             last_source_modified_at = excluded.last_source_modified_at,
+            source_file_identity = excluded.source_file_identity,
             line_count = excluded.line_count,
             pending_partial_line = excluded.pending_partial_line,
             status = excluded.status,
             last_error = excluded.last_error,
+            blocked_line_limit_bytes = excluded.blocked_line_limit_bytes,
             updated_at = excluded.updated_at;
-        """)
+        """
     }
 
     private func execute(_ sql: String) throws {
         _ = try runSQLite(arguments: baseSQLiteArguments + [databaseURL.path], input: sql)
     }
 
-    private func queryJSON(_ sql: String) throws -> String {
-        try runSQLite(arguments: baseSQLiteArguments + ["-json", databaseURL.path], input: sql)
+    private func queryJSON(_ sql: String, readOnly: Bool = false) throws -> String {
+        let mode = readOnly ? ["-readonly"] : []
+        return try runSQLite(
+            arguments: baseSQLiteArguments + mode + ["-json", databaseURL.path],
+            input: sql
+        )
+    }
+
+    private func cursorColumnNames() throws -> Set<String> {
+        let output = try queryJSON(
+            "SELECT name FROM pragma_table_info('backup_cursors') ORDER BY cid;",
+            readOnly: true
+        )
+        guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+        return Set(try decoder.decode([CursorColumnRow].self, from: Data(output.utf8)).map(\.name))
     }
 
     private var baseSQLiteArguments: [String] {
@@ -163,6 +306,10 @@ public final class BackupCursorStore {
     }
 
     private func runSQLite(arguments: [String], input: String) throws -> String {
+        if let sqliteRunner {
+            return try sqliteRunner(arguments, input)
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: sqlitePath)
         process.arguments = arguments
@@ -212,7 +359,7 @@ public final class BackupCursorStore {
     private static func drain(_ pipe: Pipe, into collector: PipeDataCollector, group: DispatchGroup) {
         group.enter()
         let reader = pipe.fileHandleForReading
-        DispatchQueue.global(qos: .utility).async {
+        Thread.detachNewThread {
             let data = reader.readDataToEndOfFile()
             try? reader.close()
             collector.append(data)
@@ -230,6 +377,10 @@ public final class BackupCursorStore {
         }
         return sqlText(value)
     }
+
+    private static func sqlNullableInt(_ value: Int?) -> String {
+        value.map(String.init) ?? "NULL"
+    }
 }
 
 private struct CursorRow: Decodable {
@@ -239,10 +390,12 @@ private struct CursorRow: Decodable {
     var lastByteOffset: Int64
     var lastSourceSize: Int64
     var lastSourceModifiedAt: TimeInterval
+    var sourceFileIdentity: String?
     var lineCount: Int
     var pendingPartialLine: String
     var status: String
     var lastError: String?
+    var blockedLineLimitBytes: Int?
     var updatedAt: TimeInterval
 
     enum CodingKeys: String, CodingKey {
@@ -252,10 +405,12 @@ private struct CursorRow: Decodable {
         case lastByteOffset = "last_byte_offset"
         case lastSourceSize = "last_source_size"
         case lastSourceModifiedAt = "last_source_modified_at"
+        case sourceFileIdentity = "source_file_identity"
         case lineCount = "line_count"
         case pendingPartialLine = "pending_partial_line"
         case status
         case lastError = "last_error"
+        case blockedLineLimitBytes = "blocked_line_limit_bytes"
         case updatedAt = "updated_at"
     }
 
@@ -275,15 +430,22 @@ private struct CursorRow: Decodable {
             pendingPartialLine: pendingPartialLineData,
             status: status,
             lastError: lastError,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            sourceFileIdentity: sourceFileIdentity,
+            blockedLineLimitBytes: blockedLineLimitBytes
         )
     }
+}
+
+private struct CursorColumnRow: Decodable {
+    var name: String
 }
 
 private enum BackupCursorStoreError: Error, Sendable {
     case launchFailed(sqlitePath: String, underlying: Error)
     case sqliteFailed(status: Int32, stderr: String)
     case invalidPendingPartialLine
+    case duplicateSourcePath(String)
 }
 
 extension BackupCursorStoreError: LocalizedError {
@@ -299,6 +461,8 @@ extension BackupCursorStoreError: LocalizedError {
             }
         case .invalidPendingPartialLine:
             "Stored backup cursor has invalid base64 pending partial line data."
+        case let .duplicateSourcePath(sourcePath):
+            "Stored backup cursors contain duplicate source path: \(sourcePath)"
         }
     }
 }

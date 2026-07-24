@@ -1,0 +1,38 @@
+appId: local.codex.session-manager
+productName: codex_会话管理
+artifactName: CodexSessionKeeper-${version}-windows-${arch}-Setup.${ext}
+asar: false
+directories:
+  output: ../../dist/windows
+  buildResources: build
+files:
+  - src/**/*
+  - src/lifecycle.js
+  - src/backup/**/*
+  - vendor/sqlite3.exe
+  - package.json
+extraResources:
+  - from: ../../Config/UpdateKeys.json
+    to: UpdateKeys.json
+  - from: ../../Config/UpdateServer.json
+    to: UpdateServer.json
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  packElevateHelper: false
+  allowToChangeInstallationDirectory: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: codex_会话管理
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false
+  include: build/installer.nsh
+publish:
+  - provider: generic
+    url: http://192.168.10.54:18080/codex-session-keeper/stable/windows/

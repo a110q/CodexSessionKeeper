@@ -5,10 +5,18 @@ public final class BackupManifestStore {
     private let fileManager: FileManager
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+    private let writer: DurableAtomicWriter
+    private let createParentDirectories: Bool
 
-    public init(manifestURL: URL) {
+    public init(
+        manifestURL: URL,
+        createParentDirectories: Bool = true,
+        writer: DurableAtomicWriter = DurableAtomicWriter()
+    ) {
         self.manifestURL = manifestURL
         self.fileManager = .default
+        self.createParentDirectories = createParentDirectories
+        self.writer = writer
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -27,7 +35,7 @@ public final class BackupManifestStore {
     ) throws -> BackupManifest {
         guard fileManager.fileExists(atPath: manifestURL.path) else {
             return BackupManifest(
-                version: 1,
+                version: 2,
                 codexRoot: codexRoot,
                 backupRoot: backupRoot,
                 createdAt: now,
@@ -41,13 +49,11 @@ public final class BackupManifestStore {
     }
 
     public func save(_ manifest: BackupManifest) throws {
-        let parentDirectory = manifestURL.deletingLastPathComponent()
-        try fileManager.createDirectory(
-            at: parentDirectory,
-            withIntermediateDirectories: true
-        )
-
         let data = try encoder.encode(manifest)
-        try data.write(to: manifestURL, options: [.atomic])
+        try writer.write(
+            data,
+            to: manifestURL,
+            createParentDirectories: createParentDirectories
+        )
     }
 }
