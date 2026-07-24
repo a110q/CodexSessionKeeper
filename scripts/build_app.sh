@@ -5,6 +5,19 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="codex_会话管理"
 APP_VERSION="${APP_VERSION:-1.1.0}"
 APP_BUILD="${APP_BUILD:-10100}"
+DISABLE_SWIFTPM_SANDBOX="${DISABLE_SWIFTPM_SANDBOX:-0}"
+case "$DISABLE_SWIFTPM_SANDBOX" in
+  0)
+    SWIFT_BUILD_ARGUMENTS=(-c release)
+    ;;
+  1)
+    SWIFT_BUILD_ARGUMENTS=(-c release --disable-sandbox)
+    ;;
+  *)
+    echo "DISABLE_SWIFTPM_SANDBOX must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 UPDATE_SCOPE="${UPDATE_SCOPE:-stable}"
 case "$UPDATE_SCOPE" in
   stable)
@@ -26,6 +39,7 @@ DIST_DIR="$ROOT_DIR/dist"
 MACOS_DIST_DIR="$DIST_DIR/macos"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 ARCHIVE_PATH="$MACOS_DIST_DIR/CodexSessionKeeper-$APP_VERSION-macos-arm64.zip"
+DMG_PATH="$MACOS_DIST_DIR/CodexSessionKeeper-$APP_VERSION-macos-arm64.dmg"
 SPARKLE_FRAMEWORK_SOURCE="$ROOT_DIR/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 
 [[ -f "$UPDATE_SERVER_CONFIG" ]] || { echo "missing update server config: $UPDATE_SERVER_CONFIG" >&2; exit 2; }
@@ -33,7 +47,14 @@ SPARKLE_FRAMEWORK_SOURCE="$ROOT_DIR/.build/artifacts/sparkle/Sparkle/Sparkle.xcf
 
 SERVER_PLIST="$(mktemp "${TMPDIR:-/tmp}/codex-update-server.XXXXXX.plist")"
 KEYS_PLIST="$(mktemp "${TMPDIR:-/tmp}/codex-update-keys.XXXXXX.plist")"
-trap 'rm -f "$SERVER_PLIST" "$KEYS_PLIST"' EXIT
+DMG_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/codex-macos-dmg.XXXXXX")"
+cleanup() {
+  rm -f "$SERVER_PLIST" "$KEYS_PLIST"
+  if [[ -d "$DMG_STAGE" && "$DMG_STAGE" == *"/codex-macos-dmg."* ]]; then
+    rm -rf "$DMG_STAGE"
+  fi
+}
+trap cleanup EXIT
 /usr/bin/plutil -convert xml1 -o "$SERVER_PLIST" "$UPDATE_SERVER_CONFIG"
 /usr/bin/plutil -convert xml1 -o "$KEYS_PLIST" "$UPDATE_KEYS"
 UPDATE_BASE_URL="$(/usr/libexec/PlistBuddy -c 'Print :releaseBaseURL' "$SERVER_PLIST")"
@@ -49,7 +70,7 @@ SPARKLE_PUBLIC_KEY="$(/usr/libexec/PlistBuddy -c 'Print :sparklePublicEDKey' "$K
 }
 
 cd "$ROOT_DIR"
-swift build -c release
+swift build "${SWIFT_BUILD_ARGUMENTS[@]}"
 
 [[ -d "$SPARKLE_FRAMEWORK_SOURCE" ]] || {
   echo "missing resolved Sparkle framework: $SPARKLE_FRAMEWORK_SOURCE" >&2
@@ -130,6 +151,26 @@ done
 /usr/bin/codesign --force --sign - --preserve-metadata=identifier,entitlements,flags,runtime "$APP_DIR/Contents/Frameworks/Sparkle.framework"
 /usr/bin/codesign --force --sign - "$APP_DIR"
 
+ARCHS="$(/usr/bin/lipo -archs "$APP_DIR/Contents/MacOS/CodexSessionVault")"
+[[ "$ARCHS" == "arm64" ]] || {
+  echo "unexpected application architectures: $ARCHS" >&2
+  exit 2
+}
+/usr/bin/codesign --verify --deep --strict "$APP_DIR"
+
 rm -f "$ARCHIVE_PATH"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ARCHIVE_PATH"
+
+/usr/bin/ditto "$APP_DIR" "$DMG_STAGE/$APP_NAME.app"
+/bin/ln -s /Applications "$DMG_STAGE/Applications"
+rm -f "$DMG_PATH"
+/usr/bin/hdiutil create \
+  -volname "$APP_NAME" \
+  -srcfolder "$DMG_STAGE" \
+  -format UDZO \
+  -fs HFS+ \
+  "$DMG_PATH"
+/usr/bin/hdiutil verify "$DMG_PATH"
+
 echo "$ARCHIVE_PATH"
+echo "$DMG_PATH"
