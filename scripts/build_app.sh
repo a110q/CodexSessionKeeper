@@ -5,7 +5,21 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="codex_会话管理"
 APP_VERSION="${APP_VERSION:-1.1.0}"
 APP_BUILD="${APP_BUILD:-10100}"
-UPDATE_SERVER_CONFIG="$ROOT_DIR/Config/UpdateServer.json"
+UPDATE_SCOPE="${UPDATE_SCOPE:-stable}"
+case "$UPDATE_SCOPE" in
+  stable)
+    UPDATE_SERVER_CONFIG="$ROOT_DIR/Config/UpdateServer.json"
+    EXPECTED_UPDATE_BASE_URL="http://192.168.10.54:18080/codex-session-keeper/stable/"
+    ;;
+  testing)
+    UPDATE_SERVER_CONFIG="$ROOT_DIR/Config/UpdateServer.testing.json"
+    EXPECTED_UPDATE_BASE_URL="http://192.168.10.54:18080/codex-session-keeper/testing/"
+    ;;
+  *)
+    echo "UPDATE_SCOPE must be stable or testing" >&2
+    exit 2
+    ;;
+esac
 UPDATE_KEYS="$ROOT_DIR/Config/UpdateKeys.json"
 BUILD_DIR="$ROOT_DIR/.build/release"
 DIST_DIR="$ROOT_DIR/dist"
@@ -23,8 +37,8 @@ trap 'rm -f "$SERVER_PLIST" "$KEYS_PLIST"' EXIT
 /usr/bin/plutil -convert xml1 -o "$SERVER_PLIST" "$UPDATE_SERVER_CONFIG"
 /usr/bin/plutil -convert xml1 -o "$KEYS_PLIST" "$UPDATE_KEYS"
 UPDATE_BASE_URL="$(/usr/libexec/PlistBuddy -c 'Print :releaseBaseURL' "$SERVER_PLIST")"
-[[ "$UPDATE_BASE_URL" == "http://192.168.10.54:18080/codex-session-keeper/stable/" ]] || {
-  echo "unexpected fixed update server: $UPDATE_BASE_URL" >&2
+[[ "$UPDATE_BASE_URL" == "$EXPECTED_UPDATE_BASE_URL" ]] || {
+  echo "unexpected fixed update server for $UPDATE_SCOPE: $UPDATE_BASE_URL" >&2
   exit 2
 }
 MANIFEST_PUBLIC_KEY="$(/usr/libexec/PlistBuddy -c 'Print :manifestPublicKey' "$KEYS_PLIST")"

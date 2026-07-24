@@ -4,7 +4,11 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { parseUpdateServerConfig, UPDATE_SERVER } from './update-server.mjs';
+import {
+  parseUpdateServerConfig,
+  UPDATE_SERVER,
+  updateServerForScope,
+} from './update-server.mjs';
 
 const RELEASE_BASE = 'http://192.168.10.54:18080/codex-session-keeper/stable/';
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -12,11 +16,28 @@ const repositoryRoot = path.resolve(testDirectory, '..', '..');
 
 test('repository update server is the fixed Mac mini endpoint', () => {
   assert.deepEqual(UPDATE_SERVER, {
+    scope: 'stable',
     releaseBaseURL: RELEASE_BASE,
     windowsFeedURL: `${RELEASE_BASE}windows/`,
     macDownloadPrefix: `${RELEASE_BASE}macos/`,
     macAppcastURL: `${RELEASE_BASE}macos/appcast.xml`,
   });
+});
+
+test('candidate server is the exact isolated Mac mini path', () => {
+  assert.deepEqual(updateServerForScope('testing'), {
+    scope: 'testing',
+    releaseBaseURL: 'http://192.168.10.54:18080/codex-session-keeper/testing/',
+    windowsFeedURL: 'http://192.168.10.54:18080/codex-session-keeper/testing/windows/',
+    macDownloadPrefix: 'http://192.168.10.54:18080/codex-session-keeper/testing/macos/',
+    macAppcastURL: 'http://192.168.10.54:18080/codex-session-keeper/testing/macos/appcast.xml',
+  });
+});
+
+test('server scope rejects unknown values', () => {
+  for (const scope of ['', 'beta', '../stable', 'testing/']) {
+    assert.throws(() => updateServerForScope(scope), /scope/);
+  }
 });
 
 test('update server parser rejects mutable or ambiguous URLs', () => {
