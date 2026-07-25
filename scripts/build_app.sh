@@ -149,6 +149,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 PLIST
 
 chmod +x "$APP_DIR/Contents/MacOS/CodexSessionVault"
+"$ROOT_DIR/scripts/verify_macos_runtime_layout.sh" "$APP_DIR"
 codesign --force --deep --sign "$MAC_CODESIGN_IDENTITY" "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
 

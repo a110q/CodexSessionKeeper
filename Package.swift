@@ -42,7 +42,13 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "Sources/CodexSessionVault",
-            swiftSettings: [.unsafeFlags(["-parse-as-library"])]
+            swiftSettings: [.unsafeFlags(["-parse-as-library"])],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", "@executable_path/../Frameworks"
+                ])
+            ]
         ),
         .testTarget(
             name: "CodexSessionVaultCoreTests",
