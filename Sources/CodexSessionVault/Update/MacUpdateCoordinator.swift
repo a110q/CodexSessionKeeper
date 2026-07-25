@@ -32,6 +32,7 @@ final class MacUpdateCoordinator: ObservableObject {
     private var downloadCancellation: (() -> Void)?
     private let attemptGate = UpdateAttemptGate<SPUUserUpdateChoice>()
     private var terminationRetryAttempted = false
+    private var terminationRetryTask: Task<Void, Never>?
     private var installWhenReady = false
     private var deferredReady = false
     private var backupDrainedForInstall = false
@@ -213,7 +214,10 @@ final class MacUpdateCoordinator: ObservableObject {
 
     private func performRestartAndInstall(version: String) async {
         recordAudit(.installRequested, version: version)
+        terminationRetryTask?.cancel()
+        terminationRetryTask = nil
         terminationRetryAttempted = false
+        await waitForUpdateUIToDismiss()
         guard await model.prepareForUpdate(timeout: .seconds(5)) else {
             cancelPendingUpdateSession(resumeBackup: false)
             transition(
@@ -324,12 +328,31 @@ final class MacUpdateCoordinator: ObservableObject {
 
     private func cancelPendingUpdateSession(resumeBackup: Bool) {
         _ = attemptGate.cancelPendingSession(with: .dismiss)
+        terminationRetryTask?.cancel()
+        terminationRetryTask = nil
         terminationRetryAttempted = false
         model.revokeUpdateTerminationApproval()
         installWhenReady = false
         deferredReady = false
         if resumeBackup {
             resumeBackupIfNeeded()
+        }
+    }
+
+    private func waitForUpdateUIToDismiss() async {
+        isPresented = false
+        for _ in 0..<20 {
+            let application = NSApplication.shared
+            let hasAttachedSheet = application.windows.contains { $0.attachedSheet != nil }
+            guard application.modalWindow != nil || hasAttachedSheet else {
+                try? await Task.sleep(for: .milliseconds(100))
+                return
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(50))
+            } catch {
+                return
+            }
         }
     }
 
@@ -463,16 +486,27 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         retryTerminatingApplication: @escaping () -> Void
     ) {
         recordAudit(.installStarted, version: targetVersion ?? currentVersion)
-        transition(.installStarted(version: targetVersion ?? currentVersion), present: true)
+        transition(
+            .installStarted(version: targetVersion ?? currentVersion),
+            present: applicationTerminated
+        )
         guard !applicationTerminated, !terminationRetryAttempted else { return }
         terminationRetryAttempted = true
-        model.approveUpdateTerminationRetry()
-        retryTerminatingApplication()
+        terminationRetryTask?.cancel()
+        terminationRetryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.waitForUpdateUIToDismiss()
+            guard !Task.isCancelled else { return }
+            self.model.approveUpdateTerminationRetry()
+            retryTerminatingApplication()
+        }
     }
 
     func sparkleInstallCompleted() {
         backupDrainedForInstall = false
         installWhenReady = false
+        terminationRetryTask?.cancel()
+        terminationRetryTask = nil
         terminationRetryAttempted = false
         model.revokeUpdateTerminationApproval()
         recordAudit(.installCompleted, version: targetVersion ?? currentVersion)
@@ -484,6 +518,8 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         downloadCancellation = nil
         attemptGate.endRequest()
         attemptGate.discardReadyReply()
+        terminationRetryTask?.cancel()
+        terminationRetryTask = nil
         terminationRetryAttempted = false
         model.revokeUpdateTerminationApproval()
         let abandonedInstall = installWhenReady

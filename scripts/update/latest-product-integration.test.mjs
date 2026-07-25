@@ -63,6 +63,10 @@ test('latest bounded backup and signed updater coexist', () => {
   assert.match(macUpdateCoordinator, /update-audit\.jsonl/);
   assert.match(macUpdateCoordinator, /retryTerminatingApplication\(\)/);
   assert.match(macUpdateCoordinator, /terminationRetryAttempted/);
+  assert.match(macUpdateCoordinator, /private func waitForUpdateUIToDismiss\(\) async/);
+  assert.match(macUpdateCoordinator, /application\.modalWindow/);
+  assert.match(macUpdateCoordinator, /attachedSheet/);
+  assert.match(macUpdateCoordinator, /await waitForUpdateUIToDismiss\(\)/);
 
   const windowsMain = readFileSync(
     'windows/codex_session_manager_electron/src/main.js',

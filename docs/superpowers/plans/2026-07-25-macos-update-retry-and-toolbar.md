@@ -461,6 +461,46 @@ all release/deployment Node tests before rebuilding either package.
 
 ---
 
+### Task 4B: Dismiss modal update UI before Sparkle termination
+
+**Files:**
+- Modify: `Sources/CodexSessionVault/Update/MacUpdateCoordinator.swift`
+- Modify: `scripts/update/latest-product-integration.test.mjs`
+
+**Interfaces:**
+- Produces: bounded dismissal of SwiftUI/AppKit sheets before handing control
+  to Sparkle
+- Produces: one deferred retry only after modal UI has left the window hierarchy
+
+- [x] **Step 1: Reproduce the modal termination stall**
+
+The rebuilt `1.0.99` downloaded and verified `1.1.0`, recorded both
+confirmations, and reached `install_started`, but remained alive while its
+update sheet was attached. A normal Command-Q was also deferred.
+
+- [x] **Step 2: Add a failing packaging contract**
+
+Require the coordinator to wait for both `NSApplication.modalWindow` and
+attached sheets to clear before asking Sparkle to terminate.
+
+- [x] **Step 3: Dismiss and settle update UI before termination**
+
+Close the SwiftUI update sheet, poll the AppKit window hierarchy for at most
+one second, and add a short main-run-loop settling delay.
+
+- [x] **Step 4: Defer the one-shot Sparkle retry**
+
+Run the retry from a cancellable main-actor task after the same modal UI
+barrier. Cancel the task on update failure, dismissal, completion, or a new
+install attempt.
+
+- [x] **Step 5: Re-run focused and complete verification**
+
+Run the product integration contract, approval gate tests, NAS wiring
+contract, complete Swift and Node suites, and a release build.
+
+---
+
 ### Task 5: Isolated publication and pure manual update acceptance
 
 **Files:**
