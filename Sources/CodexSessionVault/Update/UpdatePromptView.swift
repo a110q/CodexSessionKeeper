@@ -58,7 +58,7 @@ struct UpdatePromptView: View {
             Text("重启应用即可完成更新。")
                 .foregroundStyle(.secondary)
             HStack {
-                Button("稍后重启", action: coordinator.deferRestart)
+                Button("稍后提醒", action: coordinator.deferRestart)
                 Spacer()
                 Button("重启并更新") {
                     Task { await coordinator.restartAndInstall() }

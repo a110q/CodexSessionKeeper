@@ -184,7 +184,7 @@ final class MacUpdateCoordinator: ObservableObject {
         guard case .ready = state else { return }
         deferredReady = true
         isPresented = false
-        _ = attemptGate.resolveReadyReply(.dismiss)
+        _ = attemptGate.cancelPendingSession(with: .skip)
     }
 
     func restartAndInstall() async {
@@ -222,7 +222,7 @@ final class MacUpdateCoordinator: ObservableObject {
         guard await model.prepareForUpdate(timeout: .seconds(5)) else {
             cancelPendingUpdateSession(resumeBackup: false)
             transition(
-                .failed(message: "备份仍在写入，已取消更新重启，请稍后重试"),
+                .failed(message: "备份仍在写入，已取消本次安装，请稍后重新检查更新"),
                 present: true
             )
             return
@@ -330,7 +330,7 @@ final class MacUpdateCoordinator: ObservableObject {
     }
 
     private func cancelPendingUpdateSession(resumeBackup: Bool) {
-        _ = attemptGate.cancelPendingSession(with: .dismiss)
+        _ = attemptGate.cancelPendingSession(with: .skip)
         terminationRetryTask?.cancel()
         terminationRetryTask = nil
         terminationRetryAttempted = false
@@ -406,7 +406,7 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
               ) else {
             attemptGate.endRequest()
             installWhenReady = false
-            reply(.dismiss)
+            reply(.skip)
             resumeBackupIfNeeded()
             transition(.failed(message: "更新版本不匹配，请联系管理员"), present: true)
             return

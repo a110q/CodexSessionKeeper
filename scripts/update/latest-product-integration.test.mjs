@@ -75,6 +75,34 @@ test('latest bounded backup and signed updater coexist', () => {
     macUpdateCoordinator,
     /recordAudit\(\.installStarted[\s\S]*resolveReadyReply\(\.install\)/
   );
+  assert.match(
+    macUpdateCoordinator,
+    /guard await model\.prepareForUpdate[\s\S]{0,800}cancelPendingUpdateSession\(resumeBackup: false\)[\s\S]{0,800}\.failed/,
+    'a blocked NAS drain must end the current install session without installing',
+  );
+  const deferRestartBody = macUpdateCoordinator.match(
+    /func deferRestart\(\) \{([\s\S]*?)\n    \}\n\n    func restartAndInstall/,
+  )?.[1] ?? '';
+  assert.match(
+    deferRestartBody,
+    /cancelPendingSession\(with: \.skip\)/,
+    'deferring installation must end the current Sparkle session',
+  );
+  assert.match(
+    macUpdateCoordinator,
+    /try stateStore\.setPendingVersion\(version\)[\s\S]{0,800}catch \{[\s\S]{0,800}cancelPendingUpdateSession\(resumeBackup: true\)[\s\S]{0,800}\.failed/,
+    'a pending-marker failure must not authorize Sparkle to install without durable audit state',
+  );
+  assert.match(
+    macUpdateCoordinator,
+    /cancelPendingSession\(with: \.skip\)/,
+    'all abandoned ready sessions must explicitly skip instead of deferring installation to app quit',
+  );
+  const macUpdatePrompt = readFileSync(
+    'Sources/CodexSessionVault/Update/UpdatePromptView.swift',
+    'utf8',
+  );
+  assert.match(macUpdatePrompt, /Button\("稍后提醒", action: coordinator\.deferRestart\)/);
 
   const windowsMain = readFileSync(
     'windows/codex_session_manager_electron/src/main.js',

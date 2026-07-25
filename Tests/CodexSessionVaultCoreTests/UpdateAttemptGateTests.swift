@@ -59,7 +59,7 @@ struct UpdateAttemptGateTests {
     }
 
     @Test
-    func failedPreparationDismissesReadyReplyAndPermitsRetry() {
+    func blockedInstallSkipsTheReadyReplyAndRequiresANewAttempt() {
         let gate = UpdateAttemptGate<String>()
         var replies: [String] = []
         #expect(gate.beginRequest())
@@ -68,9 +68,10 @@ struct UpdateAttemptGateTests {
             resolvingPreviousWith: "unused"
         )
 
-        #expect(gate.cancelPendingSession(with: "dismiss"))
+        #expect(gate.cancelPendingSession(with: "skip"))
 
-        #expect(replies == ["dismiss"])
+        #expect(replies == ["skip"])
+        #expect(!gate.hasPendingReply)
         #expect(!gate.isBusy)
         #expect(gate.beginRequest())
     }
