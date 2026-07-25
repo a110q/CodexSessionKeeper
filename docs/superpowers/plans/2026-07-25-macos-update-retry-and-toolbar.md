@@ -531,6 +531,42 @@ rerun all Swift and Node suites.
 
 ---
 
+### Task 4D: End every abandoned Sparkle session without latent installation
+
+**Files:**
+- Modify: `Sources/CodexSessionVault/Update/MacUpdateCoordinator.swift`
+- Modify: `Sources/CodexSessionVault/Update/UpdatePromptView.swift`
+- Modify: `Tests/CodexSessionVaultCoreTests/UpdateAttemptGateTests.swift`
+- Modify: `scripts/update/latest-product-integration.test.mjs`
+
+- [x] **Step 1: Reproduce the deferred-install escape**
+
+Sparkle helpers remained alive after a ready reply was resolved with
+`.dismiss`. A later manual check caused that deferred update to request
+application termination even though no new install confirmation had been
+accepted.
+
+- [x] **Step 2: Confirm documented Sparkle semantics**
+
+Sparkle documents `.dismiss` as deferring the ready update and permitting
+installation when the application terminates independently. This does not
+satisfy the product rule that every installation requires a fresh second
+confirmation.
+
+- [x] **Step 3: Make non-install paths explicit skips**
+
+Use `.skip` for “稍后提醒”, a blocked NAS drain, pending-state persistence
+failure, and a mismatched Sparkle item. Every such path clears the attempt gate
+and requires a new manual update attempt before download or installation.
+
+- [x] **Step 4: Add regression contracts and rerun all tests**
+
+The focused gate tests, complete Swift suite, Windows suite, and release
+contracts all pass. The final counts are 373/373 Swift, 456/456 Windows, and
+60/60 release/deployment tests.
+
+---
+
 ### Task 5: Isolated publication and pure manual update acceptance
 
 **Files:**
@@ -542,11 +578,11 @@ rerun all Swift and Node suites.
 - Consumes: verified artifacts from Task 4
 - Produces: a tested 1.0.99 → 1.1.0 manual macOS update
 
-- [ ] **Step 1: Exit the old app normally**
+- [x] **Step 1: Exit the old app normally**
 
 Cancel any open confirmation alert. Use the application’s normal Quit command. If the NAS warning appears, choose the normal product option; do not use Force Quit. Wait until `CodexSessionVault`, Sparkle `Updater`, and `Autoupdate` have exited.
 
-- [ ] **Step 2: Archive stale Sparkle cache recoverably**
+- [x] **Step 2: Archive stale Sparkle cache recoverably**
 
 Move, do not delete:
 
@@ -557,7 +593,7 @@ mv "$HOME/Library/Caches/local.codex.session-manager/org.sparkle-project.Sparkle
 
 Only run when the destination does not exist and all related processes are stopped.
 
-- [ ] **Step 3: Publish the rebuilt testing candidate atomically**
+- [x] **Step 3: Publish the rebuilt testing candidate atomically**
 
 Build and verify a signed testing release directory:
 
@@ -613,11 +649,11 @@ ssh codex-update-macmini \
 
 Verify HTTP 200 for manifest/appcast/ZIP, POST 405, exact SHA-256, and unchanged `stable` and `index.html`.
 
-- [ ] **Step 4: Install and launch the new 1.0.99**
+- [x] **Step 4: Install and launch the new 1.0.99**
 
 Archive the current application bundle, copy the verified 1.0.99 bundle into `/Applications`, verify signature/version/feed, then launch through Computer Use. Keep a one-second RSS monitor and allow the explicitly authorized NAS connection.
 
-- [ ] **Step 5: Verify the visible button and manual download**
+- [x] **Step 5: Verify the visible button and manual download**
 
 Confirm the toolbar shows “检查更新”. Click it once, choose “立即更新”, then accept the native “确认下载” dialog once. Verify:
 
@@ -627,15 +663,15 @@ Confirm the toolbar shows “检查更新”. Click it once, choose “立即更
 - one `download_started`;
 - no repeated confirmation loop.
 
-- [ ] **Step 6: Verify NAS-gated retry**
+- [x] **Step 6: Verify NAS-gated retry**
 
 If NAS remains busy, accept the install confirmation and verify the app reports a safe cancellation. Confirm Sparkle `Updater` and `Autoupdate` exit, then use “检查更新” again and verify a new download can start.
 
-- [ ] **Step 7: Complete the manual installation**
+- [x] **Step 7: Complete the manual installation**
 
 When NAS is safely idle, repeat the two confirmations. Verify 1.1.0 launches, the toolbar remains visible, session counts remain unchanged, NAS backup resumes, the audit log contains download/install completion, and memory stays bounded.
 
-- [ ] **Step 8: Final repository and environment checks**
+- [x] **Step 8: Final repository and environment checks**
 
 Run:
 
@@ -645,3 +681,10 @@ git rev-parse HEAD
 ```
 
 Record artifact hashes, testing HTTP hashes, memory summary, app version, session count, NAS state, retained archive paths, and any remaining temporary directories.
+
+Final acceptance used the rebuilt `1eed207` artifacts. The testing channel
+served the new macOS ZIP while the stable manifest and download page hashes
+remained unchanged. The manual 1.0.99 → 1.1.0 flow recorded exactly one
+ordered download/install audit chain, relaunched as 1.1.0 build 10100,
+preserved 648/648 sessions, resumed a verified NAS backup, and stayed near
+157–175 MB RSS during the post-update observation instead of reproducing OOM.
