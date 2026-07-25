@@ -97,6 +97,7 @@ final class MacUpdateCoordinator: ObservableObject {
 
         let persistedState = stateStore.load()
         if persistedState.pendingVersion == currentVersion {
+            recordAudit(.installCompleted, version: currentVersion)
             transition(.completed(version: currentVersion), present: true)
         }
 
@@ -237,7 +238,9 @@ final class MacUpdateCoordinator: ObservableObject {
         }
 
         deferredReady = false
-        if attemptGate.resolveReadyReply(.install) {
+        if attemptGate.hasPendingReply {
+            recordAudit(.installStarted, version: version)
+            _ = attemptGate.resolveReadyReply(.install)
             installWhenReady = false
         } else {
             guard attemptGate.beginRequest() else {
@@ -474,6 +477,7 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         if installWhenReady && backupDrainedForInstall {
             installWhenReady = false
             transition(.installStarted(version: targetVersion ?? currentVersion), present: true)
+            recordAudit(.installStarted, version: targetVersion ?? currentVersion)
             _ = attemptGate.resolveReadyReply(.install)
             return
         }
@@ -485,7 +489,6 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         applicationTerminated: Bool,
         retryTerminatingApplication: @escaping () -> Void
     ) {
-        recordAudit(.installStarted, version: targetVersion ?? currentVersion)
         transition(
             .installStarted(version: targetVersion ?? currentVersion),
             present: applicationTerminated

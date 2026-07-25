@@ -501,6 +501,36 @@ contract, complete Swift and Node suites, and a release build.
 
 ---
 
+### Task 4C: Make install audit survive process replacement
+
+**Files:**
+- Modify: `Sources/CodexSessionVault/Update/MacUpdateCoordinator.swift`
+- Modify: `scripts/update/latest-product-integration.test.mjs`
+
+- [x] **Step 1: Reproduce the audit gap**
+
+The app successfully replaced `1.0.99` with `1.1.0`, preserved all 638
+sessions, and resumed NAS verification, but the old process exited before its
+Sparkle callback could append `install_started`, and the relaunched process
+did not append `install_completed`.
+
+- [x] **Step 2: Persist start before handing control to Sparkle**
+
+Append `install_started` immediately before resolving the ready reply with
+`.install`, including the deferred re-download path.
+
+- [x] **Step 3: Persist completion on matching relaunch**
+
+When the stored pending version equals the running version, append
+`install_completed` before presenting the completed state.
+
+- [x] **Step 4: Add contracts and rerun complete tests**
+
+Require both durable audit locations in the product integration contract, then
+rerun all Swift and Node suites.
+
+---
+
 ### Task 5: Isolated publication and pure manual update acceptance
 
 **Files:**
