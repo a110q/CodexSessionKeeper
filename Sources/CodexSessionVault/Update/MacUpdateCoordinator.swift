@@ -31,7 +31,7 @@ final class MacUpdateCoordinator: ObservableObject {
     private var checkCancellation: (() -> Void)?
     private var downloadCancellation: (() -> Void)?
     private let attemptGate = UpdateAttemptGate<SPUUserUpdateChoice>()
-    private var retryTermination: (() -> Void)?
+    private var terminationRetryAttempted = false
     private var installWhenReady = false
     private var deferredReady = false
     private var backupDrainedForInstall = false
@@ -213,6 +213,7 @@ final class MacUpdateCoordinator: ObservableObject {
 
     private func performRestartAndInstall(version: String) async {
         recordAudit(.installRequested, version: version)
+        terminationRetryAttempted = false
         guard await model.prepareForUpdate(timeout: .seconds(5)) else {
             cancelPendingUpdateSession(resumeBackup: false)
             transition(
@@ -323,6 +324,8 @@ final class MacUpdateCoordinator: ObservableObject {
 
     private func cancelPendingUpdateSession(resumeBackup: Bool) {
         _ = attemptGate.cancelPendingSession(with: .dismiss)
+        terminationRetryAttempted = false
+        model.revokeUpdateTerminationApproval()
         installWhenReady = false
         deferredReady = false
         if resumeBackup {
@@ -397,7 +400,6 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
     func sparkleUpdaterFailed() {
         checkCancellation = nil
         downloadCancellation = nil
-        retryTermination = nil
         cancelPendingUpdateSession(resumeBackup: true)
         recordAudit(.updateFailed, version: targetVersion ?? currentVersion)
         transition(.failed(message: "更新失败，请稍后重试"), present: true)
@@ -460,14 +462,19 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         applicationTerminated: Bool,
         retryTerminatingApplication: @escaping () -> Void
     ) {
-        retryTermination = applicationTerminated ? nil : retryTerminatingApplication
         recordAudit(.installStarted, version: targetVersion ?? currentVersion)
         transition(.installStarted(version: targetVersion ?? currentVersion), present: true)
+        guard !applicationTerminated, !terminationRetryAttempted else { return }
+        terminationRetryAttempted = true
+        model.approveUpdateTerminationRetry()
+        retryTerminatingApplication()
     }
 
     func sparkleInstallCompleted() {
         backupDrainedForInstall = false
         installWhenReady = false
+        terminationRetryAttempted = false
+        model.revokeUpdateTerminationApproval()
         recordAudit(.installCompleted, version: targetVersion ?? currentVersion)
         transition(.completed(version: targetVersion ?? currentVersion), present: true)
     }
@@ -477,7 +484,8 @@ extension MacUpdateCoordinator: SparkleUpdateDriverDelegate {
         downloadCancellation = nil
         attemptGate.endRequest()
         attemptGate.discardReadyReply()
-        retryTermination = nil
+        terminationRetryAttempted = false
+        model.revokeUpdateTerminationApproval()
         let abandonedInstall = installWhenReady
         installWhenReady = false
         if abandonedInstall {

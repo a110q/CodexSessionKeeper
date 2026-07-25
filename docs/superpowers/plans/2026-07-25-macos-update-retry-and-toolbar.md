@@ -419,6 +419,48 @@ If no tracked files changed during verification, do not create an empty commit.
 
 ---
 
+### Task 4A: Allow the confirmed updater to terminate exactly once
+
+**Files:**
+- Create: `Sources/CodexSessionVaultCore/Update/UpdateTerminationApprovalGate.swift`
+- Create: `Tests/CodexSessionVaultCoreTests/UpdateTerminationApprovalGateTests.swift`
+- Modify: `Sources/CodexSessionVault/main.swift`
+- Modify: `Sources/CodexSessionVault/Update/MacUpdateCoordinator.swift`
+
+**Interfaces:**
+- Produces: one-shot `approve()`, `consume() -> Bool`, and `revoke()` behavior
+- Produces: a single automatic use of Sparkle's documented
+  `retryTerminatingApplication` callback if the first quit event is refused
+
+- [x] **Step 1: Write failing tests for one-shot approval and revocation**
+
+Verify that an unapproved termination is rejected, approval is consumed once,
+and revocation removes an unused approval.
+
+- [x] **Step 2: Implement the minimal approval gate**
+
+Keep the gate main-actor isolated. Do not make the NAS termination warning
+globally bypassable.
+
+- [x] **Step 3: Wire approval to successful NAS drain**
+
+Approve only after `prepareForUpdate` succeeds. Revoke on cancelled update,
+Sparkle failure, or dismissal. In `applicationShouldTerminate`, consume the
+one-shot approval before evaluating the ordinary NAS warning.
+
+- [x] **Step 4: Retry termination at most once**
+
+When Sparkle reports `applicationTerminated == false`, approve one retry and
+invoke `retryTerminatingApplication` once. Reset the retry flag on a new
+install attempt and every terminal path.
+
+- [x] **Step 5: Run focused and complete tests**
+
+Run the approval tests, `MacNASWiringContractTests`, complete Swift tests, and
+all release/deployment Node tests before rebuilding either package.
+
+---
+
 ### Task 5: Isolated publication and pure manual update acceptance
 
 **Files:**
@@ -450,7 +492,8 @@ Only run when the destination does not exist and all related processes are stopp
 Build and verify a signed testing release directory:
 
 ```bash
-CANDIDATE_OUTPUT="$(mktemp -d /tmp/codex-retry-release.XXXXXX)"
+CANDIDATE_PARENT="$(mktemp -d /tmp/codex-retry-release.XXXXXX)"
+CANDIDATE_OUTPUT="$CANDIDATE_PARENT/output"
 node scripts/update/build-release-manifest.mjs \
   --version 1.1.0 \
   --build 10100 \
@@ -470,14 +513,32 @@ Transfer it through the configured long-lived SSH key, retain the previously pub
 ```bash
 REMOTE_STAGE="/Users/Shared/.codex-update-stage-retry.$(date +%Y%m%d%H%M%S)"
 REMOTE_ARCHIVE="/Users/Shared/codex-update-site/.testing-artifact-archive-1.1.0-$(date +%Y%m%d%H%M%S)"
-ssh codex-update-macmini "mkdir -m 0775 '$REMOTE_STAGE' '$REMOTE_ARCHIVE'"
+ssh codex-update-macmini \
+  "mkdir -m 0775 -p '$REMOTE_STAGE/testing' '$REMOTE_STAGE/tooling/scripts/update' \
+  '$REMOTE_STAGE/tooling/Config' '$REMOTE_ARCHIVE'"
 rsync -a "$CANDIDATE/" "codex-update-macmini:$REMOTE_STAGE/testing/"
+rsync -a \
+  scripts/update/publish-release.sh \
+  scripts/update/verify-release-directory.mjs \
+  scripts/update/release-manifest.mjs \
+  scripts/update/update-server.mjs \
+  "codex-update-macmini:$REMOTE_STAGE/tooling/scripts/update/"
+rsync -a \
+  Config/UpdateKeys.json \
+  Config/UpdateServer.json \
+  Config/UpdateServer.testing.json \
+  "codex-update-macmini:$REMOTE_STAGE/tooling/Config/"
 ssh codex-update-macmini \
-  "cp -p '/Users/Shared/codex-update-site/codex-session-keeper/testing/macos/CodexSessionKeeper-1.1.0-macos-arm64.zip' '$REMOTE_ARCHIVE/'"
-ssh codex-update-macmini \
-  "/opt/homebrew/bin/node '$REMOTE_STAGE/testing/tooling/scripts/update/verify-release-directory.mjs' --root '$REMOTE_STAGE/testing'"
-ssh codex-update-macmini \
-  "'$REMOTE_STAGE/testing/tooling/scripts/update/publish-release.sh' --candidate '$REMOTE_STAGE/testing' '/Users/Shared/codex-update-site/codex-session-keeper/testing'"
+  "export PATH='/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'; \
+  OLD_ZIP='/Users/Shared/codex-update-site/codex-session-keeper/testing/macos/CodexSessionKeeper-1.1.0-macos-arm64.zip'; \
+  ARCHIVED_ZIP='$REMOTE_ARCHIVE/CodexSessionKeeper-1.1.0-macos-arm64.zip'; \
+  node '$REMOTE_STAGE/tooling/scripts/update/verify-release-directory.mjs' --root '$REMOTE_STAGE/testing'; \
+  mv \"\$OLD_ZIP\" \"\$ARCHIVED_ZIP\"; \
+  restore_old_zip() { test -e \"\$OLD_ZIP\" || mv \"\$ARCHIVED_ZIP\" \"\$OLD_ZIP\"; }; \
+  trap restore_old_zip ERR; \
+  '$REMOTE_STAGE/tooling/scripts/update/publish-release.sh' --candidate '$REMOTE_STAGE/testing' \
+    '/Users/Shared/codex-update-site/codex-session-keeper/testing'; \
+  trap - ERR"
 ```
 
 Verify HTTP 200 for manifest/appcast/ZIP, POST 405, exact SHA-256, and unchanged `stable` and `index.html`.

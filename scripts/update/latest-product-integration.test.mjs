@@ -61,6 +61,8 @@ test('latest bounded backup and signed updater coexist', () => {
   assert.match(macUpdateCoordinator, /MacUpdateConsentPolicy\.perform\(/);
   assert.match(macUpdateCoordinator, /MacUpdateConsentPolicy\.performAsync\(/);
   assert.match(macUpdateCoordinator, /update-audit\.jsonl/);
+  assert.match(macUpdateCoordinator, /retryTerminatingApplication\(\)/);
+  assert.match(macUpdateCoordinator, /terminationRetryAttempted/);
 
   const windowsMain = readFileSync(
     'windows/codex_session_manager_electron/src/main.js',

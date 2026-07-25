@@ -411,6 +411,7 @@ final class VaultModel: ObservableObject {
     private var sessionSearchTask: Task<Void, Never>?
     private var nasRuntime: NASBackupRuntime!
     private var nasConfigurationService: NASConfigurationService!
+    private let updateTerminationApproval = UpdateTerminationApprovalGate()
     private let launchAtLoginController: MacLaunchAtLoginController
     private var nasStatusTask: Task<Void, Never>?
     private var isNASReconfigurationPresented = false
@@ -891,12 +892,31 @@ final class VaultModel: ObservableObject {
         let components = timeout.components
         let seconds = Double(components.seconds)
             + Double(components.attoseconds) / 1_000_000_000_000_000_000
-        return nasRuntime.prepareForUpdate(timeout: max(0, seconds))
+        let prepared = nasRuntime.prepareForUpdate(timeout: max(0, seconds))
+        if prepared {
+            updateTerminationApproval.approve()
+        } else {
+            updateTerminationApproval.revoke()
+        }
+        return prepared
     }
 
     func resumeBackupAfterCancelledUpdate() {
+        updateTerminationApproval.revoke()
         nasRuntime.resumeAfterCancelledUpdate()
         syncNASSetupSnapshot()
+    }
+
+    func approveUpdateTerminationRetry() {
+        updateTerminationApproval.approve()
+    }
+
+    func revokeUpdateTerminationApproval() {
+        updateTerminationApproval.revoke()
+    }
+
+    func consumeUpdateTerminationApproval() -> Bool {
+        updateTerminationApproval.consume()
     }
 
     func requestNASBackupScan(_ trigger: BackupScanTrigger) {
@@ -4714,8 +4734,13 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model,
-              model.nasSetupSnapshot.state == .seeding
+        guard let model else {
+            return .terminateNow
+        }
+        if model.consumeUpdateTerminationApproval() {
+            return .terminateNow
+        }
+        guard model.nasSetupSnapshot.state == .seeding
                 || model.nasSetupSnapshot.state == .pending
                 || model.nasSetupSnapshot.state == .verifying else {
             return .terminateNow

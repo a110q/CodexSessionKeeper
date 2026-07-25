@@ -162,6 +162,19 @@ struct MacNASWiringContractTests {
     }
 
     @Test
+    func confirmedUpdateDrainCreatesOneShotTerminationApproval() throws {
+        let source = try macAppSource()
+        let prepare = try modelFunctionSource("prepareForUpdate(", in: source)
+        let resume = try modelFunctionSource("resumeBackupAfterCancelledUpdate()", in: source)
+        let termination = try modelFunctionSource("applicationShouldTerminate(", in: source)
+
+        #expect(prepare.contains("updateTerminationApproval.approve()"))
+        #expect(prepare.contains("updateTerminationApproval.revoke()"))
+        #expect(resume.contains("updateTerminationApproval.revoke()"))
+        #expect(termination.contains("model.consumeUpdateTerminationApproval()"))
+    }
+
+    @Test
     func protectionSnapshotsMaterializeTheFrozenSecurityPlan() throws {
         let source = try macAppSource()
         let protection = try modelFunctionSource("createSessionProtectionSnapshot(", in: source)
