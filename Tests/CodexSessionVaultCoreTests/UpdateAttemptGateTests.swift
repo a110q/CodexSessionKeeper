@@ -57,4 +57,21 @@ struct UpdateAttemptGateTests {
         #expect(replyCount == 0)
         #expect(!gate.isBusy)
     }
+
+    @Test
+    func failedPreparationDismissesReadyReplyAndPermitsRetry() {
+        let gate = UpdateAttemptGate<String>()
+        var replies: [String] = []
+        #expect(gate.beginRequest())
+        gate.holdReadyReply(
+            { replies.append($0) },
+            resolvingPreviousWith: "unused"
+        )
+
+        #expect(gate.cancelPendingSession(with: "dismiss"))
+
+        #expect(replies == ["dismiss"])
+        #expect(!gate.isBusy)
+        #expect(gate.beginRequest())
+    }
 }

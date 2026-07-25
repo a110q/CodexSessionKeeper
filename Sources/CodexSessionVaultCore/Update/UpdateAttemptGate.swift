@@ -45,6 +45,12 @@ public final class UpdateAttemptGate<Choice> {
         return true
     }
 
+    @discardableResult
+    public func cancelPendingSession(with choice: Choice) -> Bool {
+        endRequest()
+        return resolveReadyReply(choice)
+    }
+
     public func discardReadyReply() {
         readyReply = nil
     }
