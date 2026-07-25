@@ -36,6 +36,16 @@ test('latest bounded backup and signed updater coexist', () => {
   assert.match(macMain, /@StateObject private var updateCoordinator: MacUpdateCoordinator/);
   assert.match(macMain, /\.sheet\([\s\S]*UpdatePromptView\(\)/);
   assert.match(macMain, /\.task \{ updateCoordinator\.start\(\) \}/);
+  assert.match(
+    macMain,
+    /struct ContentView: View \{[\s\S]*@EnvironmentObject private var updateCoordinator: MacUpdateCoordinator/,
+    'ContentView does not receive the shared update coordinator',
+  );
+  assert.match(
+    macMain,
+    /\.toolbar \{[\s\S]*updateCoordinator\.checkNow\(\)[\s\S]*Text\("检查更新"\)/,
+    'macOS toolbar does not expose a visible check-update action',
+  );
   assert.match(macMain, /func prepareForUpdate\(timeout:/);
   assert.match(macMain, /func resumeBackupAfterCancelledUpdate\(\)/);
   assert.doesNotMatch(macMain, /private let appVersion = "1\.0\.14"/);

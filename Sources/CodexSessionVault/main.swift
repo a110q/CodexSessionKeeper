@@ -4454,6 +4454,7 @@ struct CodexSessionVaultApp: App {
 
 struct ContentView: View {
     @EnvironmentObject private var model: VaultModel
+    @EnvironmentObject private var updateCoordinator: MacUpdateCoordinator
 
     private var sectionBinding: Binding<AppSection> {
         Binding(
@@ -4541,6 +4542,12 @@ struct ContentView: View {
         .navigationSplitViewStyle(.balanced)
         .toolbar {
             ToolbarItemGroup {
+                Button {
+                    updateCoordinator.checkNow()
+                } label: {
+                    Text("检查更新")
+                }
+                .help("检查公司局域网更新")
                 Button {
                     model.showEmployeeHelp()
                 } label: {
