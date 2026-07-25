@@ -57,4 +57,3 @@ public struct UpdatePresentationMachine: Equatable, Sendable {
         }
     }
 }
-

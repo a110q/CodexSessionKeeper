@@ -381,4 +381,3 @@ user clicks “立即更新”.
 The user clicks “立即更新”, then “重启并更新”. Verify `1.1.0 / 10100`, stable
 future feed, unchanged session count, resumed backup, one app instance, and no
 NAS access.
-
